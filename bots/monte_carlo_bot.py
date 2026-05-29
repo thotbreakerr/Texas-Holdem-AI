@@ -1,5 +1,5 @@
 import random
-from core.bot_api import Action, PlayerView
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, _FULL_DECK
 
 
@@ -23,7 +23,7 @@ class MonteCarloBot:
         to_call = state.to_call
         legal = state.legal_actions
         street = state.street
-        opponents = state.opponents
+        opponents = acting_opponents_for(state)
         position = state.position
 
         # If no hole cards (folded)

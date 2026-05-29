@@ -1,7 +1,7 @@
 # bots/poker_mind_bot.py
 
 import random
-from core.bot_api import Action, PlayerView
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, EVAL_HAND_MAX, _FULL_DECK
 
 
@@ -52,7 +52,9 @@ class SmartBot:
         # ===========================
         #        POSTFLOP LOGIC
         # ===========================
-        strength = self._estimate_equity(hole, board, len(state.opponents))
+        strength = self._estimate_equity(
+            hole, board, len(acting_opponents_for(state))
+        )
 
         # Position awareness: boost strength in late position (20-25%)
         position_tightness = self._get_position_tightness(position)
@@ -195,6 +197,10 @@ class SmartBot:
         """Monte Carlo equity estimate against num_opponents random hands."""
         if not hole or len(hole) < 2:
             return 0.0
+        # When everyone else is already all-in (or folded) the caller can pass
+        # num_opponents=0; clamp to a heads-up race so the candidate set is never
+        # empty (max() over no opp_hands previously crashed on the river).
+        num_opponents = max(1, num_opponents)
         wins = 0
         ties = 0
         base_used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)

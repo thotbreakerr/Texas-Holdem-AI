@@ -28,3 +28,10 @@ tournament_progress.png
 .venv/
 models/*.pkl
 models/*.pt
+models/*.bak
+
+# Training/run output logs
+output/*.log
+
+# Local agent state
+.claude/

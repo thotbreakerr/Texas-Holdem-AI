@@ -17,7 +17,8 @@ positive.  Key behaviours:
 import random
 import math
 from itertools import combinations
-from core.bot_api import Action, PlayerView
+from typing import Optional
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, EVAL_HAND_MAX, _FULL_DECK
 from core.icm import equities as _core_icm_equities
 
@@ -46,6 +47,17 @@ def icm_equity(stacks: dict[str, int]) -> dict[str, float]:
         return {pid: 0.0 for pid in stacks}
     if n == 1:
         return {pid: (1.0 if stacks[pid] > 0 else 0.0) for pid in stacks}
+    if n > 8:
+        # core.icm is exact for non-WTA payouts up to 8 players. For larger
+        # fields, use the documented chip-share approximation rather than
+        # crashing tournament bots during early full-ring play.
+        total_chips = sum(max(0, stacks[pid]) for pid in players)
+        if total_chips <= 0:
+            return {pid: 0.0 for pid in stacks}
+        return {
+            pid: (max(0, stacks[pid]) / total_chips if stacks[pid] > 0 else 0.0)
+            for pid in stacks
+        }
 
     # Top-heavy payout structure: each place pays ~60% of the place above.
     decay = 0.6
@@ -62,12 +74,23 @@ def icm_equity(stacks: dict[str, int]) -> dict[str, float]:
     return {pid: eq_list[i] for i, pid in enumerate(all_pids)}
 
 
+def _default_pot_recipient(my_pid: str, stacks: dict[str, int]) -> Optional[str]:
+    opponents = [
+        (pid, stack) for pid, stack in stacks.items()
+        if pid != my_pid and stack > 0
+    ]
+    if not opponents:
+        return None
+    return max(opponents, key=lambda item: item[1])[0]
+
+
 def icm_ev_of_call(
     my_pid: str,
     stacks: dict[str, int],
     pot: int,
     to_call: int,
     win_prob: float,
+    pot_recipient_pid: Optional[str] = None,
 ) -> float:
     """
     Compute the ICM-adjusted EV of calling a bet.
@@ -82,23 +105,30 @@ def icm_ev_of_call(
     if my_stack <= 0:
         return -1.0  # Already busted
 
-    current_eq = icm_equity(stacks)
-    my_current = current_eq.get(my_pid, 0.0)
+    risk = min(max(0, int(to_call)), my_stack)
+    pot_recipient_pid = pot_recipient_pid or _default_pot_recipient(my_pid, stacks)
+
+    # Baseline: fold. The pending pot leaves the middle and goes to the last
+    # aggressor (or the largest live opponent if the aggressor is unknown).
+    stacks_fold = dict(stacks)
+    if pot_recipient_pid in stacks_fold:
+        stacks_fold[pot_recipient_pid] += pot
+    my_fold = icm_equity(stacks_fold).get(my_pid, 0.0)
 
     # Scenario: we call and WIN
     stacks_win = dict(stacks)
-    stacks_win[my_pid] = my_stack + pot  # we gain the whole pot
-    # The opponent who was betting loses their contribution (already in pot)
-    # For simplicity, we just adjust our stack — other stacks stay the same
+    stacks_win[my_pid] = my_stack + pot
     eq_win = icm_equity(stacks_win).get(my_pid, 0.0)
 
     # Scenario: we call and LOSE
     stacks_lose = dict(stacks)
-    stacks_lose[my_pid] = max(0, my_stack - to_call)
+    stacks_lose[my_pid] = max(0, my_stack - risk)
+    if pot_recipient_pid in stacks_lose:
+        stacks_lose[pot_recipient_pid] += pot + risk
     eq_lose = icm_equity(stacks_lose).get(my_pid, 0.0)
 
     expected_eq = win_prob * eq_win + (1 - win_prob) * eq_lose
-    return expected_eq - my_current
+    return expected_eq - my_fold
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +149,17 @@ class ICMBot:
     def __init__(self, simulations: int = 300):
         self.simulations = simulations
 
+    @staticmethod
+    def _last_aggressor(state: PlayerView) -> Optional[str]:
+        for entry in reversed(state.history or []):
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("pid") == state.me:
+                continue
+            if entry.get("type") in ("bet", "raise", "all_in"):
+                return entry.get("pid")
+        return None
+
     # ── Public interface ──────────────────────────────────────────────────
 
     def act(self, state: PlayerView) -> Action:
@@ -131,7 +172,7 @@ class ICMBot:
         street = state.street
         position = state.position
         my_pid = state.me
-        opponents = state.opponents
+        opponents = acting_opponents_for(state)
 
         # If no hole cards (already folded / sitting out)
         if not hole:
@@ -212,7 +253,14 @@ class ICMBot:
             pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.0
 
             # Compute ICM EV of calling
-            icm_delta = icm_ev_of_call(my_pid, stacks, pot, to_call, win_prob)
+            icm_delta = icm_ev_of_call(
+                my_pid,
+                stacks,
+                pot,
+                to_call,
+                win_prob,
+                pot_recipient_pid=self._last_aggressor(state),
+            )
 
             # ICM says fold: the call loses equity even if chip-EV is close
             if icm_delta < -0.005 and win_prob < pot_odds + call_threshold:

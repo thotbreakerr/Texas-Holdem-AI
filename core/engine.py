@@ -166,6 +166,11 @@ def _legal_actions_for(
     alive_pids,    # list of active players
     big_blind,     # numeric BB
 ):
+    # TODO: this function is dead code (never called — the betting round has
+    # its own inline legal-action logic).  It also has the same bet/raise
+    # labeling bug fixed in _betting_round: CASE B offers only "check" but
+    # no "raise" option when a bet exists and the player has matched it.
+    # If this is ever resurrected, apply the same fix.
     """
     Returns a list of action dicts like:
       {"type": "check"}
@@ -253,31 +258,53 @@ class InProcessBot(BotAdapter):
     def __init__(self, bot_obj: Any):
         self.bot = bot_obj
 
+    @staticmethod
+    def _looks_like_view_dict_mismatch(exc: BaseException) -> bool:
+        msg = str(exc)
+        return (
+            isinstance(exc, AttributeError)
+            and "PlayerView" in msg
+            and ("get" in msg or "__getitem__" in msg)
+        ) or (
+            isinstance(exc, TypeError)
+            and "PlayerView" in msg
+            and "subscriptable" in msg
+        )
+
+    @staticmethod
+    def _view_as_dict(view: PlayerView) -> Dict[str, Any]:
+        return {
+            "street": view.street,
+            "position": view.position,
+            "hole_cards": view.hole_cards,
+            "board": view.board,
+            "pot": view.pot,
+            "to_call": view.to_call,
+            "min_raise": view.min_raise,
+            "max_raise": view.max_raise,
+            "legal_actions": view.legal_actions,
+            "stacks": view.stacks,
+            "me": view.me,
+            "opponents": view.opponents,
+            "history": view.history,
+            "hand_id": view.hand_id,
+            "seat_indices": view.seat_indices,
+            "acting_opponents": view.acting_opponents,
+            "all_in_opponents": view.all_in_opponents,
+        }
+
     def act(self, view: PlayerView) -> Action:
         # Pass PlayerView directly; bots that still expect a dict get one via fallback
         try:
             a = self.bot.act(view)
-        except (AttributeError, TypeError, Exception) as e:
+        except (AttributeError, TypeError) as e:
+            if not self._looks_like_view_dict_mismatch(e):
+                raise
             # Legacy bot expects a dict — convert for backwards compatibility
             warnings.warn(
                 f"Bot for {view.me} failed with {type(e).__name__}: {e}, using dict fallback"
             )
-            state = {
-                "street": view.street,
-                "position": view.position,
-                "hole_cards": view.hole_cards,
-                "board": view.board,
-                "pot": view.pot,
-                "to_call": view.to_call,
-                "min_raise": view.min_raise,
-                "max_raise": view.max_raise,
-                "legal_actions": view.legal_actions,
-                "stacks": view.stacks,
-                "me": view.me,
-                "opponents": view.opponents,
-                "history": view.history,
-            }
-            a = self.bot.act(state)
+            a = self.bot.act(self._view_as_dict(view))
 
         t = a.get("type") if isinstance(a, dict) else getattr(a, "type", None)
         amt = a.get("amount") if isinstance(a, dict) else getattr(a, "amount", None)
@@ -307,8 +334,8 @@ class Table:
 
         logger = DecisionLogger(enabled=log_decisions)
 
-        # NEW — set hand ID
-        logger.start_hand(self.hand_counter)
+        hand_id = self.hand_counter
+        logger.start_hand(hand_id)
         self.hand_counter += 1
 
         # Normalize seats
@@ -392,6 +419,7 @@ class Table:
                 history,
                 on_event,
                 logger=logger,
+                hand_id=hand_id,
                 **extra_kwargs,
             )
 
@@ -400,10 +428,21 @@ class Table:
                 total_pot = pot_total + sum(contrib.values())
                 by_pid[winner].chips += total_pot
 
-                return {
+                # Build per-player net for this hand
+                net = {
                     pid: by_pid[pid].chips - start_chips.get(pid, by_pid[pid].chips)
                     for pid in start_chips
                 }
+
+                # Log results so fold-win hands get result rows in the
+                # JSONL file — without this, ML training data is biased
+                # because --filter_winners drops fold-win hands entirely.
+                for pid, delta in net.items():
+                    logger.log_result(pid, delta)
+                logger.flush()
+                logger.close()
+
+                return net
 
             # No winner yet — accumulate this street's contribs
             for pid, c in contrib.items():
@@ -461,7 +500,7 @@ class Table:
     def _betting_round(
         self, street, seats, ring, pos_by_pid, hole, board, contrib, pot, bb,
         bot_for, history, on_event, logger, start_idx: int = 0,
-        folded_pids: set = None
+        folded_pids: set = None, hand_id: Optional[int] = None
     ):
         # print(f"\n=== BETTING ROUND START: {street} ===")
         # print(f"Pot before street: {pot}")
@@ -489,6 +528,9 @@ class Table:
         # ends when every live, non-all-in player is in has_acted AND
         # contributions are all equal.
         has_acted: set = set()
+        # A short all-in raise lets players call/fold the extra chips, but it
+        # does not reopen raising to players who had already acted.
+        raise_blocked: set = set()
 
         # ---- helpers ----
         def num_players_can_act():
@@ -504,11 +546,17 @@ class Table:
         def all_live_equal():
             live = []
             contribs = set()
+            highest = 0
             for i in ring:
                 s = seats[i]
                 pid = s.player_id
                 if pid in folded:
                     continue
+                # Track the highest contribution across *all* unfolded players,
+                # including those who are already all-in — a live player still
+                # owes chips if their contribution trails an all-in shove.
+                if contrib[pid] > highest:
+                    highest = contrib[pid]
                 if allin[pid]:
                     continue
                 if s.chips <= 0:
@@ -516,8 +564,15 @@ class Table:
                     continue
                 live.append(pid)
                 contribs.add(contrib[pid])
-            if len(live) <= 1:
+            if not live:
+                # Everyone is folded or all-in → nothing left to decide.
                 return True
+            if len(live) == 1:
+                # A lone live player ends the street only once they have matched
+                # the highest contribution.  If they still face an unmet bet or
+                # all-in they must be given the call/fold/raise decision rather
+                # than being dragged to showdown without acting.
+                return contrib[live[0]] >= highest
             # Every live player must have acted since the last bet/raise
             # AND all contributions must be equal before we close the street.
             all_acted = all(pid in has_acted for pid in live)
@@ -554,19 +609,46 @@ class Table:
 
             # LEGAL ACTIONS
             legal = []
+            can_raise = pid not in raise_blocked
             if to_call == 0:
                 legal.append({"type": "check"})
-                if seat.chips > 0:
-                    min_bet = min(bb, seat.chips)
-                    max_bet = seat.chips
-                    if max_bet >= min_bet:
-                        legal.append({"type": "bet", "min": min_bet, "max": max_bet})
+                if current_bet == 0:
+                    # No bet on this street yet → player can open with a "bet"
+                    if seat.chips > 0:
+                        min_bet = min(bb, seat.chips)
+                        max_bet = seat.chips
+                        if max_bet >= min_bet:
+                            legal.append({"type": "bet", "min": min_bet, "max": max_bet})
+                else:
+                    # A bet exists but this player has already matched it
+                    # (e.g. BB postflop after preflop limps).  Aggressive
+                    # action here is a "raise", not a new "bet", with the
+                    # same min/max structure used in the to_call > 0 raise
+                    # branch so bots see a consistent action shape.
+                    if can_raise and seat.chips > 0:
+                        max_total = seat.chips + contrib[pid]
+                        min_total = current_bet + last_raise_size
+                        min_total = max(min_total, current_bet + bb)
+                        if max_total >= min_total:
+                            legal.append({
+                                "type": "raise",
+                                "min": min_total,
+                                "max": max_total,
+                            })
+                        elif max_total > current_bet:
+                            legal.append({
+                                "type": "raise",
+                                "min": max_total,
+                                "max": max_total,
+                                "all_in": True,
+                                "reopens": False,
+                            })
             else:
                 legal.append({"type": "fold"})
                 call_amt = min(seat.chips, to_call)
                 if call_amt > 0:
                     legal.append({"type": "call"})
-                if seat.chips > to_call:
+                if can_raise and seat.chips > to_call:
                     max_total = seat.chips + contrib[pid]
                     min_total = current_bet + last_raise_size
                     min_total = max(min_total, current_bet + bb)
@@ -575,6 +657,14 @@ class Table:
                             "type": "raise",
                             "min": min_total,
                             "max": max_total,
+                        })
+                    elif max_total > current_bet:
+                        legal.append({
+                            "type": "raise",
+                            "min": max_total,
+                            "max": max_total,
+                            "all_in": True,
+                            "reopens": False,
                         })
 
             # print(f"[{street}] Acting: {pid} | chips={seat.chips} contrib={contrib[pid]} to_call={to_call}")
@@ -588,6 +678,22 @@ class Table:
                 pv_min_raise = max(0, (current_bet + last_raise_size) - contrib[pid])
                 pv_max_raise = seat.chips
 
+            stacks_view = {seats[i].player_id: seats[i].chips for i in ring}
+            seat_indices = {seats[i].player_id: i for i in ring}
+            opponents = [
+                seats[i].player_id for i in ring
+                if seats[i].player_id != pid
+                and seats[i].player_id not in folded
+            ]
+            acting_opponents = [
+                opid for opid in opponents
+                if stacks_view.get(opid, 0) > 0 and not allin[opid]
+            ]
+            all_in_opponents = [
+                opid for opid in opponents
+                if stacks_view.get(opid, 0) <= 0 or allin[opid]
+            ]
+
             view = PlayerView(
                 me=pid,
                 street=street,
@@ -599,35 +705,17 @@ class Table:
                 min_raise=pv_min_raise,
                 max_raise=pv_max_raise,
                 legal_actions=legal,
-                stacks={seats[i].player_id: seats[i].chips for i in ring},
-                opponents=[
-                    seats[i].player_id for i in ring
-                    if seats[i].player_id != pid
-                    and seats[i].player_id not in folded
-                    and seats[i].chips > 0
-                ],
+                stacks=stacks_view,
+                opponents=opponents,
                 history=list(history),
+                hand_id=hand_id,
+                seat_indices=seat_indices,
+                acting_opponents=acting_opponents,
+                all_in_opponents=all_in_opponents,
             )
 
             # BOT ACTION
             raw_action = bot_for[pid].act(view)
-
-            # ---- ML LOGGING (only here, once per actual action) ----
-            if logger is not None:
-                logger.log_decision({
-                    "player": pid,
-                    "street": street,
-                    "hole": hole[pid],
-                    "board": list(board),
-                    "pot": view.pot,
-                    "to_call": to_call,
-                    "legal": view.legal_actions,
-                    "chosen_action": {"type": raw_action.type, "amount": raw_action.amount},
-                    "stacks": view.stacks,
-                    "opponents": view.opponents,
-                    "folded": False,
-                    "hand_id": getattr(self, "hand_index", None)
-                })
 
             # Sanitize illegal action type
             legal_types = {a["type"] for a in legal}
@@ -659,6 +747,26 @@ class Table:
             action = Action(action_type, action_amt)
             # print(f"    Chosen action: {action.type} {action.amount}")
 
+            # ---- ML LOGGING (only here, once per actual executed action) ----
+            if logger is not None:
+                logger.log_decision({
+                    "player": pid,
+                    "street": street,
+                    "hole": hole[pid],
+                    "board": list(board),
+                    "pot": view.pot,
+                    "to_call": to_call,
+                    "legal": view.legal_actions,
+                    "chosen_action": {"type": action.type, "amount": action.amount},
+                    "stacks": view.stacks,
+                    "opponents": view.opponents,
+                    "acting_opponents": view.acting_opponents,
+                    "all_in_opponents": view.all_in_opponents,
+                    "seat_indices": view.seat_indices,
+                    "folded": False,
+                    "hand_id": hand_id,
+                })
+
             # Add to history BEFORE modifying contrib
             history.append({
                 "street": street,
@@ -666,6 +774,7 @@ class Table:
                 "type": action.type,
                 "amount": action.amount,
                 "to_call_before": to_call,
+                "pot_before": pot + sum(contrib.values()),
             })
 
             # APPLY ACTION
@@ -687,6 +796,7 @@ class Table:
 
             elif action.type in ("bet", "raise"):
                 prev_bet = max(contrib.values())
+                prev_last_raise_size = last_raise_size
                 target_total = int(action.amount or 0)
                 need = max(0, target_total - contrib[pid])
                 if need > seat.chips:
@@ -699,15 +809,27 @@ class Table:
                     allin[pid] = True
 
                 new_bet = max(contrib.values())
-                if street == "preflop" and prev_bet == 0:
-                    last_raise_size = new_bet
-                else:
-                    raise_sz = new_bet - prev_bet
-                    if raise_sz > 0:
+                raise_sz = new_bet - prev_bet
+                if raise_sz > 0:
+                    full_raise = prev_bet == 0 or raise_sz >= prev_last_raise_size
+                    if full_raise:
                         last_raise_size = raise_sz
-
-                # A bet/raise resets the "acted" tracker — everyone must respond
-                has_acted.clear()
+                        raise_blocked.clear()
+                        # A full bet/raise resets the acted tracker — everyone
+                        # must respond and raising is reopened.
+                        has_acted.clear()
+                    else:
+                        raise_blocked.update(has_acted)
+                        for i in ring:
+                            other = seats[i]
+                            opid = other.player_id
+                            if (
+                                opid not in folded
+                                and not allin[opid]
+                                and other.chips > 0
+                                and contrib[opid] < new_bet
+                            ):
+                                has_acted.discard(opid)
                 # print(f"    {pid} {action.type.upper()} to {target_total} (paid {need})")
 
             # Record that this player has acted this street
@@ -910,4 +1032,3 @@ class LiveTournamentGraph:
         self._fig.savefig(filename)
         print(f"Tournament chart saved to {filename}")
         self._plt.show()
-

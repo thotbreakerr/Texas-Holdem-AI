@@ -26,11 +26,11 @@ from core.icm import equities as icm_equities
 
 @dataclass(frozen=True)
 class Snapshot:
-    """Full-information game state at a decision point. Frozen so it is
-    hashable and safe to use as an LRU-cache key.
+    """Full-information game state at a decision point.
 
-    hole_cards is a dict but should be treated as immutable post-construction
-    — document that, don't enforce it.
+    Frozen so fields cannot be reassigned. NOT hashable -- hole_cards is a
+    dict. If LRU caching is needed later, convert hole_cards to a tuple of
+    (seat, hole_pair) items first.
     """
     hole_cards: dict          # seat_idx -> (card, card), all seats
     board: tuple              # tuple of cards (hashable)
@@ -39,6 +39,7 @@ class Snapshot:
     alive: tuple              # per seat, True = still in hand
     to_call: int              # hero's call amount right now
     hero_committed: int       # hero chips already in pot this hand
+    committed_per_seat: tuple # per-seat chips already in the pot this hand
 
 
 def _deal_remaining_board(board_tuple, deck_remaining, need):
@@ -54,8 +55,77 @@ def _deal_remaining_board(board_tuple, deck_remaining, need):
     return [board_tuple + combo for combo in combinations(deck_remaining, need)]
 
 
+def _score_alive_hands(hole_cards_dict, full_board, alive_tuple):
+    """Return {seat: score} for live seats with known hole cards."""
+    board_list = list(full_board)
+    scores = {}
+    for seat, is_alive in enumerate(alive_tuple):
+        if not is_alive or seat not in hole_cards_dict:
+            continue
+        scores[seat] = eval_hand(list(hole_cards_dict[seat]), board_list)
+    return scores
+
+
+def _side_pot_awards(scores, alive_tuple, committed_per_seat, pot):
+    """Settle a complete-board showdown with main/side-pot eligibility.
+
+    Contributions define pot layers. Folded seats can contribute dead chips to
+    a layer, but only live seats at or above that contribution level can win it.
+    If pot is larger than the sum of committed_per_seat, the defensive
+    remainder is awarded to the best live hand overall.
+    """
+    awards = {seat: 0.0 for seat in range(len(committed_per_seat))}
+    if not scores or pot <= 0:
+        return awards
+
+    contrib = [max(0, int(c)) for c in committed_per_seat]
+    total_committed = sum(contrib)
+    effective_pot = min(int(pot), total_committed) if total_committed > 0 else 0
+
+    prev_level = 0
+    distributed = 0
+    levels = sorted({c for c in contrib if c > 0})
+    for level in levels:
+        contributors = [i for i, c in enumerate(contrib) if c >= level]
+        layer = (level - prev_level) * len(contributors)
+        if layer <= 0:
+            prev_level = level
+            continue
+
+        if distributed + layer > effective_pot:
+            layer = effective_pot - distributed
+        if layer <= 0:
+            break
+
+        contenders = [
+            i for i in contributors
+            if i < len(alive_tuple) and alive_tuple[i] and i in scores
+        ]
+        if contenders:
+            best = max(scores[i] for i in contenders)
+            winners = [i for i in contenders if scores[i] == best]
+            share = layer / len(winners)
+            for w in winners:
+                awards[w] += share
+            distributed += layer
+
+        prev_level = level
+        if distributed >= effective_pot:
+            break
+
+    remainder = pot - distributed
+    if remainder > 0:
+        best = max(scores.values())
+        winners = [seat for seat, score in scores.items() if score == best]
+        share = remainder / len(winners)
+        for w in winners:
+            awards[w] += share
+
+    return awards
+
+
 def _evaluate_showdown(hole_cards_dict, full_board, alive_tuple, pot,
-                        stacks_tuple, hero_seat):
+                        stacks_tuple, hero_seat, committed_per_seat):
     """Evaluate a single showdown scenario for chip-EV.
 
     Returns hero's share of the pot (the equity * pot value).
@@ -69,31 +139,9 @@ def _evaluate_showdown(hole_cards_dict, full_board, alive_tuple, pot,
             return pot
         return 0.0
 
-    board_list = list(full_board)
-
-    # Evaluate all alive hands
-    scores = {}
-    for seat in alive_seats:
-        cards = hole_cards_dict[seat]
-        scores[seat] = eval_hand(list(cards), board_list)
-
-    # Determine hero's share considering potential side pots
-    hero_score = scores.get(hero_seat, 0)
-
-    # Simple side-pot handling: hero can only win up to their eligible share
-    # Hero's eligible pot = min(hero_total_in, each_opponent_total_in) summed
-    # For the snapshot value function, we approximate:
-    # hero's max winnable = pot (already accounts for stack-limited contributions)
-
-    # Find the best score among all alive players
-    best_score = max(scores.values())
-
-    if hero_score < best_score:
-        return 0.0  # hero loses
-
-    # Hero ties or wins
-    winners = [s for s in alive_seats if scores[s] == best_score]
-    return pot / len(winners)
+    scores = _score_alive_hands(hole_cards_dict, full_board, alive_tuple)
+    awards = _side_pot_awards(scores, alive_tuple, committed_per_seat, pot)
+    return awards.get(hero_seat, 0.0)
 
 
 def value(snapshot: Snapshot, hero_seat: int, mode: str = "chip_ev",
@@ -179,7 +227,8 @@ def _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
         # River: deterministic
         return _evaluate_showdown(
             snapshot.hole_cards, board, snapshot.alive,
-            snapshot.pot, snapshot.stacks, hero_seat)
+            snapshot.pot, snapshot.stacks, hero_seat,
+            snapshot.committed_per_seat)
 
     if cards_remaining <= 2:
         # Turn (1 card) or flop (2 cards): enumerate exactly
@@ -188,7 +237,8 @@ def _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
         for full_board in boards:
             total_value += _evaluate_showdown(
                 snapshot.hole_cards, full_board, snapshot.alive,
-                snapshot.pot, snapshot.stacks, hero_seat)
+                snapshot.pot, snapshot.stacks, hero_seat,
+                snapshot.committed_per_seat)
         return total_value / len(boards) if boards else 0.0
 
     # Preflop (5 cards remaining): Monte Carlo
@@ -201,7 +251,8 @@ def _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
         full_board = board + tuple(sample)
         total_value += _evaluate_showdown(
             snapshot.hole_cards, full_board, snapshot.alive,
-            snapshot.pot, snapshot.stacks, hero_seat)
+            snapshot.pot, snapshot.stacks, hero_seat,
+            snapshot.committed_per_seat)
         valid += 1
 
     return total_value / valid if valid > 0 else 0.0
@@ -218,11 +269,29 @@ def _tournament_value(snapshot, hero_seat, board, cards_remaining,
     alive_tuple = snapshot.alive
     alive_seats = [i for i, a in enumerate(alive_tuple) if a]
 
-    # Fold baseline: hero keeps their current stack, pot distributed
-    # to other alive players proportionally (simplification: pot stays
-    # with the eventual winner but hero has folded).
-    # Actually, the fold baseline is just current ICM equity.
-    fold_eq = icm_equities(stacks_list, payouts)[hero_seat]
+    # Fold baseline: hero folds and forfeits the pot to the remaining
+    # contesting players.  The pot MUST be redistributed rather than dropped:
+    # ICM equity is a fraction of the total chips in play, and the play-world
+    # showdown stacks (_compute_showdown_stacks) add the pot back to the
+    # winners.  Comparing equities computed over two different chip totals
+    # (fold world without the pot vs. play world with it) is not chip
+    # conserving and biases every tournament value downward.  Under the locked
+    # winner-take-all format hero's fold equity is independent of how the pot
+    # is split among the others; the proportional split is a neutral
+    # convention for non-WTA payouts.
+    fold_stacks = list(stacks_list)
+    pot = int(getattr(snapshot, "pot", 0) or 0)
+    others = [i for i in alive_seats if i != hero_seat]
+    if others and pot > 0:
+        others_total = sum(stacks_list[i] for i in others)
+        if others_total > 0:
+            for i in others:
+                fold_stacks[i] += pot * stacks_list[i] / others_total
+        else:
+            share = pot / len(others)
+            for i in others:
+                fold_stacks[i] += share
+    fold_eq = icm_equities(fold_stacks, payouts)[hero_seat]
 
     if cards_remaining == 0:
         # River: deterministic showdown
@@ -262,26 +331,15 @@ def _tournament_value(snapshot, hero_seat, board, cards_remaining,
 def _compute_showdown_stacks(snapshot, full_board, alive_seats):
     """Given a snapshot and a complete board, compute the resulting stacks
     after showdown distribution."""
-    board_list = list(full_board)
-
-    # Evaluate hands for alive players
-    scores = {}
-    for seat in alive_seats:
-        if seat in snapshot.hole_cards:
-            cards = snapshot.hole_cards[seat]
-            scores[seat] = eval_hand(list(cards), board_list)
-
+    scores = _score_alive_hands(snapshot.hole_cards, full_board, snapshot.alive)
     if not scores:
         return list(snapshot.stacks)
 
-    best_score = max(scores.values())
-    winners = [s for s in scores if scores[s] == best_score]
-
-    # Distribute pot to winners
+    awards = _side_pot_awards(
+        scores, snapshot.alive, snapshot.committed_per_seat, snapshot.pot
+    )
     stacks = list(snapshot.stacks)
-    share = snapshot.pot // len(winners)
-    remainder = snapshot.pot % len(winners)
-    for i, w in enumerate(winners):
-        stacks[w] += share + (1 if i < remainder else 0)
+    for seat, amount in awards.items():
+        stacks[seat] += amount
 
     return stacks

@@ -30,9 +30,9 @@ print(f"  Seat 2 VPIP after 10 folds: {stats.vpip:.4f}")
 print(f"  Sample size: {stats.sample_size}")
 
 if stats.vpip < 0.05:
-    print("  ✅ PASS — VPIP near 0")
+    print("  [PASS] — VPIP near 0")
 else:
-    print(f"  ❌ FAIL — VPIP = {stats.vpip:.4f}")
+    print(f"  [FAIL] — VPIP = {stats.vpip:.4f}")
     PASS = False
 
 print()
@@ -60,15 +60,15 @@ print(f"  Seat 3 PFR: {stats2.pfr:.4f}")
 print(f"  Sample size: {stats2.sample_size}")
 
 if stats2.vpip >= 0.9:
-    print("  ✅ PASS — VPIP near 1.0")
+    print("  [PASS] — VPIP near 1.0")
 else:
-    print(f"  ❌ FAIL — VPIP = {stats2.vpip:.4f}")
+    print(f"  [FAIL] — VPIP = {stats2.vpip:.4f}")
     PASS = False
 
 if stats2.af >= 2.0:
-    print("  ✅ PASS — AF high (aggressive)")
+    print("  [PASS] — AF high (aggressive)")
 else:
-    print(f"  ❌ FAIL — AF = {stats2.af:.4f}")
+    print(f"  [FAIL] — AF = {stats2.af:.4f}")
     PASS = False
 
 print()
@@ -103,9 +103,9 @@ print(f"  After +5 folds: VPIP = {stats_after.vpip:.4f}")
 # VPIP should reflect a mix since window is 10 and we have 15 total
 # The window keeps the last 10, so 5 raises + 5 folds = VPIP ~0.5
 if stats_after.vpip < stats_before.vpip:
-    print("  ✅ PASS — VPIP decreased after folds")
+    print("  [PASS] — VPIP decreased after folds")
 else:
-    print("  ❌ FAIL — VPIP didn't decrease")
+    print("  [FAIL] — VPIP didn't decrease")
     PASS = False
 
 print()
@@ -132,9 +132,9 @@ tp_stats = tp_tracker.stats_for(0)
 tp_bucket = tp_tracker.bucket(0)
 print(f"  TP profile: VPIP={tp_stats.vpip:.2f}, AF={tp_stats.af:.2f} → bucket={tp_bucket}")
 if tp_bucket == "TP":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected TP, got {tp_bucket}")
+    print(f"  [FAIL] — expected TP, got {tp_bucket}")
     PASS = False
 
 # TA: tight aggressive (vpip < 0.25, af > 1.5)
@@ -152,9 +152,9 @@ ta_stats = ta_tracker.stats_for(0)
 ta_bucket = ta_tracker.bucket(0)
 print(f"  TA profile: VPIP={ta_stats.vpip:.2f}, AF={ta_stats.af:.2f} → bucket={ta_bucket}")
 if ta_bucket == "TA":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected TA, got {ta_bucket}")
+    print(f"  [FAIL] — expected TA, got {ta_bucket}")
     PASS = False
 
 # LP: loose passive (vpip >= 0.25, af <= 1.5)
@@ -171,9 +171,9 @@ lp_stats = lp_tracker.stats_for(0)
 lp_bucket = lp_tracker.bucket(0)
 print(f"  LP profile: VPIP={lp_stats.vpip:.2f}, AF={lp_stats.af:.2f} → bucket={lp_bucket}")
 if lp_bucket == "LP":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected LP, got {lp_bucket}")
+    print(f"  [FAIL] — expected LP, got {lp_bucket}")
     PASS = False
 
 # LA: loose aggressive (vpip >= 0.25, af > 1.5)
@@ -191,9 +191,9 @@ la_stats = la_tracker.stats_for(0)
 la_bucket = la_tracker.bucket(0)
 print(f"  LA profile: VPIP={la_stats.vpip:.2f}, AF={la_stats.af:.2f} → bucket={la_bucket}")
 if la_bucket == "LA":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected LA, got {la_bucket}")
+    print(f"  [FAIL] — expected LA, got {la_bucket}")
     PASS = False
 
 print()
@@ -216,9 +216,9 @@ bucket_low = default_tracker.bucket(1)
 stats_low = default_tracker.stats_for(1)
 print(f"  Sample size: {stats_low.sample_size}, bucket: {bucket_low}")
 if bucket_low == "TA":
-    print("  ✅ PASS — default TA for low sample")
+    print("  [PASS] — default TA for low sample")
 else:
-    print(f"  ❌ FAIL — expected TA, got {bucket_low}")
+    print(f"  [FAIL] — expected TA, got {bucket_low}")
     PASS = False
 
 print()
@@ -250,16 +250,16 @@ try:
     t1 = tensor_tracker.to_tensor(1)  # empty seat
     print(f"  Seat 1 (empty) tensor shape: {t1.shape}")
     if t0.shape == t1.shape:
-        print("  ✅ PASS — stable shape across seats")
+        print("  [PASS] — stable shape across seats")
     else:
-        print("  ❌ FAIL — different shapes")
+        print("  [FAIL] — different shapes")
         PASS = False
 
     # No NaN
     if not torch.isnan(t0).any() and not torch.isnan(t1).any():
-        print("  ✅ PASS — no NaN values")
+        print("  [PASS] — no NaN values")
     else:
-        print("  ❌ FAIL — NaN detected")
+        print("  [FAIL] — NaN detected")
         PASS = False
 
     # Confidence scalar increases with sample size
@@ -267,13 +267,13 @@ try:
     conf_1 = t1[-1].item()
     print(f"  Confidence: seat 0 = {conf_0:.4f}, seat 1 = {conf_1:.4f}")
     if conf_0 > conf_1:
-        print("  ✅ PASS — confidence increases with sample size")
+        print("  [PASS] — confidence increases with sample size")
     else:
-        print("  ❌ FAIL — confidence not increasing")
+        print("  [FAIL] — confidence not increasing")
         PASS = False
 
 except ImportError:
-    print("  ⚠ SKIP — torch not available")
+    print("  [OPTIONAL] SKIP — torch not available")
 
 print()
 
@@ -283,8 +283,8 @@ print()
 
 print("=" * 60)
 if PASS:
-    print("ALL CHECKS PASSED ✅")
+    print("ALL CHECKS PASSED [PASS]")
 else:
-    print("SOME CHECKS FAILED ❌")
+    print("SOME CHECKS FAILED [FAIL]")
     sys.exit(1)
 print("=" * 60)

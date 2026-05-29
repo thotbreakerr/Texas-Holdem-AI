@@ -11,17 +11,62 @@ from contextlib import redirect_stdout
 from multiprocessing import Pool
 
 from core.engine import Table, Seat
+from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from bots import parse_players, escalate_blinds, create_bot
 
 
 # ── Single silent tournament ──────────────────────────────────────────────────
+
+def maybe_disable_deep_cfr_search(adapter, bot_type: str):
+    """Disable DeepCFR real-time search on an adapter, if it wraps DeepCFRBot."""
+    key = bot_type.strip().lower()
+    if not key.startswith(("deep_cfr", "deepcfr", "deep_cfr_bot")):
+        return adapter
+    inner = getattr(adapter, "bot", None)
+    if hasattr(inner, "search_depth"):
+        inner.search_depth = 0
+    return adapter
+
+
+def _advance_dealer(dealer_index: int, active_count: int) -> int:
+    """Advance the dealer button by one in the ACTIVE seat circle.
+
+    Bug fingerprint (now fixed): using % len(seats_total) instead of
+    % active_count produces sequences with duplicate consecutive indices
+    after eliminations (e.g. with 6 seats total but 5 active:
+    [0,1,2,3,4,0,0,1,2,3] — note the double-0 at positions 5 and 6).
+    Correct rotation: [0,1,2,3,4,0,1,2,3,4].
+    """
+    return (dealer_index + 1) % active_count
+
+def finalize_finish_order(seats, finish_order, total_players, hand_count):
+    """Append survivor results after a natural finish or safety stop."""
+    survivors = [
+        s for s in seats
+        if s.chips > 0 and not any(e[0] == s.player_id for e in finish_order)
+    ]
+
+    if len(survivors) == 1:
+        finish_order.append((survivors[0].player_id, 1, hand_count, survivors[0].chips))
+    elif len(survivors) > 1:
+        if not finish_order:
+            # Match run_local_match.py: no eliminations means unfinished/unranked.
+            for s in survivors:
+                finish_order.append((s.player_id, 0, hand_count, s.chips))
+        else:
+            sorted_survivors = sorted(survivors, key=lambda s: s.chips, reverse=True)
+            for rank_idx, s in enumerate(sorted_survivors):
+                finish_order.append((s.player_id, rank_idx + 1, hand_count, s.chips))
+
+    return finish_order
 
 def run_silent_tournament(args_tuple):
     """Run one tournament silently. Accepts a tuple for multiprocessing.Pool.map.
 
     Returns dict with: winner, hand_count, finish_order [(pid, position, hand#, chips_at_elim)].
     """
-    player_specs, chips, base_sb, base_bb, blind_increase_every, max_hands, seed = args_tuple
+    (player_specs, chips, base_sb, base_bb, blind_increase_every,
+     max_hands, seed, disable_search) = args_tuple
 
     if seed is not None:
         random.seed(seed)
@@ -29,10 +74,14 @@ def run_silent_tournament(args_tuple):
     # Rebuild bots in this process (can't pickle adapters across processes)
     bots = {}
     for pid, btype, _ in player_specs:
-        bots[pid] = create_bot(btype)
+        adapter = create_bot(btype)
+        if disable_search:
+            adapter = maybe_disable_deep_cfr_search(adapter, btype)
+        bots[pid] = adapter
 
     seats = [Seat(player_id=pid, chips=chips) for pid, _, _ in player_specs]
-    table = Table()
+    table_rng = random.Random(seed) if seed is not None else random.Random()
+    table = Table(rng=table_rng)
     dealer_index = 0
     hand_count = 0
     total_players = len(seats)
@@ -48,16 +97,21 @@ def run_silent_tournament(args_tuple):
             sb, bb = escalate_blinds(hand_count, base_sb, base_bb, blind_increase_every)
             active_seats = [s for s in seats if s.chips > 0]
             active_bots = {s.player_id: bots[s.player_id] for s in active_seats}
+            dealer_index = normalize_dealer_seat_index(seats, dealer_index)
+            if dealer_index is None:
+                break
 
             table.play_hand(
-                seats=active_seats,
+                seats=seats,
                 small_blind=sb,
                 big_blind=bb,
-                dealer_index=dealer_index % len(active_seats),
+                dealer_index=dealer_index,
                 bot_for=active_bots,
                 on_event=None,
             )
-            dealer_index = (dealer_index + 1) % len(seats)
+            next_dealer = advance_dealer_seat_index(seats, dealer_index)
+            if next_dealer is not None:
+                dealer_index = next_dealer
 
             # Track eliminations
             for s in seats:
@@ -68,27 +122,13 @@ def run_silent_tournament(args_tuple):
             if hand_count >= max_hands:
                 break
 
-    # Winner / survivors
-    for s in seats:
-        if s.chips > 0 and not any(e[0] == s.player_id for e in finish_order):
-            finish_order.append((s.player_id, 1, hand_count, s.chips))
-
-    # If we hit max_hands, assign remaining positions by chip count
-    unfinished = [s for s in seats
-                  if not any(e[0] == s.player_id for e in finish_order)]
-    unfinished.sort(key=lambda s: s.chips, reverse=True)
-    next_pos = total_players - len(finish_order)
-    for s in unfinished:
-        finish_order.append((s.player_id, next_pos, hand_count, s.chips))
-        next_pos -= 1
+    finalize_finish_order(seats, finish_order, total_players, hand_count)
 
     winner = None
     for pid, pos, _, _ in finish_order:
         if pos == 1:
             winner = pid
             break
-    if winner is None and finish_order:
-        winner = finish_order[-1][0]
 
     return {
         "winner": winner,
@@ -116,7 +156,8 @@ def _bar(done, total):
 
 
 def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_bb,
-                         blind_increase_every, max_hands, parallel, output_csv, seed):
+                         blind_increase_every, max_hands, parallel, output_csv, seed,
+                         disable_search=False):
     player_specs = parse_players(player_spec_str)
     if len(player_specs) < 2:
         print("Error: need at least 2 players.")
@@ -133,6 +174,8 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
           f"Escalation every {blind_increase_every} hands")
     if parallel > 1:
         print(f"Parallel workers: {parallel}")
+    if disable_search:
+        print("DeepCFR search: disabled (raw regret-matched policy)")
     print("=" * 75)
     print()
 
@@ -141,7 +184,7 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
     for i in range(num_tournaments):
         t_seed = (seed + i) if seed is not None else None
         tasks.append((player_specs, chips, base_sb, base_bb,
-                      blind_increase_every, max_hands, t_seed))
+                      blind_increase_every, max_hands, t_seed, disable_search))
 
     # Run tournaments
     results = []
@@ -170,7 +213,8 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
 
     for res in results:
         hand_counts.append(res["hand_count"])
-        wins[res["winner"]] += 1
+        if res["winner"] in pids:
+            wins[res["winner"]] += 1
 
         fo = res["finish_order"]  # [(pid, pos, hand#, chips)]
 
@@ -296,6 +340,8 @@ def main():
                         help="Number of parallel workers (default: 1, sequential)")
     parser.add_argument("--output-csv", type=str, default=None,
                         help="Save per-tournament results to CSV file")
+    parser.add_argument("--disable-search", action="store_true",
+                        help="Disable DeepCFR real-time search; use raw policy")
     parser.add_argument("--rl_model", type=str, default=None,
                         help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
                              "Rewrites any 'rl' entry in --players to use this model.")
@@ -316,6 +362,7 @@ def main():
         parallel=args.parallel,
         output_csv=args.output_csv,
         seed=args.seed,
+        disable_search=args.disable_search,
     )
 
 

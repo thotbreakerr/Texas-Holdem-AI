@@ -6,6 +6,7 @@ Provides:
   create_bot(btype)        -> BotAdapter
   escalate_blinds(...)     -> (sb, bb)
 """
+import os
 import re
 from core.engine import InProcessBot, RandomBot
 from core.bot_api import BotAdapter, PlayerView, Action
@@ -22,10 +23,13 @@ def create_bot(btype: str) -> BotAdapter:
       smart              SmartBot (heuristic)
       ml                 MLBot (supervised learning)
       rl, rl:<path>      RLBot (reinforcement learning, with optional model path)
-      cfr                CFRBot (MCCFR, loads models/cfr_regret.pkl by default)
+      cfr, cfr:<path>    CFRBot (MCCFR, optional profile path)
+      deep_cfr, deep_cfr:<path>
+                          DeepCFRBot (optional weights path)
       random             RandomBot
     """
-    btype = btype.strip().lower()
+    raw_btype = btype.strip()
+    btype = raw_btype.lower()
 
     if btype.startswith("mc"):
         from bots.monte_carlo_bot import MonteCarloBot
@@ -44,7 +48,7 @@ def create_bot(btype: str) -> BotAdapter:
     if btype in ("rl", "rlbot") or btype.startswith("rl:"):
         from bots.rl_bot import RLBot
         if btype.startswith("rl:"):
-            model_path = btype[3:]  # Extract path after "rl:"
+            model_path = raw_btype[3:]  # Extract path after "rl:"
             return _wrap(RLBot(model_path=model_path))
         else:
             return _wrap(RLBot())
@@ -68,13 +72,27 @@ def create_bot(btype: str) -> BotAdapter:
         from bots.opponent_model_bot import OpponentModelBot
         return _wrap(OpponentModelBot())
 
-    if btype in ("cfr", "cfrbot"):
+    if btype in ("cfr", "cfrbot") or btype.startswith(("cfr:", "cfrbot:")):
         from bots.cfr_bot import CFRBot
-        return _wrap(CFRBot(profile_path="models/cfr_regret_deep.pkl", inference_mode=True))
+        profile_path = "models/cfr_regret_deep_v2.pkl"
+        if ":" in raw_btype:
+            profile_path = raw_btype.split(":", 1)[1]
+        elif not os.path.exists(profile_path):
+            profile_path = None
+        return _wrap(CFRBot(profile_path=profile_path, inference_mode=True))
 
-    raise ValueError(f"Unknown bot type: {btype!r}. "
+    if (btype in ("deep_cfr", "deepcfr", "deep_cfr_bot") or
+            btype.startswith(("deep_cfr:", "deepcfr:", "deep_cfr_bot:"))):
+        from bots.deep_cfr_bot import DeepCFRBot
+        weights_path = "models/deep_cfr_v1.pt"
+        if ":" in raw_btype:
+            weights_path = raw_btype.split(":", 1)[1]
+        return _wrap(DeepCFRBot(weights_path=weights_path, inference_mode=True))
+
+    raise ValueError(f"Unknown bot type: {raw_btype!r}. "
                      "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
-                     "cfr, icm, exploitative, gto, opponentmodel")
+                     "cfr, cfr:<path>, deep_cfr, deep_cfr:<path>, "
+                     "icm, exploitative, gto, opponentmodel")
 
 
 class _PlayerViewAdapter(BotAdapter):

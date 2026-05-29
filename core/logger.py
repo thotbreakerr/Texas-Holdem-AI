@@ -4,8 +4,13 @@ import json
 import os
 from datetime import datetime
 
+# Class-level counter so every DecisionLogger instance in this process
+# gets a unique filename even when created within the same microsecond.
+_logger_counter = 0
+
 class DecisionLogger:
     def __init__(self, enabled=True, directory="logs"):
+        global _logger_counter
         self.enabled = enabled
         self.directory = directory
         self.file = None
@@ -13,8 +18,15 @@ class DecisionLogger:
 
         if enabled:
             os.makedirs(directory, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.file = open(f"{directory}/session_{ts}.jsonl", "w")
+            # Include PID + monotonic counter to guarantee unique filenames
+            # across processes and fast sequential hand creation.
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            pid = os.getpid()
+            seq = _logger_counter
+            _logger_counter += 1
+            self.file = open(
+                f"{directory}/session_{ts}_p{pid}_{seq}.jsonl", "a"
+            )
 
     def start_hand(self, hand_id: int):
         """Set hand ID at start of each hand."""

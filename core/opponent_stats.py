@@ -68,6 +68,15 @@ class OpponentStatTracker:
         self._in_hand = False
         self._current_street = "preflop"
 
+    def ensure_n_seats(self, n_seats: int):
+        """Grow tracker storage when a stable seat map exposes higher seats."""
+        if n_seats <= self.n_seats:
+            return
+        for seat_idx in range(self.n_seats, n_seats):
+            self._history[seat_idx] = deque(maxlen=self.window)
+            self._current[seat_idx] = _HandRecord()
+        self.n_seats = n_seats
+
     def observe_action(self, seat_idx: int, street: str, action: str,
                        pot_before: int = 0, is_cbet: bool = False):
         """Record one observed action.
