@@ -10,7 +10,7 @@ This mirrors the real gameday tournament format:
   * 1 000 chip starting stacks
   * 5/10 blinds with 1.5× escalation every 50 hands
 
-Saves to a *separate* profile (models/cfr_regret_deep.pkl) so the existing
+Saves to a *separate* profile (models/cfr_regret_deep_v2.pkl) so the existing
 heads-up profile (models/cfr_regret.pkl) is never touched.
 
 Equity-cache optimisation
@@ -27,7 +27,7 @@ sign of healthy convergence, not a bug.  Track ``info_sets`` and
 
 Checkpoint
 ----------
-* Loads  ``--profile``  (default: models/cfr_regret_deep.pkl) on startup.
+* Loads  ``--profile``  (default: models/cfr_regret_deep_v2.pkl) on startup.
 * Saves every ``--save_every`` episodes (default: 500) and at the end of
   training.
 
@@ -39,6 +39,7 @@ Usage
 """
 
 import os
+import random
 import sys
 
 # Add project root so imports work from any working directory.
@@ -47,7 +48,8 @@ sys.path.insert(0, project_root)
 
 import argparse
 
-from core.engine import Table, Seat, InProcessBot
+from core.engine import Table, Seat, InProcessBot, _FULL_DECK
+from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from core.bot_api import BotAdapter, PlayerView, Action
 from bots.cfr_bot import CFRBot
 from bots import escalate_blinds
@@ -79,12 +81,28 @@ BASE_BB = 10
 BLIND_ESCALATION_EVERY = 50   # hands
 
 
+def _format_card(card) -> str:
+    return f"{card[0]}{card[1]}"
+
+
+def _preview_first_flop(rng: random.Random, n_players: int) -> tuple:
+    """Preview the first hand's flop cards without advancing ``rng``."""
+    clone = random.Random()
+    clone.setstate(rng.getstate())
+    deck = list(_FULL_DECK)
+    clone.shuffle(deck)
+    for _ in range(n_players * 2):
+        deck.pop()
+    return tuple(deck.pop() for _ in range(3))
+
+
 def train_cfr_bot_multiway(
     num_tournaments: int = 50_000,
     chips_per_player: int = 1_000,
     iterations: int = 200,
     save_every: int = 500,
-    profile_path: str = "models/cfr_regret_deep.pkl",
+    profile_path: str = "models/cfr_regret_deep_v2.pkl",
+    seed: int | None = None,
 ) -> CFRBot:
     """
     Run multi-player CFR self-play for ``num_tournaments`` episodes.
@@ -92,9 +110,10 @@ def train_cfr_bot_multiway(
     Args:
         num_tournaments:  Number of 6-player tournament episodes.
         chips_per_player: Starting chip stack per seat (default 1 000).
-        iterations:       MCCFR rollouts per decision point.
+        iterations:       MCCFR traversals per decision point.
         save_every:       Persist the regret table every N episodes.
         profile_path:     Path for regret-table persistence.
+        seed:             Optional base seed. Episode N uses seed + N - 1.
 
     Returns:
         The trained CFRBot instance.
@@ -107,11 +126,18 @@ def train_cfr_bot_multiway(
     print(f"Chips per player: {chips_per_player}")
     print(f"Base blinds:      {BASE_SB}/{BASE_BB}")
     print(f"Blind escalation: every {BLIND_ESCALATION_EVERY} hands (×1.5)")
-    print(f"Iterations/pt:    {iterations}  (MCCFR rollouts per decision)")
+    print(f"Iterations/pt:    {iterations}  (MCCFR traversals per decision)")
     print(f"Save every:       {save_every} episodes")
     print(f"Profile path:     {profile_path}")
+    if seed is None:
+        print("Deck RNG:         system entropy per episode")
+    else:
+        print(f"Deck RNG:         reproducible per episode from seed={seed}")
     print("=" * 70)
     print()
+
+    if seed is not None:
+        random.seed(seed)
 
     # ── Build bot (constructor auto-loads profile if it exists) ──────────────
     bot = CFRBot(
@@ -133,12 +159,23 @@ def train_cfr_bot_multiway(
     # ── One shared adapter: all 6 seats reference the same CFRBot ────────────
     adapter = _CFRAdapter(bot)
 
-    table = Table()
     wins = {pid: 0 for pid in PLAYER_IDS}
+    first_flop_previews = []
 
     # ── Main training loop ───────────────────────────────────────────────────
     try:
         for episode in range(1, num_tournaments + 1):
+            episode_seed = seed + episode - 1 if seed is not None else None
+            table_rng = (
+                random.Random(episode_seed)
+                if episode_seed is not None
+                else random.Random()
+            )
+            if len(first_flop_previews) < 10:
+                first_flop_previews.append(
+                    (episode, _preview_first_flop(table_rng, NUM_PLAYERS))
+                )
+            table = Table(rng=table_rng)
 
             # Fresh chip stacks each episode
             seats = [Seat(player_id=pid, chips=chips_per_player) for pid in PLAYER_IDS]
@@ -164,18 +201,24 @@ def train_cfr_bot_multiway(
                     BASE_BB,
                     BLIND_ESCALATION_EVERY,
                 )
+                dealer_index = normalize_dealer_seat_index(seats, dealer_index)
+                if dealer_index is None:
+                    winner = None
+                    break
 
                 table.play_hand(
-                    seats=active_seats,
+                    seats=seats,
                     small_blind=sb,
                     big_blind=bb,
-                    dealer_index=dealer_index % len(active_seats),
+                    dealer_index=dealer_index,
                     bot_for={s.player_id: bots[s.player_id] for s in active_seats},
                     on_event=None,
                     log_decisions=False,
                 )
 
-                dealer_index = (dealer_index + 1) % len(active_seats)
+                next_dealer = advance_dealer_seat_index(seats, dealer_index)
+                if next_dealer is not None:
+                    dealer_index = next_dealer
                 hand_count += 1
 
                 if hand_count > 10_000:      # safety cap
@@ -190,8 +233,9 @@ def train_cfr_bot_multiway(
             if episode % save_every == 0:
                 bot.save(profile_path)
 
-            # ── Progress report every 1 000 episodes ─────────────────────────
-            if episode % 1_000 == 0:
+            # ── Progress report every 100 episodes (first 1k) or 1000 ─────
+            report_interval = 100 if episode <= 1_000 else 1_000
+            if episode % report_interval == 0:
                 s = bot.stats()
                 win_rates = "  ".join(
                     f"{pid}={wins[pid]/episode:.1%}" for pid in PLAYER_IDS
@@ -200,6 +244,7 @@ def train_cfr_bot_multiway(
                     f"  ep={episode:>7}  "
                     f"info_sets={s['info_sets']:<7}  "
                     f"total_iters={s['total_iterations']:<10}  "
+                    f"recursion_calls={s.get('recursion_calls', '?'):<8}  "
                     f"{win_rates}"
                 )
 
@@ -220,6 +265,12 @@ def train_cfr_bot_multiway(
         print(f"  Info sets:      {final_stats['info_sets']}")
         print(f"  Total iters:    {final_stats['total_iterations']}")
         print(f"  Profile saved:  {profile_path}")
+        if first_flop_previews:
+            preview_text = ", ".join(
+                f"ep{ep}:{'/'.join(_format_card(c) for c in flop)}"
+                for ep, flop in first_flop_previews
+            )
+            print(f"  First flop previews: {preview_text}")
         print(f"{'=' * 70}")
 
     return bot
@@ -243,15 +294,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--iterations", type=int, default=200,
-        help="MCCFR rollouts per decision point (default: 200)"
+        help="MCCFR traversals per decision point (default: 200)"
     )
     parser.add_argument(
         "--save_every", type=int, default=500,
         help="Save regret table every N episodes (default: 500)"
     )
     parser.add_argument(
-        "--profile", type=str, default="models/cfr_regret_deep.pkl",
-        help="Path for regret-table persistence (default: models/cfr_regret_deep.pkl)"
+        "--profile", type=str, default="models/cfr_regret_deep_v2.pkl",
+        help="Path for regret-table persistence (default: models/cfr_regret_deep_v2.pkl)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Optional base seed for reproducible per-episode deck RNG"
     )
     args = parser.parse_args()
 
@@ -263,4 +318,5 @@ if __name__ == "__main__":
         iterations=args.iterations,
         save_every=args.save_every,
         profile_path=args.profile,
+        seed=args.seed,
     )

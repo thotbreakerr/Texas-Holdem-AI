@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""
+run_eval.py — Path A vs Path B tournament evaluation harness.
+
+Runs either head-to-head Path A/Path B matches or multiway tournaments against
+the strong bot pool, then reports tournament-aware metrics with Wilson 95%
+confidence intervals.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import os
+import random
+import statistics
+from collections import defaultdict
+from contextlib import redirect_stdout
+from dataclasses import dataclass
+from multiprocessing import Pool
+from typing import Any
+
+from core.engine import Table, Seat
+from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
+from bots import create_bot, escalate_blinds
+from run_tournament_stats import finalize_finish_order
+
+
+PATH_A = "PATH_A"
+PATH_B = "PATH_B"
+DEFAULT_POOL = "smart,mc200,gto,icm,exploitative,opponentmodel"
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    mode: str
+    path_a_profile: str
+    path_b_weights: str
+    tournaments: int = 1000
+    pool: str = DEFAULT_POOL
+    chips: int = 500
+    sb: int = 5
+    bb: int = 10
+    blind_increase_every: int = 50
+    max_hands: int = 10000
+    seed: int | None = None
+    output_csv: str | None = None
+    parallel: int = 1
+
+
+def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Standard Wilson score interval for a binomial proportion."""
+    if n <= 0:
+        return (0.0, 0.0)
+    p = wins / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = p + z2 / (2.0 * n)
+    margin = z * ((p * (1.0 - p) / n + z2 / (4.0 * n * n)) ** 0.5)
+    low = (center - margin) / denom
+    high = (center + margin) / denom
+    return (max(0.0, low), min(1.0, high))
+
+
+def head_to_head_verdict(a_ci: tuple[float, float],
+                         b_ci: tuple[float, float]) -> str:
+    """Declare a decisive H2H winner only when its lower CI bound exceeds 50%."""
+    if a_ci[0] > 0.5:
+        return "Production CFR: PATH_A"
+    if b_ci[0] > 0.5:
+        return "Production CFR: PATH_B"
+    return "No decisive winner — within statistical noise"
+
+
+def production_verdict(summary: dict[str, dict[str, Any]]) -> str:
+    """Production CFR decision rule for multiway Path A vs Path B comparison."""
+    a = summary.get(PATH_A)
+    b = summary.get(PATH_B)
+    if not a or not b:
+        return "No decisive winner — manual review required"
+
+    a_lo, a_hi = a["win_ci"]
+    b_lo, b_hi = b["win_ci"]
+    if a["win_rate"] > b["win_rate"] and a_lo > b_hi:
+        return "Production CFR: PATH_A"
+    if b["win_rate"] > a["win_rate"] and b_lo > a_hi:
+        return "Production CFR: PATH_B"
+
+    a_pos = a["avg_position"]
+    b_pos = b["avg_position"]
+    if a_pos is not None and b_pos is not None:
+        if a_pos < b_pos:
+            return "Production CFR: PATH_A"
+        if b_pos < a_pos:
+            return "Production CFR: PATH_B"
+
+    return "Production CFR: PATH_B"
+
+
+def _pool_specs(pool: str) -> list[tuple[str, str]]:
+    """Return unique (pid, bot_spec) entries for the comma-separated pool."""
+    specs = []
+    seen = defaultdict(int)
+    for raw in [p.strip() for p in pool.split(",") if p.strip()]:
+        base = raw.upper().replace(":", "_").replace("/", "_").replace(".", "_")
+        seen[base] += 1
+        pid = base if seen[base] == 1 else f"{base}_{seen[base]}"
+        specs.append((pid, raw))
+    return specs
+
+
+def build_player_specs(config: EvalConfig) -> list[tuple[str, str]]:
+    """Build (pid, bot_spec) entries for the selected eval mode."""
+    if config.mode == "head_to_head":
+        return [
+            (PATH_A, f"cfr:{config.path_a_profile}"),
+            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+        ]
+    if config.mode == "multiway":
+        return [
+            (PATH_A, f"cfr:{config.path_a_profile}"),
+            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            *_pool_specs(config.pool),
+        ]
+    if config.mode == "curriculum":
+        return [(PATH_B, f"deep_cfr:{config.path_b_weights}")]
+    raise ValueError(f"unknown mode: {config.mode}")
+
+
+def _make_bots(player_specs: list[tuple[str, str]]) -> dict[str, Any]:
+    # NOTE: bots are intentionally reconstructed per tournament.  Stateful bots
+    # (CFR/Deep CFR opponent-stat trackers) must start each tournament fresh, so
+    # we deliberately do not cache bot instances across tournaments.  The cost
+    # is re-deserialising model weights from disk each tournament; in parallel
+    # mode (Pool) each worker pays this once per task.  If this dominates a very
+    # large run, cache the immutable loaded weights (not the bot instances) at
+    # the create_bot layer rather than reusing bots here.
+    bots = {}
+    for pid, bot_spec in player_specs:
+        with redirect_stdout(io.StringIO()):
+            bots[pid] = create_bot(bot_spec)
+    return bots
+
+
+def _run_one_tournament(task: tuple) -> dict[str, Any]:
+    (
+        player_specs,
+        chips,
+        base_sb,
+        base_bb,
+        blind_increase_every,
+        max_hands,
+        seed,
+    ) = task
+
+    if seed is not None:
+        random.seed(seed)
+
+    bots = _make_bots(player_specs)
+    seats = [Seat(player_id=pid, chips=chips) for pid, _ in player_specs]
+    table = Table(rng=random.Random(seed) if seed is not None else random.Random())
+    dealer_index = 0
+    hand_count = 0
+    total_players = len(seats)
+    finish_order: list[tuple[str, int, int, int]] = []
+
+    with redirect_stdout(io.StringIO()):
+        while True:
+            active_seats = [s for s in seats if s.chips > 0]
+            if len(active_seats) <= 1:
+                break
+
+            hand_count += 1
+            sb, bb = escalate_blinds(
+                hand_count, base_sb, base_bb, blind_increase_every
+            )
+            active_bots = {s.player_id: bots[s.player_id] for s in active_seats}
+            dealer_index = normalize_dealer_seat_index(seats, dealer_index)
+            if dealer_index is None:
+                break
+
+            table.play_hand(
+                seats=seats,
+                small_blind=sb,
+                big_blind=bb,
+                dealer_index=dealer_index,
+                bot_for=active_bots,
+                on_event=None,
+                log_decisions=False,
+            )
+            next_dealer = advance_dealer_seat_index(seats, dealer_index)
+            if next_dealer is not None:
+                dealer_index = next_dealer
+
+            for s in seats:
+                already_ranked = any(e[0] == s.player_id for e in finish_order)
+                if s.chips <= 0 and not already_ranked:
+                    pos = total_players - len(finish_order)
+                    finish_order.append((s.player_id, pos, hand_count, 0))
+
+            if hand_count >= max_hands:
+                break
+
+    finalize_finish_order(seats, finish_order, total_players, hand_count)
+    final_chips = {s.player_id: s.chips for s in seats}
+    winner = None
+    for pid, pos, _, _ in finish_order:
+        if pos == 1:
+            winner = pid
+            break
+
+    if winner is None and final_chips:
+        # No seat was eliminated into 1st place (e.g. the match hit max_hands
+        # with survivors).  Resolve deterministically by final chip count so the
+        # tournament still yields a real winner instead of a silently
+        # uncredited no-decision (which would bias every win_rate downward).
+        winner = max(final_chips, key=lambda p: final_chips[p])
+
+    chip_swing = None
+    if total_players == 2 and winner:
+        loser = next(pid for pid, _ in player_specs if pid != winner)
+        chip_swing = final_chips[winner] - final_chips[loser]
+
+    return {
+        "winner": winner,
+        "hand_count": hand_count,
+        "finish_order": finish_order,
+        "final_chips": final_chips,
+        "chip_swing": chip_swing,
+    }
+
+
+def _run_all_tournaments(config: EvalConfig,
+                         player_specs: list[tuple[str, str]]) -> list[dict[str, Any]]:
+    tasks = []
+    for i in range(config.tournaments):
+        t_seed = config.seed + i if config.seed is not None else None
+        tasks.append((
+            player_specs,
+            config.chips,
+            config.sb,
+            config.bb,
+            config.blind_increase_every,
+            config.max_hands,
+            t_seed,
+        ))
+
+    if config.parallel > 1:
+        with Pool(processes=config.parallel) as pool:
+            return list(pool.map(_run_one_tournament, tasks))
+    return [_run_one_tournament(task) for task in tasks]
+
+
+def aggregate_results(results: list[dict[str, Any]],
+                      player_specs: list[tuple[str, str]]) -> dict[str, Any]:
+    pids = [pid for pid, _ in player_specs]
+    bot_types = {pid: spec for pid, spec in player_specs}
+    n = len(results)
+    itm_cutoff = 3 if len(pids) >= 6 else 1
+
+    wins = defaultdict(int)
+    finish_positions = defaultdict(list)
+    hands_survived = defaultdict(list)
+    itm_counts = defaultdict(int)
+    h2h_wins = defaultdict(lambda: defaultdict(int))
+    h2h_totals = defaultdict(lambda: defaultdict(int))
+    hand_counts = []
+    chip_swings = []
+
+    for res in results:
+        hand_counts.append(res["hand_count"])
+        if res["chip_swing"] is not None:
+            chip_swings.append(res["chip_swing"])
+        if res["winner"] in pids:
+            wins[res["winner"]] += 1
+
+        fo = {pid: (pos, hand, chips) for pid, pos, hand, chips in res["finish_order"]}
+        for pid in pids:
+            pos, hand, _ = fo.get(pid, (0, res["hand_count"], 0))
+            finish_positions[pid].append(pos)
+            hands_survived[pid].append(hand)
+            if 0 < pos <= itm_cutoff:
+                itm_counts[pid] += 1
+
+        for a in pids:
+            a_pos = fo.get(a, (0, 0, 0))[0]
+            for b in pids:
+                if a == b:
+                    continue
+                b_pos = fo.get(b, (0, 0, 0))[0]
+                if a_pos > 0 and b_pos > 0 and a_pos != b_pos:
+                    h2h_totals[a][b] += 1
+                    if a_pos < b_pos:
+                        h2h_wins[a][b] += 1
+
+    summary = {}
+    for pid in pids:
+        positions = finish_positions[pid]
+        positive_positions = [p for p in positions if p > 0]
+        hs = hands_survived[pid]
+        w = wins[pid]
+        summary[pid] = {
+            "bot": bot_types[pid],
+            "wins": w,
+            "win_rate": w / n if n else 0.0,
+            "win_ci": wilson_ci(w, n),
+            "avg_position": (
+                sum(positive_positions) / len(positive_positions)
+                if positive_positions else None
+            ),
+            "itm_rate": itm_counts[pid] / n if n else 0.0,
+            "hands_avg": sum(hs) / len(hs) if hs else 0.0,
+            "hands_median": statistics.median(hs) if hs else 0.0,
+            "hands_max": max(hs) if hs else 0,
+        }
+
+    h2h_matrix = {}
+    for a in pids:
+        h2h_matrix[a] = {}
+        for b in pids:
+            if a == b:
+                h2h_matrix[a][b] = None
+                continue
+            total = h2h_totals[a][b]
+            h2h_matrix[a][b] = (
+                h2h_wins[a][b] / total if total else None
+            )
+
+    return {
+        "players": pids,
+        "bot_types": bot_types,
+        "summary": summary,
+        "h2h_matrix": h2h_matrix,
+        "hand_counts": hand_counts,
+        "chip_swings": chip_swings,
+        "results": results,
+    }
+
+
+def _fmt_ci(ci: tuple[float, float]) -> str:
+    return f"[{ci[0]:.3f}, {ci[1]:.3f}]"
+
+
+def print_report(config: EvalConfig, aggregated: dict[str, Any]) -> str:
+    """Print and return the verdict line."""
+    summary = aggregated["summary"]
+    pids = aggregated["players"]
+    hand_counts = aggregated["hand_counts"]
+
+    print("=" * 80)
+    print(f"EVAL REPORT — {config.mode}")
+    print("=" * 80)
+    print(f"Tournaments: {config.tournaments}")
+    print(f"Players: {', '.join(pids)}")
+    print(f"Chips: {config.chips} | Blinds: {config.sb}/{config.bb} | "
+          f"Blind increase every: {config.blind_increase_every}")
+    if hand_counts:
+        print(f"Hands/match: avg={sum(hand_counts)/len(hand_counts):.1f} "
+              f"min={min(hand_counts)} max={max(hand_counts)}")
+    print()
+
+    if config.mode == "head_to_head":
+        a = summary[PATH_A]
+        b = summary[PATH_B]
+        print("HEAD-TO-HEAD")
+        for pid, row in ((PATH_A, a), (PATH_B, b)):
+            print(
+                f"  {pid}: wins={row['wins']}/{config.tournaments} "
+                f"win_rate={row['win_rate']:.3f} "
+                f"Wilson95={_fmt_ci(row['win_ci'])}"
+            )
+        swings = aggregated["chip_swings"]
+        if swings:
+            print(
+                f"  Avg chip swing: {sum(swings)/len(swings):.1f} "
+                f"(n={len(swings)})"
+            )
+        verdict = head_to_head_verdict(a["win_ci"], b["win_ci"])
+        print(f"Verdict: {verdict}")
+        print("=" * 80)
+        return verdict
+
+    print("RANK TABLE")
+    print(f"{'Rank':<5} {'Bot':<16} {'Wins':>7} {'WinRate':>9} "
+          f"{'Wilson95':>18} {'AvgPos':>8} {'ITM':>8} "
+          f"{'HandsAvg':>9} {'HandsMed':>9} {'HandsMax':>9}")
+    ranked = sorted(
+        pids,
+        key=lambda pid: (
+            summary[pid]["win_rate"],
+            -(summary[pid]["avg_position"] or 999),
+        ),
+        reverse=True,
+    )
+    for rank, pid in enumerate(ranked, 1):
+        row = summary[pid]
+        avg_pos = row["avg_position"]
+        print(
+            f"{rank:<5} {pid:<16} {row['wins']:>7} "
+            f"{row['win_rate']:>9.3f} {_fmt_ci(row['win_ci']):>18} "
+            f"{(avg_pos if avg_pos is not None else 0):>8.2f} "
+            f"{row['itm_rate']:>8.3f} {row['hands_avg']:>9.1f} "
+            f"{row['hands_median']:>9.1f} {row['hands_max']:>9}"
+        )
+
+    print()
+    print("HEAD-TO-HEAD MATRIX (row finished above column)")
+    col_w = 10
+    print(f"{'':>{col_w}}", end="")
+    for pid in pids:
+        print(f"{pid[:col_w-1]:>{col_w}}", end="")
+    print()
+    for a in pids:
+        print(f"{a[:col_w-1]:>{col_w}}", end="")
+        for b in pids:
+            rate = aggregated["h2h_matrix"][a][b]
+            if rate is None:
+                cell = "---"
+            else:
+                cell = f"{rate:.3f}"
+            print(f"{cell:>{col_w}}", end="")
+        print()
+
+    verdict = production_verdict(summary)
+    print()
+    print(verdict)
+    print("=" * 80)
+    return verdict
+
+
+def write_csv(path: str, aggregated: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    pids = aggregated["players"]
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "tournament", "winner", "hands",
+            *[f"{pid}_position" for pid in pids],
+            *[f"{pid}_hands_survived" for pid in pids],
+            *[f"{pid}_final_chips" for pid in pids],
+        ])
+        for i, res in enumerate(aggregated["results"], 1):
+            fo = {pid: (pos, hand) for pid, pos, hand, _ in res["finish_order"]}
+            row = [i, res["winner"], res["hand_count"]]
+            for pid in pids:
+                row.append(fo.get(pid, (0, 0))[0])
+            for pid in pids:
+                row.append(fo.get(pid, (0, 0))[1])
+            for pid in pids:
+                row.append(res["final_chips"].get(pid, 0))
+            writer.writerow(row)
+
+
+def run_evaluation(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
+    if config.mode == "curriculum":
+        return run_curriculum(config, emit=emit)
+
+    player_specs = build_player_specs(config)
+    results = _run_all_tournaments(config, player_specs)
+    aggregated = aggregate_results(results, player_specs)
+    if emit:
+        verdict = print_report(config, aggregated)
+        if config.output_csv:
+            write_csv(config.output_csv, aggregated)
+            print(f"CSV saved: {config.output_csv}")
+    else:
+        verdict = (
+            head_to_head_verdict(
+                aggregated["summary"][PATH_A]["win_ci"],
+                aggregated["summary"][PATH_B]["win_ci"],
+            )
+            if config.mode == "head_to_head"
+            else production_verdict(aggregated["summary"])
+        )
+    aggregated["verdict"] = verdict
+    return aggregated
+
+
+def _curriculum_tiers(config: EvalConfig):
+    """Progressively harder Deep CFR checkpoint gates."""
+    deep_spec = (PATH_B, f"deep_cfr:{config.path_b_weights}")
+    return [
+        {
+            "name": "Tier 1 — random-only 5-player",
+            "target": 0.40,
+            "specs": [deep_spec] + [(f"RANDOM_{i}", "random") for i in range(1, 5)],
+        },
+        {
+            "name": "Tier 2 — smart-only 5-player",
+            "target": 0.25,
+            "specs": [deep_spec] + [(f"SMART_{i}", "smart") for i in range(1, 5)],
+        },
+        {
+            "name": "Tier 3 — full strong pool",
+            # 7-player field (deep_spec + 6 opponents) → uniform break-even 1/7.
+            "target": 1 / 7,
+            "specs": [
+                deep_spec,
+                ("SMART", "smart"),
+                ("GTO", "gto"),
+                ("MC200", "mc200"),
+                ("ICM", "icm"),
+                ("EXPLOITATIVE", "exploitative"),
+                ("OPPONENTMODEL", "opponentmodel"),
+            ],
+        },
+    ]
+
+
+def run_curriculum(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
+    """Run Deep CFR through progressively harder pre-production gates."""
+    tier_results = []
+    if emit:
+        print("=" * 80)
+        print("DEEP CFR CURRICULUM EVAL")
+        print("=" * 80)
+        print(f"Tournaments per tier: {config.tournaments}")
+        print(f"Weights: {config.path_b_weights}")
+        print(f"Chips: {config.chips} | Blinds: {config.sb}/{config.bb}")
+        print("=" * 80)
+
+    for tier in _curriculum_tiers(config):
+        results = _run_all_tournaments(config, tier["specs"])
+        aggregated = aggregate_results(results, tier["specs"])
+        deep = aggregated["summary"][PATH_B]
+        passed = deep["win_rate"] > tier["target"]
+        tier_row = {
+            "name": tier["name"],
+            "target": tier["target"],
+            "passed": passed,
+            "summary": deep,
+            "aggregated": aggregated,
+        }
+        tier_results.append(tier_row)
+
+        if emit:
+            print()
+            print(tier["name"])
+            print("-" * len(tier["name"]))
+            avg_pos = deep["avg_position"]
+            avg_pos_str = f"{avg_pos:.2f}" if avg_pos is not None else "n/a"
+            print(
+                f"Deep CFR wins={deep['wins']}/{config.tournaments} "
+                f"win_rate={deep['win_rate']:.3f} "
+                f"Wilson95={_fmt_ci(deep['win_ci'])} "
+                f"avg_pos={avg_pos_str} "
+                f"hands_avg={deep['hands_avg']:.1f}"
+            )
+            print(
+                f"Target: > {tier['target']:.3f} "
+                f"({'PASS' if passed else 'FAIL'})"
+            )
+
+        if not passed:
+            if emit:
+                print("Stopping curriculum early; this checkpoint failed the tier.")
+                print("=" * 80)
+            break
+
+    verdict = "PASS" if tier_results and all(t["passed"] for t in tier_results) else "FAIL"
+    return {
+        "mode": "curriculum",
+        "tiers": tier_results,
+        "verdict": verdict,
+    }
+
+
+def parse_args(argv: list[str] | None = None) -> EvalConfig:
+    parser = argparse.ArgumentParser(
+        description="Evaluate Path A vs Path B with tournament-aware metrics."
+    )
+    parser.add_argument("--mode", choices=("head_to_head", "multiway", "curriculum"),
+                        required=True)
+    parser.add_argument("--path_a_profile", default="models/cfr_regret_deep_v2.pkl",
+                        help="Path A CFR profile path")
+    parser.add_argument("--path_b_weights", default="models/deep_cfr_v1.pt",
+                        help="Path B Deep CFR weights path")
+    parser.add_argument("--tournaments", type=int, default=1000)
+    parser.add_argument("--pool", default=DEFAULT_POOL,
+                        help="Comma-separated bot pool for multiway mode")
+    parser.add_argument("--chips", type=int, default=500)
+    parser.add_argument("--sb", type=int, default=5)
+    parser.add_argument("--bb", type=int, default=10)
+    parser.add_argument("--blind-increase-every", type=int, default=50)
+    parser.add_argument("--max-hands", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--output-csv", default=None)
+    parser.add_argument("--parallel", type=int, default=1)
+    ns = parser.parse_args(argv)
+    return EvalConfig(
+        mode=ns.mode,
+        path_a_profile=ns.path_a_profile,
+        path_b_weights=ns.path_b_weights,
+        tournaments=ns.tournaments,
+        pool=ns.pool,
+        chips=ns.chips,
+        sb=ns.sb,
+        bb=ns.bb,
+        blind_increase_every=ns.blind_increase_every,
+        max_hands=ns.max_hands,
+        seed=ns.seed,
+        output_csv=ns.output_csv,
+        parallel=max(1, ns.parallel),
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    config = parse_args(argv)
+    run_evaluation(config, emit=True)
+
+
+if __name__ == "__main__":
+    main()

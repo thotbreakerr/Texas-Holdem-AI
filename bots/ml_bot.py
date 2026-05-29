@@ -1,7 +1,13 @@
 import torch
-from core.bot_api import Action
-from core.engine import eval_hand, EVAL_HAND_MAX
+from core.bot_api import Action, acting_opponents_for
+from core.engine import eval_hand, EVAL_HAND_MAX, RANK_TO_INT
 from bots.poker_mlp import PokerMLP
+
+# eval_hand uses a small rank-sum heuristic with fewer than 5 cards (preflop),
+# whose maximum is pocket aces = 2*max_rank + 40.  Normalising those scores by
+# EVAL_HAND_MAX (the 5-card table max) collapses every preflop hand to ~0, so we
+# normalise the heuristic on its own scale instead.
+_PREFLOP_EVAL_MAX = 2 * max(RANK_TO_INT.values()) + 40
 
 
 
@@ -91,9 +97,16 @@ class MLBot:
         scale = self.starting_chips
         pot = float(state.pot) / scale
         to_call = float(state.to_call) / scale
-        hero_stack = float(state.stacks.get(state.me, 0)) / scale
-        eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
-        n_players = len(state.opponents) + 1
+        hero_stack_raw = float(state.stacks.get(state.me, 0))
+        hero_stack = hero_stack_raw / scale
+        acting_opponents = acting_opponents_for(state)
+        opp_stacks = [
+            float(state.stacks.get(pid, hero_stack_raw))
+            for pid in acting_opponents
+            if float(state.stacks.get(pid, 0)) > 0
+        ]
+        eff_stack = min([hero_stack_raw] + opp_stacks) / scale
+        n_players = len(acting_opponents) + 1
 
         # Hole cards encoding (pad to 4 numbers)
         hole = state.hole_cards or []
@@ -130,7 +143,7 @@ class MLBot:
         position_value = position_order.get(state.position, 0.5)
 
         # Calculate memory features from running opponent stats
-        opponents = state.opponents
+        opponents = acting_opponents_for(state)
         memory_features = self._calculate_memory_features(opponents)
 
         # FULL 26-feature vector
@@ -150,7 +163,10 @@ class MLBot:
         if not hole or len(hole) < 2:
             return 0.0
         score = eval_hand(hole, board)
-        return score / EVAL_HAND_MAX
+        if len(hole) + len(board) >= 5:
+            return score / EVAL_HAND_MAX
+        # Preflop / incomplete board: normalise the rank-sum heuristic.
+        return min(1.0, score / _PREFLOP_EVAL_MAX)
 
     # ----------------------------------------------------------
     # ACT ------------------------------------------------------
@@ -161,7 +177,7 @@ class MLBot:
 
         # Update running opponent stats from history
         if hasattr(state, 'history') and state.history:
-            self._update_opponent_stats(state.history, state.opponents)
+            self._update_opponent_stats(state.history, acting_opponents_for(state))
 
         # If model not trained and fallback enabled, use fallback
         if not self.model_trained and self.use_fallback:

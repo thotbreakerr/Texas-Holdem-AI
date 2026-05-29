@@ -1,0 +1,20 @@
+[
+  {
+    "file": "bots/deep_cfr_bot.py",
+    "line": 429,
+    "summary": "Featurization parity break: inference passes committed=0 for every opponent, while training passes the real per-seat committed chips, so opponent feature channel 1 (committed/pot) is always zero at play time.",
+    "failure_scenario": "build_network_input (inference) calls _fill_public_opp_features(..., committed=0, ...) at line 429, but _DeepCFRGameState.to_network_input (training) passes committed=self.committed_per_seat[seat] at line 1019. _fill_public_opp_features writes channel 1 = committed/pot. The encoder learns to read opponent commitment during training (distinguishing a 3-bettor / big bettor), then at inference that channel is silently fed 0 for every opponent (mean-pooling does not hide it). The network operates on out-of-distribution opponent features at exactly the spots where betting context matters most, systematically degrading decisions with no error raised."
+  },
+  {
+    "file": "training/train_deep_cfr.py",
+    "line": 251,
+    "summary": "Sizing head uses plain MSE against discrete bucket fractions {0.33..1.00}; with little state-conditioned signal the head can minimize loss by predicting near the global target mean, making bet sizing nearly state-independent.",
+    "failure_scenario": "SizingHead.forward returns torch.sigmoid(mlp)*2.0 (deep_cfr_bot.py:245); the only targets collected (deep_cfr_bot.py:1804) are the best-bucket fraction in {0.33,0.50,0.67,0.75,1.00}. mse_loss with weak state signal lets the head fit by predicting close to the target mean across most states (training log shows sizing loss dropping to ~0.01). At inference, _abstract_to_concrete multiplies this fraction by pot, so chosen bet sizes barely vary with the actual spot. (Note: Section 6 of sanity_deep_cfr checks std>0.05 on random inputs, so this is reduced expressiveness, not a hard constant.)"
+  },
+  {
+    "file": "bots/deep_cfr_bot.py",
+    "line": 1760,
+    "summary": "Curriculum risk: during the all-in shadow phase the hero-node baseline `ev` is summed only over policy_legal_mask (all-in removed) while all-in regret is still collected, so the all-in advantage is measured against a strategy that structurally cannot play all-in.",
+    "failure_scenario": "expansion_legal_mask = target_legal_mask (includes all_in) but strategy and ev use policy_legal_mask with all-in removed during the long shadow phase (< all_in_warmup_iterations). regret_vec[all_in] = action_values[all_in] - ev, and ev never contains the all-in branch. This is technically valid CFR (regret vs the current restricted strategy), but it means the accumulated all-in advantage estimate is conditioned on an opponent/strategy distribution that excludes hero all-ins for ~100k iterations; when the all-in policy mask lifts at deploy the head's all-in estimate can be miscalibrated, which is consistent with the all-in over-selection the collapse canary guards against. Worth validating that the shadow-trained all-in advantage transfers cleanly."
+  }
+]

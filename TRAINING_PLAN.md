@@ -18,7 +18,7 @@ This plan is the combined result of brainstorming with two chat agents (ChatGPT 
 - **Hardware:** Apple M5 Max — 18 CPU cores (~10x scaling measured), 40-core GPU via MPS (~8x speedup on models ≥2048 hidden), 64GB RAM. See `HARDWARE_BENCHMARK.md`.
 - **Imitation target:** CFR bot (currently strongest). Regenerating the dataset on the M5.
 - **Parallelization plan:**
-  - Week 1 (data gen + AIVAT labeling + eval): use `multiprocessing.Pool(18)`. Embarrassingly parallel, free 10x.
+  - Week 1 (data gen + equity-shape labeling + eval): use `multiprocessing.Pool(18)`. Embarrassingly parallel, free 10x.
   - Week 1 (CFR retraining): CFR needs special handling — not embarrassingly parallel because all workers update the same regret table. See "CFR parallelization" section below.
   - Week 4+ (PPO training loop): vectorized envs or async actors. Architectural choice, tackled when we get there — not front-loaded.
 
@@ -41,7 +41,7 @@ CFR is different from data-gen or eval workloads. Workers can't just run indepen
 **Option 4 — Ensemble of independent CFR runs.** Train 6–10 independent CFR models on separate workers (no merging, fully independent), then at inference time average their regret tables. This is how a lot of published poker research bots are actually trained. The independent convergence paths smooth out each other's blind spots. Often the highest final quality, but adds complexity at inference (bot has to load/merge multiple files).
 
 **When to revisit:** only if we find the single-threaded CFR retrain is a real bottleneck *and* we want to iterate on CFR multiple times. For a one-shot retrain, single-threaded overnight is fine.
-- **"AIVAT" naming:** technically a misnomer for what we're doing. The real name is "full-information equity shaping" — we peek at opponent cards during training and reward by actual equity. Works fine, just not literally the AIVAT paper's method.
+- **Naming note:** earlier drafts of this plan called the technique "AIVAT" after the paper of the same name. That was a misnomer — the real AIVAT (Burch et al. 2018) is a variance-reduction technique for *evaluating* poker bots, not a training reward. What we're doing is **full-information equity shaping**: during self-play, peek at opponent cards to compute what each decision was worth in equity terms, then use that as the training reward instead of noisy chip deltas. The mechanics overlap with AIVAT (full-info, variance reduction) but the application is different.
 - **Time budget:** timeless. Overnight / weekend runs are fine.
 
 ---
@@ -71,7 +71,7 @@ Run thousands of tournaments with **only your strong bots** playing (cfr, mc200,
 
 This is the raw material for everything downstream. Without it, there's nothing to imitate. Crucially — generate data from **all stages of a tournament**, not just full-table play. Short-handed and heads-up decisions are very different and need their own training examples.
 
-### Step 2 — Implement AIVAT-style reward (with ICM adjustment)
+### Step 2 — Implement equity-shaped reward (with ICM adjustment)
 
 Replace raw chip delta with equity-based reward. This is the single biggest upgrade.
 
@@ -86,9 +86,9 @@ Replace raw chip delta with equity-based reward. This is the single biggest upgr
 - At hand end, run a Monte Carlo rollout against **all remaining opponents' actual hands** (full-information during self-play training — you know everyone's cards, the bot doesn't)
 - Reward = `EV_realized - EV_if_you_folded`
 
-**Multi-way adjustment (important for your format):** in a tournament, equity-at-showdown isn't the only thing that matters. Chips aren't linear in tournament value — losing your last 100 chips is way worse than losing 100 when you have 1000. Wrap the AIVAT reward in an **ICM (Independent Chip Model) transform** so the reward reflects tournament equity, not raw chip equity.
+**Multi-way adjustment (important for your format):** in a tournament, equity-at-showdown isn't the only thing that matters. Chips aren't linear in tournament value — losing your last 100 chips is way worse than losing 100 when you have 1000. Wrap the equity-shaped reward in an **ICM (Independent Chip Model) transform** so the reward reflects tournament equity, not raw chip equity.
 
-- Early in the tournament (deep stacks): ICM ≈ linear, AIVAT is almost enough on its own
+- Early in the tournament (deep stacks): ICM ≈ linear, equity shaping is almost enough on its own
 - Mid/late (short stacks, bubble, heads-up): ICM diverges sharply — a double-up is worth much less than losing it all
 - You already have an ICM bot — reuse its math
 
@@ -189,7 +189,7 @@ Stop using 50-tournament tests. Poker variance is brutal, and **tournament varia
 - Track: tournament win rate (1st place %), ITM rate (in-the-money %), average finishing position, hands survived
 - Report Wilson confidence intervals on win rate — random in a 7-player field ≈ 14%, so anything <20% is noise
 - Measure exploitability periodically (train a dedicated exploiter against the current bot, see how much it wins)
-- For AIVAT-style per-hand evals, use bb/100 on individual hands (finer signal, less variance than tournament outcomes)
+- For equity-shaped per-hand evals, use bb/100 on individual hands (finer signal, less variance than tournament outcomes)
 - Randomize seating and starting-stage conditions to avoid positional bias
 
 ---
@@ -233,15 +233,79 @@ If you want to go nuclear: swap PPO for Deep CFR or ReBeL. These are purpose-bui
 
 ### Week 1 — Infrastructure
 
-- **Overnight background run:** retrain CFR for 6-seat tables (current profile is 4-max). Save to a new profile file, don't overwrite existing. Runs unattended while we work on everything else below.
-- Parallelize data-gen + eval with `Pool(18)` before anything else
-- Run tournaments to generate dataset at 6-seat tables (Step 1), using the newly retrained CFR as the main imitation target
-- Implement full-info equity reward with ICM = P(winning tournament) (Step 2)
-- Validate reward: fold AA test case, short-stack shove test case
-- Build proper eval harness: 500–1000 tournament matches with Wilson CIs on win rate
-- Randomize stack depths in training envs
-- Fix BB position-encoding bug (Step 8)
-- Drop fixed 10% exploration (Step 7) — it's a one-liner, do it now
+**Status as of 2026-04-27:** Foundation work landed (CFR multiway rewrite + value function + position/SPR/bet-size abstraction + sanity script + several engine bugs). First overnight CFR retrain ran ~22h, stopped early. **Result was sub-random win rate in 6-player and 9-player stats runs — not because training failed, but because the heuristic value function has structural biases that converge CFR to "bot-shaped wrong play" no matter how many iterations you throw at it.** See `SESSION_LOG_2026-04-26.md` for the full post-mortem.
+
+**Lesson learned:** Iterating one-feature-at-a-time with a training run between each was wasteful. Going forward we spec everything once, build it all, and train at the end. The first overnight retrain wasted ~22 hours because the heuristic value function structurally caps CFR's strategy quality regardless of iteration count.
+
+The current `models/cfr_regret_deep.pkl` (~104 MB, ~499k info sets, ~25.4B iter) is archived as `models/cfr_regret_deep.v1_pre_equity_shaping.pkl` and kept as a "pocket" reference bot.
+
+#### New sequence — build BOTH maxed-CFR variants in parallel, train sequentially
+
+We're building two variants of "max CFR" simultaneously and comparing them after both train. See `SESSION_LOG_2026-04-26.md` for the full architectural spec.
+
+**Path A — Tabular MCCFR+ fully bolted.** Real tree CFR, equity-shaped value function, opponent-stat bucket in info-set key, finer card buckets, real-time search at decision time. **MCCFR+ improvements** (the CFR+ techniques from Tammelin 2014 applied to MCCFR): linear iteration weighting on regret accumulation + positive-regret-only matching (parallel to Path B's Deep CFR Plus, which is the same idea applied to neural Deep CFR). Saves to `models/cfr_regret_deep_v2.pkl`. CPU-bound — trained second using all 18 M5 cores.
+
+**Path B — Deep CFR Plus + continuous bet sizing (neural, juiced).** Regret network + value network sharing a state encoder (card embeddings, action-history GRU, opponent embeddings). Real tree CFR with **Deep CFR Plus** sample weighting (linear iteration weighting, ~10-30% better convergence than vanilla Deep CFR). **Continuous bet-sizing head** in addition to the discrete action-type head — the network emits a fractional bet size in [0.0, 2.0] when raising, finer resolution than Path A's discrete sizings. Real-time search at decision time. Saves to `models/deep_cfr_v1.pt`. GPU/RAM-bound — trained first using the M5 Max's 40-core GPU + 64GB unified memory.
+
+**Note on apples-to-oranges in eval:** Path B has a richer action space (continuous sizing) than Path A (discrete). Head-to-head comparison still works since both play the same engine, but a Path B win partly reflects "richer outputs" not just "neural beats tabular."
+
+**Path B network sizing (~15M params total):** Targets the BigModel sweet spot per `HARDWARE_BENCHMARK.md` (~17M params → 7.66x MPS speedup, vs 1.4x at ~72K params). Breakdown: shared state encoder ~5-8M (card embeddings + card pooling + action-history GRU + opponent-embedding aggregator with mean pooling for variable opponent count + MLP body), regret network ~3-4M, value network ~3-4M, continuous bet-sizing head ~500K. Working memory ~8-15GB during training, fits in unified memory with room to spare. Build the architecture parametrized so a ~5M smoke variant can validate the pipeline before the full 15M training run.
+
+#### Build phase — COMPLETE (closed 2026-04-27)
+
+1. [DONE] **Gate 1 — Shared utilities.** `core/equity.py`, `core/icm.py`, `core/aivat.py` (full-info equity shaping with main/side pot settlement, ICM mode for tournament equity), `core/opponent_stats.py` (per-opponent VPIP/AF/cbet tracker), `core/action_history.py` (canonical ActionEvent + tokenize for Path A + tensor for Path B).
+2. [DONE] **Gate 2B — Path B (`bots/deep_cfr_bot.py`).** State encoder (card embed + action-history GRU + opponent embed + scalars) + regret/value/sizing heads. ReservoirBuffer. Real depth-N subgame search via `_search_subtree` with verified leaf-call growth. Configurable n_sims for AIVAT leaves. Two config variants — small (~632K params) and large (~2.8M params), below the 5M/15M aspirational targets but accepted.
+3. [DONE] **Gate 2A — Path A (`bots/cfr_bot.py` extension).** Recursive `_cfr_recurse` replaces the old one-step lookahead. AIVAT leaf evaluator with `real_contributions` provenance flag (training uses AIVAT, inference falls back to vanilla equity to avoid side-pot misuse). Opponent-stat bucket added to info-set key (7 fields, 6 colons). Card buckets 20→50. Depth-3 real-time subgame search at inference.
+4. [DONE] **Sanity coverage.** `sanity_aivat.py`, `sanity_opponent_stats.py`, `sanity_action_history.py`, extended `sanity_cfr_equity.py`, `sanity_deep_cfr.py` (--variant small/large), `sanity_train_cfr.py`, `sanity_train_deep_cfr.py`, `sanity_eval.py`.
+
+#### Training phase (sequential, after build is verified) — READY TO RUN
+
+**Pre-retrain gate (run this FIRST, before any clean retrain).** The canonical
+ladder `sanity_validation_ladder.py` runs the tiered sanity suite — static/import
+health → engine truth → CFR/Deep CFR reconstruction & abstraction → feature/schema
+consistency → chip/value accounting → (optional) smoke training → eval readiness —
+and exits nonzero if any selected gate fails.
+
+```bash
+# Fast/medium gates only (seconds) — run before EVERY retrain:
+.venv/bin/python sanity_validation_ladder.py --path deep-cfr     # Path B prep
+.venv/bin/python sanity_validation_ladder.py --path cfr          # Path A prep
+.venv/bin/python sanity_validation_ladder.py --path both         # both
+
+# Full gate incl. slow smoke-training + eval (run once before the overnight run):
+.venv/bin/python sanity_validation_ladder.py --path both --full        # ~11 min (M5 Max)
+.venv/bin/python sanity_validation_ladder.py --path both --keep-going  # report all failures
+```
+
+Default mode skips the slow smoke-training (Tier 5) and full-eval gates and prints
+how to enable them. `--full` adds them — note it is expensive for `--path both`
+because `sanity_eval.py` re-runs the training gates internally. Only kick off a real
+overnight training run (steps 7/8 below) after the appropriate ladder is green.
+
+5. [DONE] **Gate 3B — Path B training pipeline** (`training/train_deep_cfr.py`). External-sampling Deep CFR Plus traversal with target collection (CFR+ linear weighting on regrets), SmoothL1 loss + averaging + lr=1e-4 (replaced naïve MSE that produced ~17K losses; now ~50–70 range), AIVAT n_sims=500 default. Atomic checkpoints, SIGINT handler. Sanity gate runs 100 iter @ depth=4 in <10 min.
+6. [DONE] **Gate 3A — Path A training pipeline** (`training/train_cfr_bot_multiway.py` audit + polish). Verified `_run_iterations` wraps `_cfr_recurse` correctly (no fallback to deprecated `_estimate_action_value` heuristic — sanity Section 6 anti-substitution test confirms). Default profile path moved to `cfr_regret_deep_v2.pkl`. Per-episode Table RNG via optional `--seed`. `sanity_train_cfr.py` is a slow ~5–8 min pre-overnight gate.
+7. [TODO] **User-driven: train Path B overnight on M5 Max GPU.** Estimated 8–24 hours for `--iterations 1000000 --variant large`.
+8. [TODO] **User-driven: train Path A overnight on M5 Max CPU after Path B finishes.** Estimated 2–4 hours for `--tournaments 5000 --iterations 10`. Never concurrent with Path B (unified memory contention).
+
+#### Eval and pocket bots — HARNESS COMPLETE, EVAL USER-DRIVEN
+
+9. [DONE] **Eval harness** (`run_eval.py` + `sanity_eval.py`). Head-to-head and multiway modes. Wilson 95% CIs. Production-CFR verdict logic (CIs don't overlap → decisive winner; otherwise tie). Factory updated to support `cfr:<path>` and `deep_cfr:<path>` for inline weight loading.
+10. [TODO] **User-driven: head-to-head + N-player stats.** After both training runs complete, run 1500-match head-to-head and 1000-tournament multiway. Verdict line picks production CFR.
+11. [TODO] **Step 1 — generate imitation dataset** using the winning path as primary target. Target 500k–1M decision rows. Post-eval.
+12. [TODO] Randomize stack depths in training envs.
+13. [TODO] Drop fixed 10% exploration (Step 7) — one-liner, do it now.
+14. [DONE] Fix BB position-encoding bug (Step 8) — `train_ml_bot.py` now matches `bots/ml_bot.py` (both use 0.3).
+
+#### Foundation work that landed (not in original plan but were prerequisites)
+
+- [DONE] CFR multiway equity rewrite — was heads-up-only, overstated equity by ~30 points in 6-handed.
+- [DONE] CFR value function rewrite — proper chip-EV math with pot odds, fold-equity blend, stack-clamped sizing. **Will be replaced by equity shaping in step 1 above.**
+- [DONE] CFR position bucket in info-set key — closes the README's open Known Limitation.
+- [DONE] CFR SPR bucket in info-set key — needed for tournament play with varying stacks.
+- [DONE] Bet sizes 4 → 6, history tokens 4 → 6, card buckets 10 → 20.
+- [DONE] Engine bugs — logger filename collision, fold-win logging, tournament safety stop, bet/raise label, history `pot_before` snapshot.
+- [DONE] ML training `verbose=True` removal (torch ≥2.2 compat).
+- [PARTIAL] First CFR retrain — produced `cfr_regret_deep.v1_pre_equity_shaping.pkl` (the pocket bot). Not used as primary CFR going forward; will be retrained on equity-shaped signal.
 
 ### Week 2 — Architecture upgrade
 
@@ -251,7 +315,7 @@ If you want to go nuclear: swap PPO for Deep CFR or ReBeL. These are purpose-bui
 
 ### Week 3 — Supervised warm-start
 
-- Train ML bot on CFR's decisions with AIVAT labels (Step 3)
+- Train ML bot on CFR's decisions with equity-shape labels (Step 3)
 - Target: warm-started bot breaks even vs CFR heads-up
 - If getting crushed, stop and debug before starting RL
 
@@ -279,7 +343,7 @@ If you want to go nuclear: swap PPO for Deep CFR or ReBeL. These are purpose-bui
 
 - 10k-hand matches vs each target
 - Report win rates with confidence intervals
-- If not winning, most likely culprit is still reward signal or warm-start quality — go back and verify AIVAT first
+- If not winning, most likely culprit is still reward signal or warm-start quality — go back and verify equity shaping first
 
 ---
 
@@ -308,7 +372,7 @@ If you do Steps 1–4 (the Must-do section), you'll go from "random noise" to "c
 
 Steps 5–9 bring polish and robustness. Steps 10–15 push toward "superhuman" but have diminishing returns and much bigger engineering cost.
 
-**Single most impactful change:** implement AIVAT reward (Step 2).
+**Single most impactful change:** implement equity-shaped reward (Step 2).
 
 **Single most impactful pipeline change:** imitation warm-start → value-shaped PPO → league training (Steps 3–4).
 

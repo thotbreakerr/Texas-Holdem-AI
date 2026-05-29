@@ -183,9 +183,21 @@ class PokerDataset(Dataset):
 
             stacks = row["stacks"]
             me = row["player"]
-            hero_stack = float(stacks[me]) / scale
-            eff_stack = min(float(v) for v in stacks.values()) / scale
-            n_players = len([v for v in stacks.values() if v > 0])
+            hero_stack_raw = float(stacks[me])
+            hero_stack = hero_stack_raw / scale
+            acting_opponents = row.get("acting_opponents")
+            if acting_opponents is None:
+                acting_opponents = [
+                    pid for pid in row.get("opponents", [])
+                    if float(stacks.get(pid, 0)) > 0
+                ]
+            opp_stacks = [
+                float(stacks.get(pid, hero_stack_raw))
+                for pid in acting_opponents
+                if float(stacks.get(pid, 0)) > 0
+            ]
+            eff_stack = min([hero_stack_raw] + opp_stacks) / scale
+            n_players = len(acting_opponents) + 1
 
             # Hand strength — normalised the same way as MLBot._estimate_hand_strength()
             if hole and len(hole) >= 2:
@@ -204,13 +216,13 @@ class PokerDataset(Dataset):
             # Position encoding — matches ml_bot.py position_order
             position_order = {
                 "UTG": 0.0, "UTG+1": 0.1, "MP": 0.3, "LJ": 0.4,
-                "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.5
+                "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.3
             }
             position = row.get("position", "MP")
             position_value = position_order.get(position, 0.5)
 
             # NEW: Calculate memory features from previous decisions
-            opponents = row.get("opponents", [])
+            opponents = acting_opponents
             memory_features = self._calculate_memory_features(
                 all_decisions, decision_idx, me, opponents, row.get("_file")
             )
@@ -289,7 +301,7 @@ def train_model(
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=3, verbose=True
+        optimizer, mode="min", factor=0.5, patience=3
     )
 
     best_val_loss = float("inf")
@@ -340,9 +352,13 @@ def train_model(
         avg_val = val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
         accuracy = 100 * correct / total if total > 0 else 0.0
 
-        # LR scheduling
+        # LR scheduling — manually log when the LR changes (replaces the
+        # removed verbose=True which crashes on torch >= 2.2)
+        prev_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(avg_val)
         current_lr = optimizer.param_groups[0]["lr"]
+        if current_lr != prev_lr:
+            print(f"  [LR] Reduced from {prev_lr:.2e} → {current_lr:.2e}")
 
         print(f"Epoch {epoch}/{epochs} | "
               f"Train Loss: {avg_train:.4f} | "

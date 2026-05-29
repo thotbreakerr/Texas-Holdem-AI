@@ -20,15 +20,19 @@ import math
 import os
 import pickle
 import random
+import time as _time
 from collections import defaultdict
 from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.bot_api import Action, PlayerView
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, _FULL_DECK, EVAL_HAND_MAX
 from core.equity import equity as _canonical_equity
 from core.equity import equity_bucket as _canonical_equity_bucket
 from core.action_history import ActionEvent, tokenize as _canonical_tokenize
+from core.aivat import Snapshot as _Snapshot, value as _aivat_value
+from core.opponent_stats import OpponentStatTracker as _OpponentStatTracker
+from core.table_order import street_action_order as _shared_street_action_order
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -51,12 +55,20 @@ ABSTRACT_ACTIONS: List[str] = [
 NUM_ACTIONS = len(ABSTRACT_ACTIONS)
 
 # Number of Monte Carlo rollouts for postflop hand-strength estimation
-_HS_SIMS = 100
+# Bumped 100→200 in Gate 2A: finer 50-buckets need tighter sims to land
+# hands in the right bin.
+_HS_SIMS = 200
 
 # Number of preflop buckets (hand-strength tiers)
-_PREFLOP_BUCKETS = 20
+# Bumped 20→50 in Gate 2A. Info-set key space grows ~2.5× per dimension;
+# combined with opp-stat bucket this is ~10-20× the Gate 1 size.
+_PREFLOP_BUCKETS = 50
 # Number of postflop buckets (hand-strength percentile ranges)
-_POSTFLOP_BUCKETS = 20
+_POSTFLOP_BUCKETS = 50
+
+# ── Tree CFR constants (Gate 2A) ──────────────────────────────────────────────
+_MAX_CFR_DEPTH = 8        # covers ~2 betting rounds in 6-handed play
+_DEFAULT_SEARCH_DEPTH = 3 # real-time subgame solve depth at inference
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -75,6 +87,14 @@ _POSITION_BUCKETS = {
     # Blinds: posted dead money, last to act preflop
     "SB": "blinds", "BB": "blinds",
 }
+
+
+def _engine_positions(n: int) -> List[str]:
+    """Mirror core.engine.Table._positions without importing Table."""
+    if n == 2:
+        return ["BTN", "BB"]
+    tags = ["BTN", "SB", "BB", "UTG", "UTG+1", "MP", "LJ", "HJ", "CO"]
+    return tags[:n]
 
 
 def _position_bucket(position: str) -> str:
@@ -99,6 +119,266 @@ def _spr_bucket(hero_stack: int, pot: int, opp_stacks: list) -> str:
     if spr < 5:    return "low"     # commitment/stack-off territory
     if spr < 15:   return "mid"     # standard play
     return "high"                   # deep, implied odds matter
+
+
+def _seat_labels_for_view(view: PlayerView, pids: List[str],
+                          hero_seat: int) -> Dict[int, str]:
+    """Infer engine position labels from ordered PlayerView.stacks keys."""
+    labels = _engine_positions(len(pids))
+    if hero_seat < len(labels) and labels[hero_seat] == view.position:
+        return {i: labels[i] for i in range(len(pids))}
+    if view.position in labels:
+        # Synthetic tests sometimes put hero at a different dict index than
+        # the engine would. Rotate labels so hero's known label stays true.
+        hero_label_idx = labels.index(view.position)
+        offset = hero_seat - hero_label_idx
+        return {
+            i: labels[(i - offset) % len(labels)]
+            for i in range(len(pids))
+        }
+    return {i: labels[i] if i < len(labels) else "MP" for i in range(len(pids))}
+
+
+def _street_action_order(street: str, ring_order: List[int]) -> List[int]:
+    """Engine-equivalent action order for a fresh betting street."""
+    return _shared_street_action_order(street, ring_order)
+
+
+def _order_after_seat(order: List[int], seat: int,
+                      include_seat: bool = False) -> List[int]:
+    """Return seats in order after seat, wrapping once around the table."""
+    if seat not in order:
+        return list(order)
+    idx = order.index(seat)
+    tail = order[idx + 1:] + order[:idx]
+    if include_seat:
+        return [seat] + tail
+    return tail
+
+
+def _seat_indices_for_view(view: PlayerView) -> Dict[str, int]:
+    mapping = getattr(view, "seat_indices", None) or {}
+    if mapping:
+        return {pid: int(idx) for pid, idx in mapping.items()}
+    return {pid: i for i, pid in enumerate(view.stacks.keys())}
+
+
+def _stable_seat_index(view: PlayerView, pid: str,
+                       pids: Optional[List[str]] = None) -> Optional[int]:
+    mapping = _seat_indices_for_view(view)
+    if pid in mapping:
+        return mapping[pid]
+    pids = pids if pids is not None else list(view.stacks.keys())
+    if pid in pids:
+        return pids.index(pid)
+    return None
+
+
+def _tracker_size_for_view(view: PlayerView) -> int:
+    mapping = _seat_indices_for_view(view)
+    if mapping:
+        return max(mapping.values()) + 1
+    return len(view.stacks)
+
+
+def _infer_big_blind_from_view(view: PlayerView) -> int:
+    """Best-effort BB inference from the frozen PlayerView shape."""
+    to_call = int(getattr(view, "to_call", 0) or 0)
+    min_raise = int(getattr(view, "min_raise", 0) or 0)
+    first_pot = None
+    for entry in getattr(view, "history", []) or []:
+        if entry.get("street") == "preflop" and "pot_before" in entry:
+            first_pot = int(entry.get("pot_before") or 0)
+            break
+    if first_pot and first_pot > 0:
+        return max(1, int(round(first_pot * 2 / 3)))
+    if getattr(view, "street", None) == "preflop":
+        pot = int(getattr(view, "pot", 0) or 0)
+        if pot > 0:
+            return max(1, int(round(pot * 2 / 3)))
+    if to_call > 0 and min_raise > to_call:
+        return max(1, min_raise - to_call)
+    if to_call == 0:
+        return max(1, min_raise or 1)
+    return max(1, min_raise or 1)
+
+
+def _infer_last_raise_size_from_view(view: PlayerView, big_blind: int) -> int:
+    """Infer the current street's last full raise size from public history."""
+    pids = list(getattr(view, "stacks", {}) or {})
+    pid_to_seat = {pid: i for i, pid in enumerate(pids)}
+    contrib = [0 for _ in pids]
+    bb = max(1, int(big_blind or 1))
+    last_raise_size = bb
+    current_street = "preflop"
+    history = list(getattr(view, "history", []) or [])
+
+    explicit_blinds = any(e.get("type") == "blind" for e in history)
+    if explicit_blinds:
+        for entry in history:
+            if entry.get("type") != "blind":
+                continue
+            pid = entry.get("pid", "")
+            if pid in pid_to_seat:
+                contrib[pid_to_seat[pid]] += max(0, int(entry.get("amount") or 0))
+    else:
+        first_pot = None
+        for entry in history:
+            if entry.get("street") == "preflop" and "pot_before" in entry:
+                first_pot = int(entry.get("pot_before") or 0)
+                break
+        if first_pot is None and getattr(view, "street", None) == "preflop":
+            first_pot = int(getattr(view, "pot", 0) or 0)
+        if first_pot and len(pids) >= 2:
+            inferred_bb = max(1, int(round(first_pot * 2 / 3)))
+            inferred_sb = max(0, first_pot - inferred_bb)
+            if len(pids) == 2:
+                sb_idx, bb_idx = 0, 1
+            else:
+                sb_idx, bb_idx = 1, 2 % len(pids)
+            contrib[sb_idx] += inferred_sb
+            contrib[bb_idx] += inferred_bb
+            last_raise_size = inferred_bb
+
+    for entry in history:
+        atype = entry.get("type", "")
+        if atype == "blind":
+            continue
+        street = entry.get("street", current_street)
+        if street != current_street:
+            contrib = [0 for _ in pids]
+            last_raise_size = bb
+            current_street = street
+
+        pid = entry.get("pid", "")
+        if pid not in pid_to_seat:
+            continue
+        idx = pid_to_seat[pid]
+        if atype in ("check", "fold"):
+            continue
+        if atype == "call":
+            amount = entry.get("amount")
+            if amount is None:
+                amount = entry.get("to_call_before", 0)
+            contrib[idx] += max(0, int(amount or 0))
+            continue
+        if atype not in ("bet", "raise", "all_in"):
+            continue
+
+        prev_bet = max(contrib) if contrib else 0
+        target = entry.get("amount")
+        if target is None:
+            target = contrib[idx] + int(entry.get("to_call_before", 0) or 0)
+        target = max(0, int(target or 0))
+        raise_size = target - prev_bet
+        if raise_size > 0 and (prev_bet == 0 or raise_size >= last_raise_size):
+            last_raise_size = raise_size
+        contrib[idx] += max(0, target - contrib[idx])
+
+    if current_street != getattr(view, "street", current_street):
+        return bb
+
+    legal_raise = next(
+        (a for a in (getattr(view, "legal_actions", None) or [])
+         if a.get("type") == "raise"),
+        None,
+    )
+    if legal_raise is not None:
+        current_bet = max(contrib) if contrib else 0
+        min_total = int(legal_raise.get("min") or 0)
+        if current_bet > 0 and min_total > current_bet:
+            last_raise_size = max(last_raise_size, min_total - current_bet)
+    return max(1, int(last_raise_size or bb))
+
+
+def _reconstruct_contributions_from_view(view: PlayerView):
+    """Return (street_committed, total_committed, reliable) for PlayerView.
+
+    ``street_committed`` mirrors the engine's current-street ``contrib`` map.
+    ``total_committed`` mirrors the hand-level ``total_contrib`` plus the
+    current street's outstanding contributions.
+    """
+    pids = list(view.stacks.keys())
+    n_seats = len(pids)
+    pid_to_seat = {pid: i for i, pid in enumerate(pids)}
+    total_committed = [0 for _ in pids]
+    street_contrib = [0 for _ in pids]
+    history = list(view.history or [])
+    reliable = bool(pids)
+
+    def add_to(pid, amount):
+        nonlocal reliable
+        if pid not in pid_to_seat:
+            reliable = False
+            return
+        amt = max(0, int(amount or 0))
+        idx = pid_to_seat[pid]
+        total_committed[idx] += amt
+        street_contrib[idx] += amt
+
+    explicit_blinds = any(e.get("type") == "blind" for e in history)
+    if explicit_blinds:
+        for entry in history:
+            if entry.get("type") == "blind":
+                add_to(entry.get("pid", ""), entry.get("amount") or 0)
+    else:
+        first_pot = None
+        for entry in history:
+            if entry.get("street") == "preflop" and "pot_before" in entry:
+                first_pot = int(entry.get("pot_before") or 0)
+                break
+        if first_pot is None and view.street == "preflop":
+            first_pot = int(view.pot or 0)
+        if first_pot and n_seats >= 2:
+            bb = max(1, int(round(first_pot * 2 / 3)))
+            sb = max(0, first_pot - bb)
+            if n_seats == 2:
+                sb_idx, bb_idx = 0, 1
+            else:
+                sb_idx, bb_idx = 1, 2 % n_seats
+            total_committed[sb_idx] += sb
+            street_contrib[sb_idx] += sb
+            total_committed[bb_idx] += bb
+            street_contrib[bb_idx] += bb
+
+    current_street = "preflop"
+    for entry in history:
+        atype = entry.get("type", "")
+        if atype == "blind":
+            continue
+        street = entry.get("street", current_street)
+        if street != current_street:
+            street_contrib = [0 for _ in pids]
+            current_street = street
+
+        pid = entry.get("pid", "")
+        if pid not in pid_to_seat:
+            reliable = False
+            continue
+        idx = pid_to_seat[pid]
+
+        if atype in ("check", "fold"):
+            continue
+        if atype == "call":
+            amt = entry.get("amount")
+            if amt is None:
+                amt = entry.get("to_call_before", 0)
+            add_to(pid, amt)
+        elif atype in ("bet", "raise", "all_in"):
+            target = entry.get("amount")
+            if target is None:
+                target = street_contrib[idx] + int(entry.get("to_call_before", 0) or 0)
+            delta = max(0, int(target or 0) - street_contrib[idx])
+            add_to(pid, delta)
+        else:
+            reliable = False
+
+    if current_street != view.street:
+        street_contrib = [0 for _ in pids]
+
+    view_pot = int(view.pot or 0)
+    is_real = reliable and abs(sum(total_committed) - view_pot) <= 1
+    return street_contrib, total_committed, is_real
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -161,29 +441,77 @@ def _postflop_bucket(hole: List[Tuple[str, str]],
 
 def _info_set_key(street: str, bucket: int, history_key: str,
                   n_opponents: int, position_bucket: str,
-                  spr_bucket: str) -> str:
+                  spr_bucket: str, opp_stat_bucket: str = "TA") -> str:
     """
     Build a compact information-set key from the street, active opponent
-    count, position bucket, SPR bucket, card bucket, and abstracted
-    action history.
+    count, position bucket, SPR bucket, opponent-stat bucket, card bucket,
+    and abstracted action history.
 
-    Including all dimensions means CFR learns separate strategies for
-    different positions, stack depths, and table sizes.
+    Gate 2A format: 7 fields separated by 6 colons.
+    Pre-Gate-2A format had 6 fields / 5 colons — those keys are rejected
+    at load time.
     """
     return (f"{street}:{n_opponents}:{position_bucket}"
-            f":{spr_bucket}:{bucket}:{history_key}")
+            f":{spr_bucket}:{opp_stat_bucket}:{bucket}:{history_key}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Action mapping: abstract ↔ concrete
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _current_bet_from_view(view: PlayerView, to_call: int) -> int:
+    """Highest street contribution at this decision (the engine's current_bet).
+
+    Mirrors the ``_GameState`` path, where ``current_bet == max(committed_per
+    _seat)``.  Reconstructed from the view's history; falls back to ``to_call``
+    (i.e. assume the hero has nothing committed yet) when reconstruction is
+    unreliable.
+    """
+    try:
+        street_committed, _total, _real = _reconstruct_contributions_from_view(view)
+        if not street_committed:
+            return int(to_call or 0)
+        pids = list(view.stacks.keys())
+        my_committed = 0
+        if view.me in pids:
+            my_committed = street_committed[pids.index(view.me)]
+        # current_bet is the table-wide max; it must also cover hero's own
+        # committed plus what they still owe.
+        return max(max(street_committed), my_committed + int(to_call or 0))
+    except Exception:
+        return int(to_call or 0)
+
+
+def _raise_sizing_target(frac: float, pot: int, to_call: int,
+                         current_bet: int, is_raise: bool) -> int:
+    """Translate a pot-fraction sizing bucket into an engine *target total*.
+
+    The engine interprets a bet/raise amount as the actor's TOTAL street
+    contribution.  A pot-fraction is only a total for an opening bet
+    (``current_bet == 0``); when facing a bet, a pot-relative *raise* means
+    "call, then raise by a fraction of the post-call pot":
+
+        target_total = current_bet + frac * (pot + to_call)
+
+    With the defaults (to_call=0, current_bet=0) this reduces to ``frac*pot``,
+    preserving the opening-bet behaviour for callers that do not supply the
+    betting context.
+    """
+    if is_raise:
+        return current_bet + int(round(frac * (pot + to_call)))
+    return int(pot * frac)
+
+
 def _legal_abstract_actions(legal: List[Dict[str, Any]],
-                            pot: int) -> List[int]:
+                            pot: int, to_call: int = 0,
+                            current_bet: int = 0) -> List[int]:
     """
     Map the engine's concrete legal actions to abstract action indices.
 
     Returns a list of indices into ``ABSTRACT_ACTIONS`` that are available.
+    ``to_call``/``current_bet`` describe the betting context so raise sizing
+    buckets are spaced as true pot-relative raises rather than collapsing onto
+    the min-raise when facing a bet.
     """
     types = {a["type"] for a in legal}
     result: List[int] = []
@@ -199,14 +527,18 @@ def _legal_abstract_actions(legal: List[Dict[str, Any]],
     if has_bet_raise:
         spec = next(a for a in legal if a["type"] in ("bet", "raise"))
         lo, hi = spec["min"], spec["max"]
+        if spec.get("all_in") or lo == hi:
+            result.append(7)  # all_in
+            return sorted(set(result))
 
         # Generate the six sizing targets (indices match ABSTRACT_ACTIONS)
+        is_raise = spec["type"] == "raise"
         sizes = {
-            2: int(pot * 0.33),   # bet_33
-            3: int(pot * 0.50),   # bet_50
-            4: int(pot * 0.67),   # bet_67
-            5: int(pot * 0.75),   # bet_75
-            6: int(pot * 1.00),   # bet_100
+            2: _raise_sizing_target(0.33, pot, to_call, current_bet, is_raise),
+            3: _raise_sizing_target(0.50, pot, to_call, current_bet, is_raise),
+            4: _raise_sizing_target(0.67, pot, to_call, current_bet, is_raise),
+            5: _raise_sizing_target(0.75, pot, to_call, current_bet, is_raise),
+            6: _raise_sizing_target(1.00, pot, to_call, current_bet, is_raise),
             7: hi,                # all_in
         }
 
@@ -224,10 +556,13 @@ def _legal_abstract_actions(legal: List[Dict[str, Any]],
 
 def _abstract_to_concrete(abstract_idx: int,
                           legal: List[Dict[str, Any]],
-                          pot: int) -> Action:
+                          pot: int, to_call: int = 0,
+                          current_bet: int = 0) -> Action:
     """
     Convert an abstract action index back into a concrete ``Action`` the
-    engine accepts.
+    engine accepts.  ``to_call``/``current_bet`` give the betting context so a
+    bet/raise bucket maps to the correct engine *target total* (see
+    :func:`_raise_sizing_target`).
     """
     types = {a["type"] for a in legal}
     label = ABSTRACT_ACTIONS[abstract_idx]
@@ -263,7 +598,8 @@ def _abstract_to_concrete(abstract_idx: int,
         # all-in
         amt = hi
     else:
-        amt = int(pot * frac)
+        amt = _raise_sizing_target(frac, pot, to_call, current_bet,
+                                   spec["type"] == "raise")
 
     amt = max(lo, min(hi, amt))
     return Action(spec["type"], amt)
@@ -312,6 +648,480 @@ def _abstract_history(history: List[Dict[str, Any]], pot: int) -> str:
             pot_before=int(ref_pot),
         ))
     return _canonical_tokenize(events)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Lightweight GameState for recursive tree CFR (Gate 2A)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_STREET_ORDER = ["preflop", "flop", "turn", "river"]
+_STREET_CARDS = {"preflop": 0, "flop": 3, "turn": 1, "river": 1}
+
+
+class _GameState:
+    """Lightweight game state for recursive CFR traversal.
+
+    Does NOT reuse the engine's Table — too heavyweight. Owns: pot, stacks,
+    committed_per_seat, alive, street, board, hole_cards (full info during
+    training, hero-only during inference), seat_order (who acts next),
+    history (list of abstract action indices).
+    """
+    __slots__ = (
+        "pot", "stacks", "committed_per_seat", "total_committed_per_seat",
+        "alive", "street", "board", "hole_cards", "seat_order", "action_idx",
+        "history_tokens", "deck_remaining", "n_seats", "hero_seat",
+        "real_contributions", "ring_order", "position_labels",
+        "opp_stat_bucket", "big_blind", "street_actions",
+        "last_raise_size", "raise_blocked", "acted",
+    )
+
+    def __init__(self, *, pot, stacks, committed_per_seat, alive, street,
+                 board, hole_cards, seat_order, action_idx=0,
+                 history_tokens="", deck_remaining=None, hero_seat=0,
+                 real_contributions=False, ring_order=None,
+                 position_labels=None, opp_stat_bucket="TA", big_blind=10,
+                 street_actions=0, total_committed_per_seat=None,
+                 last_raise_size=None, raise_blocked=None, acted=None):
+        self.pot = pot
+        self.stacks = list(stacks)
+        self.committed_per_seat = list(committed_per_seat)
+        # Cumulative per-seat contributions across all streets (mirrors
+        # engine.py's total_contrib). Used by AIVAT for side-pot settlement.
+        # If not provided, seed from the (possibly cumulative) initial
+        # committed_per_seat so the field is well-defined from the start.
+        self.total_committed_per_seat = (
+            list(total_committed_per_seat)
+            if total_committed_per_seat is not None
+            else list(committed_per_seat)
+        )
+        self.alive = list(alive)
+        self.street = street
+        self.board = list(board)
+        self.hole_cards = dict(hole_cards)  # seat -> (card, card)
+        self.seat_order = list(seat_order)  # seats in action order
+        self.action_idx = action_idx        # index into seat_order
+        self.history_tokens = history_tokens
+        self.deck_remaining = list(deck_remaining) if deck_remaining else []
+        self.n_seats = len(stacks)
+        self.hero_seat = hero_seat
+        self.real_contributions = real_contributions
+        self.ring_order = list(ring_order) if ring_order else list(range(self.n_seats))
+        self.position_labels = dict(position_labels) if position_labels else {}
+        self.opp_stat_bucket = opp_stat_bucket
+        self.big_blind = max(1, int(big_blind or 1))
+        self.street_actions = int(street_actions)
+        self.last_raise_size = max(
+            1,
+            int(last_raise_size if last_raise_size is not None else self.big_blind),
+        )
+        self.raise_blocked = set(raise_blocked or [])
+        if acted is None:
+            acted = self.seat_order[:max(0, min(self.action_idx, len(self.seat_order)))]
+        self.acted = set(acted)
+
+    def copy(self):
+        return _GameState(
+            pot=self.pot,
+            stacks=list(self.stacks),
+            committed_per_seat=list(self.committed_per_seat),
+            total_committed_per_seat=list(self.total_committed_per_seat),
+            alive=list(self.alive),
+            street=self.street,
+            board=list(self.board),
+            hole_cards=dict(self.hole_cards),
+            seat_order=list(self.seat_order),
+            action_idx=self.action_idx,
+            history_tokens=self.history_tokens,
+            deck_remaining=list(self.deck_remaining),
+            hero_seat=self.hero_seat,
+            real_contributions=self.real_contributions,
+            ring_order=list(self.ring_order),
+            position_labels=dict(self.position_labels),
+            opp_stat_bucket=self.opp_stat_bucket,
+            big_blind=self.big_blind,
+            street_actions=self.street_actions,
+            last_raise_size=self.last_raise_size,
+            raise_blocked=set(self.raise_blocked),
+            acted=set(self.acted),
+        )
+
+    def is_terminal(self):
+        """True if only 0-1 alive players remain, or street is past river."""
+        alive_count = sum(1 for a in self.alive if a)
+        if alive_count <= 1:
+            return True
+        if self.street not in _STREET_ORDER:
+            return True
+        # Past river = terminal
+        if self.street == "river" and self.action_idx >= len(self.seat_order):
+            return True
+        # Soft cap to bound CFR tree depth per street.
+        if self.street_actions >= 50:
+            return True
+        return False
+
+    def is_chance_node(self):
+        """True if we need to deal the next street's cards."""
+        if self.is_terminal():
+            return False
+        # If we've cycled through all actors for this street, advance
+        return self.action_idx >= len(self.seat_order)
+
+    def seat_to_act(self):
+        """Return the seat index of the next player to act."""
+        if self.action_idx < len(self.seat_order):
+            return self.seat_order[self.action_idx]
+        return -1
+
+    def legal_abstract_actions(self):
+        """Return list of abstract action indices legal for seat_to_act."""
+        seat = self.seat_to_act()
+        if seat < 0 or not self.alive[seat]:
+            return _legal_abstract_actions(self.legal_actions(), self.pot)
+        max_contrib = max(self.committed_per_seat[s]
+                          for s in range(self.n_seats) if self.alive[s])
+        to_call = max(0, max_contrib - self.committed_per_seat[seat])
+        return _legal_abstract_actions(self.legal_actions(), self.pot,
+                                       to_call=to_call, current_bet=max_contrib)
+
+    def _active_seats(self):
+        return [
+            i for i in self.ring_order
+            if self.alive[i] and self.stacks[i] > 0
+        ]
+
+    def _ordered_after(self, seat, candidates):
+        candidates = list(candidates)
+        if not candidates:
+            return []
+        ring = list(self.ring_order)
+        if seat not in ring:
+            return candidates
+        seat_pos = ring.index(seat)
+        order = ring[seat_pos + 1:] + ring[:seat_pos]
+        allowed = set(candidates)
+        return [i for i in order if i in allowed]
+
+    def legal_actions(self):
+        """Build engine-shaped legal actions from this lightweight state."""
+        seat = self.seat_to_act()
+        if seat < 0 or not self.alive[seat]:
+            return [{"type": "check"}]
+
+        max_contrib = max(self.committed_per_seat[s]
+                          for s in range(self.n_seats) if self.alive[s])
+        to_call = max_contrib - self.committed_per_seat[seat]
+        chips = self.stacks[seat]
+        if chips <= 0:
+            return [{"type": "check"}]
+        legal = []
+        can_raise = seat not in self.raise_blocked
+
+        if to_call > 0:
+            legal.append({"type": "fold"})
+            if chips > 0:
+                legal.append({"type": "call"})
+            if can_raise and chips > to_call:
+                max_total = chips + self.committed_per_seat[seat]
+                min_total = max_contrib + self.last_raise_size
+                min_total = max(min_total, max_contrib + self.big_blind)
+                if max_total >= min_total:
+                    legal.append({
+                        "type": "raise",
+                        "min": min_total,
+                        "max": max_total,
+                    })
+                elif max_total > max_contrib:
+                    legal.append({
+                        "type": "raise",
+                        "min": max_total,
+                        "max": max_total,
+                        "all_in": True,
+                        "reopens": False,
+                    })
+        else:
+            legal.append({"type": "check"})
+            if max_contrib == 0:
+                min_bet = min(self.big_blind, chips)
+                if chips >= min_bet:
+                    legal.append({"type": "bet", "min": min_bet, "max": chips})
+            else:
+                if can_raise:
+                    max_total = chips + self.committed_per_seat[seat]
+                    min_total = max_contrib + self.last_raise_size
+                    min_total = max(min_total, max_contrib + self.big_blind)
+                    if max_total >= min_total:
+                        legal.append({
+                            "type": "raise",
+                            "min": min_total,
+                            "max": max_total,
+                        })
+                    elif max_total > max_contrib:
+                        legal.append({
+                            "type": "raise",
+                            "min": max_total,
+                            "max": max_total,
+                            "all_in": True,
+                            "reopens": False,
+                        })
+        return legal
+
+    def apply_action(self, seat, abstract_idx):
+        """Return a new _GameState after seat takes abstract_idx action."""
+        s = self.copy()
+        label = ABSTRACT_ACTIONS[abstract_idx]
+
+        max_contrib = max(s.committed_per_seat[i]
+                          for i in range(s.n_seats) if s.alive[i])
+        to_call = max_contrib - s.committed_per_seat[seat]
+        prev_bet = max_contrib
+        prev_last_raise_size = s.last_raise_size
+        acted_before = set(s.acted)
+
+        reopens_action = False
+        raise_size = 0
+        if label == "fold":
+            s.alive[seat] = False
+        elif label == "check_call":
+            cost = min(to_call, s.stacks[seat])
+            s.stacks[seat] -= cost
+            s.committed_per_seat[seat] += cost
+            s.total_committed_per_seat[seat] += cost
+            s.pot += cost
+        else:
+            # Bet/raise sizing
+            frac_map = {
+                "bet_33": 0.33, "bet_50": 0.50, "bet_67": 0.67,
+                "bet_75": 0.75, "bet_100": 1.00, "all_in": None,
+            }
+            frac = frac_map.get(label, 0.5)
+            bet_raise = [a for a in s.legal_actions()
+                         if a["type"] in ("bet", "raise")]
+            if not bet_raise:
+                return s
+            spec = bet_raise[0]
+            lo, hi = spec["min"], spec["max"]
+            reopens_action = bool(spec.get("reopens", True))
+            if frac is None:
+                bet_total = hi
+            else:
+                bet_total = _raise_sizing_target(
+                    frac, s.pot, to_call, max_contrib,
+                    spec["type"] == "raise")
+                bet_total = max(lo, min(hi, bet_total))
+            need = bet_total - s.committed_per_seat[seat]
+            need = max(0, min(need, s.stacks[seat]))
+            s.stacks[seat] -= need
+            s.committed_per_seat[seat] += need
+            s.total_committed_per_seat[seat] += need
+            s.pot += need
+            new_bet = max(
+                s.committed_per_seat[i]
+                for i in range(s.n_seats) if s.alive[i]
+            )
+            raise_size = max(0, new_bet - prev_bet)
+
+        # Token for history
+        token_map = {
+            0: "F", 1: "K" if to_call == 0 else "C",
+            2: "S", 3: "Q", 4: "M", 5: "L", 6: "P", 7: "A",
+        }
+        s.history_tokens += token_map.get(abstract_idx, "?")
+        s.street_actions += 1
+
+        full_raise = (
+            abstract_idx >= 2
+            and raise_size > 0
+            and reopens_action
+            and (prev_bet == 0 or raise_size >= prev_last_raise_size)
+        )
+        # Soft cap on tree depth per street; engine has its own 500-iteration
+        # safety counter at engine.py:547 — CFR uses 50 to keep recursion bounded.
+        if full_raise and s.street_actions < 50:
+            s.last_raise_size = raise_size
+            s.raise_blocked.clear()
+            s.acted = {seat}
+            new_bet = max(s.committed_per_seat)
+            responders = [
+                i for i in s._active_seats()
+                if i != seat and s.committed_per_seat[i] < new_bet
+            ]
+            s.seat_order = s._ordered_after(seat, responders)
+            s.action_idx = 0
+        elif abstract_idx >= 2 and raise_size > 0 and s.street_actions < 50:
+            s.raise_blocked.update(acted_before)
+            s.acted = acted_before | {seat}
+            new_bet = max(s.committed_per_seat)
+            responders = [
+                i for i in s._active_seats()
+                if i != seat and s.committed_per_seat[i] < new_bet
+            ]
+            s.seat_order = s._ordered_after(seat, responders)
+            s.action_idx = 0
+        elif seat == self.seat_to_act():
+            s.acted.add(seat)
+            s.action_idx += 1
+
+        return s
+
+    def advance_street(self):
+        """Deal next street's cards via MC sample. Returns new _GameState."""
+        s = self.copy()
+        si = _STREET_ORDER.index(s.street)
+        if si + 1 >= len(_STREET_ORDER):
+            return s  # past river — terminal
+
+        next_street = _STREET_ORDER[si + 1]
+        n_cards = _STREET_CARDS[next_street]
+
+        if n_cards > 0 and len(s.deck_remaining) >= n_cards:
+            dealt = random.sample(s.deck_remaining, n_cards)
+            s.board.extend(dealt)
+            s.deck_remaining = [c for c in s.deck_remaining if c not in dealt]
+
+        s.street = next_street
+        # Reset action order to the engine's next-street order.
+        s.seat_order = [
+            seat for seat in _street_action_order(next_street, s.ring_order)
+            if s.alive[seat] and s.stacks[seat] > 0
+        ]
+        s.action_idx = 0
+        s.street_actions = 0
+        s.last_raise_size = s.big_blind
+        s.raise_blocked.clear()
+        s.acted.clear()
+        # Mirror engine.py L430: reset per-seat contributions for the new
+        # street so preflop blinds/bets do not leak into postflop to_call.
+        # total_committed_per_seat is NOT reset — it tracks cumulative
+        # contributions across all streets (mirrors engine's total_contrib),
+        # needed by AIVAT for side-pot settlement at leaves.
+        s.committed_per_seat = [0] * s.n_seats
+        return s
+
+    def to_call_for(self, seat):
+        if not self.alive[seat]:
+            return 0
+        max_contrib = max(self.committed_per_seat[i]
+                          for i in range(self.n_seats) if self.alive[i])
+        return max(0, max_contrib - self.committed_per_seat[seat])
+
+
+def _build_game_state_from_view(
+    view: PlayerView,
+    full_hole_cards=None,
+    opp_stat_bucket: str = "TA",
+):
+    """Construct a _GameState from a PlayerView for inference-time search.
+
+    full_hole_cards: if provided, dict {seat_idx: (card, card)} for all seats.
+    During inference we only know hero's cards; opponents get None.
+    """
+    stacks_dict = view.stacks
+    pids = list(stacks_dict.keys())
+    n_seats = len(pids)
+    hero_pid = view.me
+    hero_seat = pids.index(hero_pid) if hero_pid in pids else 0
+
+    stacks = [stacks_dict[pid] for pid in pids]
+    alive = [stacks[i] >= 0 for i, _pid in enumerate(pids)]
+    opp_set = set(view.opponents) if view.opponents else set()
+    for i, pid in enumerate(pids):
+        if pid != hero_pid and pid not in opp_set:
+            alive[i] = False
+
+    big_blind = _infer_big_blind_from_view(view)
+    last_raise_size = _infer_last_raise_size_from_view(view, big_blind)
+
+    # Prefer reconstructed current-street contributions when history is enough,
+    # then force the public PlayerView.to_call contract to be true at the root.
+    committed, total_committed, real = _reconstruct_contributions_from_view(view)
+    if not committed or len(committed) != n_seats:
+        committed = [0] * n_seats
+        total_committed = [0] * n_seats
+        real = False
+
+    active_seats = [i for i, ok in enumerate(alive) if ok]
+    desired_to_call = max(0, int(view.to_call or 0))
+    current_bet = max((committed[i] for i in active_seats), default=0)
+    legal_raise = next(
+        (a for a in (view.legal_actions or []) if a.get("type") == "raise"),
+        None,
+    )
+    if desired_to_call > 0:
+        if current_bet < desired_to_call:
+            current_bet = desired_to_call
+        committed[hero_seat] = max(0, current_bet - desired_to_call)
+        if max((committed[i] for i in active_seats if i != hero_seat), default=0) < current_bet:
+            for i in active_seats:
+                if i != hero_seat:
+                    committed[i] = current_bet
+                    break
+        if legal_raise is not None:
+            min_total = int(legal_raise.get("min") or 0)
+            if min_total > current_bet:
+                last_raise_size = max(1, min_total - current_bet)
+    elif current_bet == 0:
+        legal_types = {a.get("type") for a in view.legal_actions or []}
+        if "raise" in legal_types and "bet" not in legal_types:
+            min_total = int(legal_raise.get("min") or 0) if legal_raise else 0
+            current_bet = max(
+                1,
+                (min_total - last_raise_size) if min_total else int(view.min_raise or 0) - big_blind,
+            )
+            for i in active_seats:
+                committed[i] = current_bet
+    elif legal_raise is not None:
+        min_total = int(legal_raise.get("min") or 0)
+        if min_total > current_bet:
+            last_raise_size = max(1, min_total - current_bet)
+
+    if not real:
+        total_committed = list(committed)
+
+    hole_cards = {}
+    if full_hole_cards:
+        hole_cards = dict(full_hole_cards)
+    else:
+        hole_cards[hero_seat] = tuple(view.hole_cards)
+
+    used = set()
+    for cards in hole_cards.values():
+        if cards:
+            for c in cards:
+                used.add(tuple(c))
+    for c in view.board:
+        used.add(tuple(c))
+    deck_remaining = [c for c in _FULL_DECK if c not in used]
+
+    ring_order = list(range(n_seats))
+    position_labels = _seat_labels_for_view(view, pids, hero_seat)
+    full_order = [
+        seat for seat in _street_action_order(view.street, ring_order)
+        if alive[seat] and stacks[seat] > 0
+    ]
+    seat_order = _order_after_seat(full_order, hero_seat, include_seat=True)
+
+    return _GameState(
+        pot=view.pot,
+        stacks=stacks,
+        committed_per_seat=committed,
+        total_committed_per_seat=total_committed,
+        alive=alive,
+        street=view.street,
+        board=list(view.board),
+        hole_cards=hole_cards,
+        seat_order=seat_order,
+        action_idx=0,
+        history_tokens=_abstract_history(view.history or [], view.pot),
+        deck_remaining=deck_remaining,
+        hero_seat=hero_seat,
+        real_contributions=False,
+        ring_order=ring_order,
+        position_labels=position_labels,
+        opp_stat_bucket=opp_stat_bucket,
+        big_blind=big_blind,
+        last_raise_size=last_raise_size,
+    ), hero_seat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -407,6 +1217,7 @@ class CFRBot:
         profile_path: Optional[str] = None,
         use_average: bool = True,
         inference_mode: bool = False,
+        search_depth: int = _DEFAULT_SEARCH_DEPTH,
     ):
         self.iterations = iterations
         self.profile_path = profile_path
@@ -414,13 +1225,34 @@ class CFRBot:
         # When True, skip _run_iterations during act() so the loaded regret
         # table is used as-is without being overwritten by online updates.
         self.inference_mode = inference_mode
+        self._training = not inference_mode  # inverse for clarity in tree-CFR
+        self._search_depth = search_depth
 
         # Node map: info_set_key → _CFRNode
         self._nodes: Dict[str, _CFRNode] = {}
+        self._legacy_nodes: Dict[str, _CFRNode] = {}
+        self._profile_loaded = False
 
         # Session statistics
         self._hands_played = 0
         self._total_iterations = 0
+        self._recursion_calls = 0   # Gate 3A: anti-substitution counter
+
+        # Per-instance RNG for decision sampling. Seeded from the global so
+        # `random.seed(N)` at script start still cascades into reproducibility,
+        # but multiple bots in one process have independent decision streams
+        # (vs. all coupling through the module-level random state).
+        self._rng = random.Random(random.getrandbits(64))
+
+        # Gate 2A item 6: internal opponent stat tracker.
+        # Constructed lazily on first act() with known n_seats.
+        # Limitation: no hand-end observation, so showdown_freq and
+        # fold_to_cbet read low-sample. VPIP and AF (the dimensions
+        # that drive the bucket) work correctly.
+        self._opp_stats: Optional[_OpponentStatTracker] = None
+        self._last_history_len = 0
+        self._last_history_snapshot: List[Dict[str, Any]] = []
+        self._last_hand_id = None
 
         # Attempt to load persisted profile
         if profile_path:
@@ -430,13 +1262,30 @@ class CFRBot:
     #  Public interface: act(state) → Action
     # ──────────────────────────────────────────────────────────────────────────
 
+    def _detect_hand_boundary(self, view: PlayerView) -> bool:
+        """Return True when view.history belongs to a new hand."""
+        hand_id = getattr(view, "hand_id", None)
+        if hand_id is not None:
+            return self._last_hand_id is not None and hand_id != self._last_hand_id
+
+        current = list(view.history or [])
+        if not current:
+            return self._last_history_snapshot != []
+        if len(current) < self._last_history_len:
+            return True
+        if current[:self._last_history_len] != self._last_history_snapshot:
+            return True
+        return False
+
     def act(self, state: PlayerView) -> Action:
         """
         Choose an action for the current game state.
 
-        1. Compute the card bucket for the current hand + board.
-        2. If NOT in inference_mode, run MCCFR iterations to update regrets.
-        3. Select an action from the (average) strategy profile, falling back
+        1. Update internal opponent stat tracker from new history entries.
+        2. Compute card bucket, position, SPR, opp-stat bucket.
+        3. If NOT in inference_mode, run MCCFR iterations to update regrets.
+        4. If profile is loaded and inference mode, do real-time subgame search.
+        5. Select an action from the (average) strategy profile, falling back
            to an equity-based heuristic for unseen information sets.
         """
         hole = state.hole_cards
@@ -448,15 +1297,51 @@ class CFRBot:
         history = state.history or []
         hero_stack = int(state.stacks.get(state.me, 0))
         call_amount = max(0, int(to_call))
+        # Betting context for pot-relative raise sizing (shared by the legal
+        # mask and the concrete action so they stay consistent).
+        current_bet = _current_bet_from_view(state, to_call)
 
-        # How many opponents are still active (not folded)?  The engine's
-        # PlayerView.opponents already excludes folded players.
-        n_opp = len(state.opponents) if state.opponents else 1
-        n_opp = max(1, n_opp)  # at least 1 opponent for the math to work
+        # How many opponents can still affect future action?
+        acting_opponents = acting_opponents_for(state)
+        n_opp = len(acting_opponents) if acting_opponents else 1
+        n_opp = max(1, n_opp)
 
-        # Bail fast if we have no cards (shouldn't happen, but be safe)
+        # Bail fast if we have no cards
         if not hole or len(hole) < 2:
             return _fallback_passive(legal)
+
+        # ── Item 6: Update internal opponent stat tracker ────────
+        n_seats = _tracker_size_for_view(state)
+        if self._opp_stats is None:
+            self._opp_stats = _OpponentStatTracker(n_seats=n_seats, window=50)
+            self._last_history_len = 0
+            self._last_history_snapshot = []
+        else:
+            self._opp_stats.ensure_n_seats(n_seats)
+
+        # Hand-end detection: history resets per engine hand, but the first view
+        # we see in a hand can already contain earlier actions.
+        if self._detect_hand_boundary(state):
+            self._opp_stats.observe_hand_end([])
+            self._last_history_len = 0
+            self._last_history_snapshot = []
+
+        # Walk new history entries since last act() call
+        pids = list(state.stacks.keys())
+        new_entries = history[self._last_history_len:]
+        for entry in new_entries:
+            pid = entry.get("pid", "")
+            seat_idx = _stable_seat_index(state, pid, pids)
+            if seat_idx is not None:
+                self._opp_stats.observe_action(
+                    seat_idx=seat_idx,
+                    street=entry.get("street", "preflop"),
+                    action=entry.get("type", "check"),
+                    pot_before=entry.get("pot_before", 0),
+                )
+        self._last_history_len = len(history)
+        self._last_history_snapshot = list(history)
+        self._last_hand_id = getattr(state, "hand_id", None)
 
         # ── Card abstraction ────────────────────────────────────
         if street == "preflop":
@@ -469,56 +1354,192 @@ class CFRBot:
 
         # ── Position & SPR abstraction ──────────────────────────
         pos_b = _position_bucket(state.position)
-        # Collect active opponent stacks for effective-stack calculation
         opp_stacks = [
             int(state.stacks.get(o, 0))
-            for o in (state.opponents or [])
+            for o in acting_opponents
             if int(state.stacks.get(o, 0)) > 0
         ]
         spr_b = _spr_bucket(hero_stack, pot, opp_stacks)
 
-        # ── Information-set key (includes opponent count, position, SPR) ──
+        # ── Item 3: Opponent stat bucket ────────────────────────
+        opp_stat_b = self._compute_opp_stat_bucket(state)
+
+        # ── Information-set key (7 fields, 6 colons) ────────────
         info_key = _info_set_key(street, bucket, hist_key,
                                  n_opponents=n_opp,
                                  position_bucket=pos_b,
-                                 spr_bucket=spr_b)
+                                 spr_bucket=spr_b,
+                                 opp_stat_bucket=opp_stat_b)
 
         # ── Legal abstract actions ──────────────────────────────
-        legal_mask = _legal_abstract_actions(legal, pot)
+        legal_mask = _legal_abstract_actions(legal, pot, to_call=to_call,
+                                             current_bet=current_bet)
 
-        # ── MCCFR updates: only during training, never during inference ──
-        # Running iterations during live play corrupts the loaded regret
-        # table with noise from the simplified value function.
+        # ── MCCFR updates: only during training ─────────────────
         if not self.inference_mode:
             self._run_iterations(info_key, legal_mask, pot, hole, board,
                                  street, n_opponents=n_opp,
                                  call_amount=call_amount,
-                                 hero_stack=hero_stack)
+                                 hero_stack=hero_stack, view=state)
 
         # ── Choose action from strategy ─────────────────────────
-        node = self._nodes.get(info_key)
+        node = self._lookup_node(info_key)
 
-        # Unseen node (especially common in multiway play with a HU-trained
-        # table): fall back to an equity-based heuristic rather than
-        # uniform random, which is what a blank _CFRNode would give.
+        # Unseen node: fall back to equity-based heuristic
         if node is None or sum(node.strategy_sum) == 0.0:
+            # Item 5: Even with empty profile, try subgame search
+            if self.inference_mode:
+                return self._search_fallback(state, legal_mask, legal, pot,
+                                             hole, board, n_opp, to_call,
+                                             current_bet=current_bet)
             equity = self._quick_equity(hole, board, n_opponents=n_opp)
-            return self._heuristic_action(legal_mask, equity, pot, to_call, legal)
+            return self._heuristic_action(legal_mask, equity, pot, to_call,
+                                          legal, current_bet=current_bet)
 
         if self.use_average:
-            strategy = node.get_average_strategy(legal_mask)
+            avg_strategy = node.get_average_strategy(legal_mask)
         else:
-            strategy = node.get_strategy(legal_mask)
+            avg_strategy = node.get_strategy(legal_mask)
 
-        # Sample from strategy distribution
-        abstract_idx = self._sample_action(strategy, legal_mask)
+        # ── Item 5: Real-time subgame search at inference ───────
+        if self._profile_loaded and self.inference_mode:
+            t0 = _time.monotonic()
+            refined = self._subgame_search(state, avg_strategy, legal_mask,
+                                           depth=self._search_depth)
+            elapsed = _time.monotonic() - t0
+            if elapsed > 5.0:
+                print(f"[CFRBot] [WARN] _subgame_search took {elapsed:.2f}s "
+                      f"(budget: 2s at depth={self._search_depth})")
+            abstract_idx = self._sample_action(refined, legal_mask)
+        else:
+            abstract_idx = self._sample_action(avg_strategy, legal_mask)
+
         self._hands_played += 1
-
-        return _abstract_to_concrete(abstract_idx, legal, pot)
+        return _abstract_to_concrete(abstract_idx, legal, pot,
+                                     to_call=to_call, current_bet=current_bet)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  MCCFR iteration (simplified external-sampling)
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _sample_opponent_hands(self, hero_hole, board, n_opponents: int):
+        """Sample one private-card assignment for live opponents."""
+        used = {tuple(c) for c in hero_hole} | {tuple(c) for c in board}
+        remaining = [c for c in _FULL_DECK if c not in used]
+        need = max(0, int(n_opponents)) * 2
+        if len(remaining) < need:
+            return []
+        sampled = random.sample(remaining, need)
+        return [
+            tuple(sampled[i * 2:(i + 1) * 2])
+            for i in range(max(0, int(n_opponents)))
+        ]
+
+    def _reconstruct_committed_per_seat(self, view: PlayerView):
+        """Walk PlayerView.history and return street/total contributions."""
+        return _reconstruct_contributions_from_view(view)
+
+    def _build_training_game_state(self, view: PlayerView, hero_hole,
+                                   opp_hands, board):
+        """Build a full-info _GameState for recursive training traversal."""
+        pids = list(view.stacks.keys())
+        if not pids or view.me not in pids:
+            return None
+        hero_seat = pids.index(view.me)
+        stacks = [int(view.stacks[pid]) for pid in pids]
+        street_committed, total_committed, real = self._reconstruct_committed_per_seat(view)
+        if not real:
+            return None
+        big_blind = _infer_big_blind_from_view(view)
+        last_raise_size = _infer_last_raise_size_from_view(view, big_blind)
+
+        opp_set = set(view.opponents or [])
+        alive = [
+            (pid == view.me or pid in opp_set) and stacks[i] >= 0
+            for i, pid in enumerate(pids)
+        ]
+        hole_cards = {hero_seat: tuple(hero_hole)}
+        hand_iter = iter(opp_hands)
+        for opid in view.opponents or []:
+            if opid not in pids:
+                continue
+            try:
+                hole_cards[pids.index(opid)] = tuple(next(hand_iter))
+            except StopIteration:
+                return None
+
+        used = set()
+        for cards in hole_cards.values():
+            for c in cards:
+                used.add(tuple(c))
+        for c in board:
+            used.add(tuple(c))
+        deck_remaining = [c for c in _FULL_DECK if c not in used]
+
+        ring_order = list(range(len(pids)))
+        position_labels = _seat_labels_for_view(view, pids, hero_seat)
+        full_order = [
+            seat for seat in _street_action_order(view.street, ring_order)
+            if alive[seat] and stacks[seat] > 0
+        ]
+        seat_order = _order_after_seat(full_order, hero_seat, include_seat=True)
+
+        return _GameState(
+            pot=int(view.pot),
+            stacks=stacks,
+            committed_per_seat=street_committed,
+            total_committed_per_seat=total_committed,
+            alive=alive,
+            street=view.street,
+            board=list(board),
+            hole_cards=hole_cards,
+            seat_order=seat_order,
+            action_idx=0,
+            history_tokens=_abstract_history(view.history or [], view.pot),
+            deck_remaining=deck_remaining,
+            hero_seat=hero_seat,
+            real_contributions=True,
+            ring_order=ring_order,
+            position_labels=position_labels,
+            opp_stat_bucket=self._compute_opp_stat_bucket(view),
+            big_blind=big_blind,
+            last_raise_size=last_raise_size,
+        )
+
+    def _info_key_for_state(self, state: _GameState, seat: int) -> str:
+        """Build the Gate-2A 7-field key for a recursive state node."""
+        n_opponents = sum(
+            1 for i, live in enumerate(state.alive)
+            if i != seat and live and state.stacks[i] > 0
+        )
+        n_opponents = max(1, n_opponents)
+        hole = state.hole_cards.get(seat, [])
+        if hole and len(hole) >= 2:
+            if state.street == "preflop":
+                bucket = _preflop_bucket(list(hole))
+            else:
+                bucket = _postflop_bucket(
+                    list(hole), state.board, n_opponents=n_opponents
+                )
+        else:
+            bucket = 0
+
+        pos_label = state.position_labels.get(seat, "MP")
+        pos_b = _position_bucket(pos_label)
+        opp_stacks = [
+            int(state.stacks[i]) for i, live in enumerate(state.alive)
+            if i != seat and live and int(state.stacks[i]) > 0
+        ]
+        spr_b = _spr_bucket(int(state.stacks[seat]), state.pot, opp_stacks)
+        return _info_set_key(
+            state.street,
+            bucket,
+            state.history_tokens,
+            n_opponents=n_opponents,
+            position_bucket=pos_b,
+            spr_bucket=spr_b,
+            opp_stat_bucket=state.opp_stat_bucket,
+        )
 
     def _run_iterations(
         self,
@@ -531,50 +1552,27 @@ class CFRBot:
         n_opponents: int,
         call_amount: int,
         hero_stack: int,
+        view: PlayerView,
     ):
         """
-        Run ``self.iterations`` simplified MCCFR traversals rooted at the
-        current decision node.
-
-        Because we don't have access to a full game-tree simulator inside the
-        bot, we use a *one-step look-ahead with rollout*: for each abstract
-        action, simulate the expected value via Monte-Carlo equity estimation,
-        then update regrets as if each action led to a terminal node.
+        Run ``self.iterations`` external-sampling MCCFR traversals rooted at
+        the current decision. Each traversal samples opponent hole cards,
+        builds a full-info _GameState from PlayerView.history, and recurses.
         """
-        node = self._get_node(info_key)
-
-        # Compute equity once per decision point (outside the iteration loop)
-        # so that the Monte-Carlo rollout is not repeated on every iteration.
-        equity = self._quick_equity(hole, board, n_opponents=n_opponents)
-
+        completed = 0
         for _ in range(self.iterations):
-            strategy = node.get_strategy(legal_mask)
+            sample_opponents = max(1, len(view.opponents or []))
+            opp_hands = self._sample_opponent_hands(hole, board, sample_opponents)
+            state = self._build_training_game_state(
+                view, hero_hole=hole, opp_hands=opp_hands, board=board
+            )
+            if state is None:
+                continue
+            reach = {s: 1.0 for s in range(len(state.stacks))}
+            self._cfr_recurse(state, state.hero_seat, reach, depth=0)
+            completed += 1
 
-            # Accumulate strategy for average computation
-            for a in legal_mask:
-                node.strategy_sum[a] += strategy[a]
-
-            # Compute utility for each legal abstract action via rollout
-            action_values = {}
-            for a in legal_mask:
-                action_values[a] = self._estimate_action_value(
-                    a,
-                    pot,
-                    equity,
-                    n_opponents=n_opponents,
-                    call_amount=call_amount,
-                    hero_stack=hero_stack,
-                )
-
-            # Expected value under current strategy
-            ev = sum(strategy[a] * action_values.get(a, 0.0) for a in legal_mask)
-
-            # Update regrets
-            for a in legal_mask:
-                regret = action_values[a] - ev
-                node.regret_sum[a] += regret
-
-        self._total_iterations += self.iterations
+        self._total_iterations += completed
 
     def _estimate_action_value(
         self,
@@ -586,11 +1584,16 @@ class CFRBot:
         hero_stack: int,
     ) -> float:
         """
+        DEPRECATED training value function.
+
         Estimate the chip EV of taking the given abstract action.
 
         Fold is the neutral reference point. Other actions are scored in
         chips, then normalized by pot size so regrets stay comparable across
         short-stack and deep-stack spots.
+
+        Recursive MCCFR training now uses _cfr_recurse + _leaf_value. This
+        helper remains only for sanity diagnostics and heuristic fallbacks.
         """
         label = ABSTRACT_ACTIONS[abstract_idx]
         pot = max(0, int(pot))
@@ -660,6 +1663,7 @@ class CFRBot:
         pot: int,
         to_call: int,
         legal: List[Dict[str, Any]],
+        current_bet: int = 0,
     ) -> Action:
         """
         Equity-based fallback for information sets not seen during training.
@@ -673,7 +1677,9 @@ class CFRBot:
             # Strong hand: bet for value using the largest available sizing.
             bet_actions = [a for a in legal_mask if a >= 2]
             if bet_actions:
-                return _abstract_to_concrete(max(bet_actions), legal, pot)
+                return _abstract_to_concrete(max(bet_actions), legal, pot,
+                                             to_call=to_call,
+                                             current_bet=current_bet)
             # No bet available → check/call
             return _abstract_to_concrete(1, legal, pot)
 
@@ -696,6 +1702,283 @@ class CFRBot:
         return _abstract_to_concrete(1, legal, pot)           # forced call
 
     # ──────────────────────────────────────────────────────────────────────────
+    #  Gate 2A: opponent stat bucket (item 3)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _compute_opp_stat_bucket(self, state: PlayerView) -> str:
+        """Build the opp_stat_bucket string for the info-set key.
+
+        Heads-up: single opponent's bucket (e.g. "TA").
+        Multiway: sorted concatenation of all live opponents' buckets,
+        separated by hyphens (e.g. "LA-LP-TA").
+        """
+        if self._opp_stats is None:
+            return "TA"
+
+        pids = list(state.stacks.keys())
+        opp_pids = acting_opponents_for(state)
+
+        buckets = []
+        for opid in opp_pids:
+            seat_idx = _stable_seat_index(state, opid, pids)
+            if seat_idx is not None:
+                buckets.append(self._opp_stats.bucket(seat_idx))
+            else:
+                buckets.append("TA")
+
+        if not buckets:
+            return "TA"
+
+        buckets.sort()
+        return "-".join(buckets)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  Gate 2A: AIVAT leaf evaluator (item 2)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _leaf_value(self, game_state: _GameState, hero_seat: int) -> float:
+        """Evaluate a tree leaf.
+
+        Training mode (real_contributions=True):
+            Uses core.aivat.value() with full opponent hole cards visible. This
+            is the equity-shaping value signal for Path A, with correct
+            main/side-pot settlement during regret learning.
+
+        Inference mode (real_contributions=False):
+            AIVAT needs exact per-seat contributions and full opponent hole
+            cards. Inference has neither, so it falls back to vanilla
+            equity-vs-random opponents times pot instead of pretending to be
+            side-pot-correct. See SESSION_LOG_2026-04-26.md for context.
+        """
+        if not game_state.alive[hero_seat]:
+            return 0.0
+
+        if not game_state.real_contributions:
+            hole = game_state.hole_cards.get(hero_seat, [])
+            n_opponents = sum(
+                1 for i, live in enumerate(game_state.alive)
+                if i != hero_seat and live
+            )
+            eq = _canonical_equity(
+                list(hole),
+                list(game_state.board),
+                n_opponents=max(1, n_opponents),
+                n_sims=200,
+            )
+            return eq * game_state.pot
+
+        assert sum(game_state.total_committed_per_seat) >= game_state.pot - 1, (
+            f"Real-contribution claim violated: total_committed_per_seat="
+            f"{game_state.total_committed_per_seat} vs pot={game_state.pot}"
+        )
+
+        snapshot = _Snapshot(
+            hole_cards=game_state.hole_cards,
+            board=tuple(game_state.board),
+            pot=game_state.pot,
+            stacks=tuple(game_state.stacks),
+            alive=tuple(game_state.alive),
+            to_call=game_state.to_call_for(hero_seat),
+            hero_committed=game_state.total_committed_per_seat[hero_seat],
+            committed_per_seat=tuple(game_state.total_committed_per_seat),
+        )
+        return _aivat_value(snapshot, hero_seat, mode="chip_ev", n_sims=200)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  Gate 2A: Recursive tree CFR (item 1)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _cfr_recurse(self, state: _GameState, hero_seat: int,
+                     reach_probs: Dict[int, float], depth: int) -> float:
+        """External-sampling MCCFR recursive traversal.
+
+        state: current _GameState
+        hero_seat: which seat we're computing regret for this iteration
+        reach_probs: {seat -> reach probability under each player's strategy}
+        depth: recursion depth, bounded by _MAX_CFR_DEPTH
+        """
+        self._recursion_calls += 1  # Gate 3A: anti-substitution counter
+        if state.is_terminal() or depth >= _MAX_CFR_DEPTH:
+            return self._leaf_value(state, hero_seat)
+
+        if state.is_chance_node():
+            next_state = state.advance_street()
+            return self._cfr_recurse(next_state, hero_seat, reach_probs,
+                                     depth + 1)
+
+        seat = state.seat_to_act()
+        if seat < 0:
+            return self._leaf_value(state, hero_seat)
+
+        info_key = self._info_key_for_state(state, seat)
+        legal_mask = state.legal_abstract_actions()
+        node = self._get_node(info_key)
+        strategy = node.get_strategy(legal_mask)
+
+        if seat != hero_seat:
+            # Opponent: sample one action (external sampling)
+            action = self._sample_action(strategy, legal_mask)
+            next_state = state.apply_action(seat, action)
+            new_reach = dict(reach_probs)
+            new_reach[seat] = new_reach.get(seat, 1.0) * strategy[action]
+            return self._cfr_recurse(next_state, hero_seat, new_reach,
+                                     depth + 1)
+
+        # Hero: expand all legal actions
+        action_utils = {}
+        for a in legal_mask:
+            before_commit = state.committed_per_seat[hero_seat]
+            next_state = state.apply_action(hero_seat, a)
+            added_cost = max(
+                0, next_state.committed_per_seat[hero_seat] - before_commit
+            )
+            new_reach = dict(reach_probs)
+            new_reach[hero_seat] = new_reach.get(hero_seat, 1.0) * strategy[a]
+            action_utils[a] = (
+                self._cfr_recurse(next_state, hero_seat, new_reach, depth + 1)
+                - added_cost
+            )
+
+        node_util = sum(strategy[a] * action_utils.get(a, 0.0)
+                        for a in legal_mask)
+
+        # Counterfactual reach = product of all opponents' reach probs
+        cf_reach = 1.0
+        for s, rp in reach_probs.items():
+            if s != hero_seat:
+                cf_reach *= rp
+        self_reach = reach_probs.get(hero_seat, 1.0)
+
+        # Update regrets and average strategy
+        for a in legal_mask:
+            node.regret_sum[a] += cf_reach * (action_utils.get(a, 0.0)
+                                              - node_util)
+            node.strategy_sum[a] += self_reach * strategy[a]
+
+        return node_util
+
+    # ──────────────────────────────────────────────────────────────────────────
+    #  Gate 2A: Real-time subgame search (item 5)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _subgame_search(self, state: PlayerView, prior: List[float],
+                        legal_mask: List[int], depth: int = 3) -> List[float]:
+        """Depth-limited subgame search rooted at the current state.
+
+        Builds a small game tree, evaluates leaves via AIVAT, returns a
+        refined strategy = softmax(prior * exp(ev)).
+        """
+        gs, hero_seat = _build_game_state_from_view(
+            state,
+            opp_stat_bucket=self._compute_opp_stat_bucket(state),
+        )
+
+        # Evaluate each candidate hero action
+        action_evs = {}
+        for a in legal_mask:
+            before_commit = gs.committed_per_seat[hero_seat]
+            next_state = gs.apply_action(hero_seat, a)
+            added_cost = max(
+                0, next_state.committed_per_seat[hero_seat] - before_commit
+            )
+            ev = self._search_subtree(next_state, hero_seat, depth - 1) - added_cost
+            action_evs[a] = ev
+
+        # Refined strategy: softmax over (prior * exp(ev))
+        refined = [0.0] * NUM_ACTIONS
+        max_ev = max(action_evs.values()) if action_evs else 0.0
+
+        total = 0.0
+        for a in legal_mask:
+            ev = action_evs.get(a, 0.0)
+            w = max(prior[a], 1e-6) * math.exp(ev - max_ev)
+            refined[a] = w
+            total += w
+
+        if total > 0:
+            for a in legal_mask:
+                refined[a] /= total
+        else:
+            n = len(legal_mask)
+            for a in legal_mask:
+                refined[a] = 1.0 / n
+
+        return refined
+
+    def _search_subtree(self, state: _GameState, hero_seat: int,
+                        depth: int) -> float:
+        """Recursive subtree evaluation for subgame search."""
+        if state.is_terminal() or depth <= 0:
+            return self._leaf_value(state, hero_seat)
+
+        if state.is_chance_node():
+            next_state = state.advance_street()
+            return self._search_subtree(next_state, hero_seat, depth - 1)
+
+        seat = state.seat_to_act()
+        if seat < 0:
+            return self._leaf_value(state, hero_seat)
+
+        legal_mask = state.legal_abstract_actions()
+
+        if seat != hero_seat:
+            # Opponent: use profile avg strategy or uniform
+            info_key = self._info_key_for_state(state, seat)
+            node = self._lookup_node(info_key)
+            if node and sum(node.strategy_sum) > 0:
+                strategy = node.get_average_strategy(legal_mask)
+            else:
+                strategy = [0.0] * NUM_ACTIONS
+                n = len(legal_mask)
+                for a in legal_mask:
+                    strategy[a] = 1.0 / n
+
+            # Sample one opponent action
+            action = self._sample_action(strategy, legal_mask)
+            next_state = state.apply_action(seat, action)
+            return self._search_subtree(next_state, hero_seat, depth - 1)
+
+        # Hero: expand all actions, take max (search for best play)
+        best_val = float('-inf')
+        for a in legal_mask:
+            before_commit = state.committed_per_seat[hero_seat]
+            next_state = state.apply_action(hero_seat, a)
+            added_cost = max(
+                0, next_state.committed_per_seat[hero_seat] - before_commit
+            )
+            val = self._search_subtree(next_state, hero_seat, depth - 1) - added_cost
+            best_val = max(best_val, val)
+        return best_val
+
+    def _search_fallback(self, state: PlayerView, legal_mask: List[int],
+                         legal: List[Dict[str, Any]], pot: int,
+                         hole, board, n_opp: int, to_call: int,
+                         current_bet: int = 0) -> Action:
+        """Fallback when no profile node exists: run search or heuristic."""
+        try:
+            uniform = [0.0] * NUM_ACTIONS
+            n = len(legal_mask)
+            for a in legal_mask:
+                uniform[a] = 1.0 / n
+            t0 = _time.monotonic()
+            refined = self._subgame_search(state, uniform, legal_mask,
+                                           depth=self._search_depth)
+            elapsed = _time.monotonic() - t0
+            if elapsed > 5.0:
+                print(f"[CFRBot] [WARN] search fallback took {elapsed:.2f}s")
+            return _abstract_to_concrete(
+                self._sample_action(refined, legal_mask), legal, pot,
+                to_call=to_call, current_bet=current_bet)
+        except (KeyError, IndexError, ValueError) as e:
+            print(
+                f"[CFRBot] _search_fallback caught {type(e).__name__}: {e}; "
+                "using heuristic action."
+            )
+            equity = self._quick_equity(hole, board, n_opponents=n_opp)
+            return self._heuristic_action(legal_mask, equity, pot, to_call,
+                                          legal, current_bet=current_bet)
+
+    # ──────────────────────────────────────────────────────────────────────────
     #  Node management
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -704,9 +1987,30 @@ class CFRBot:
             self._nodes[key] = _CFRNode()
         return self._nodes[key]
 
+    @staticmethod
+    def _legacy_key_candidates(info_key: str) -> List[str]:
+        parts = info_key.split(":")
+        if len(parts) < 7:
+            return []
+        street, n_opp, position, spr, _opp_stat, bucket = parts[:6]
+        history = ":".join(parts[6:])
+        return [
+            f"{street}:{n_opp}:{position}:{spr}:{bucket}:{history}",
+        ]
+
+    def _lookup_node(self, key: str) -> Optional[_CFRNode]:
+        node = self._nodes.get(key)
+        if node is not None:
+            return node
+        for candidate in self._legacy_key_candidates(key):
+            node = self._legacy_nodes.get(candidate)
+            if node is not None:
+                return node
+        return None
+
     def _sample_action(self, strategy: List[float], legal_mask: List[int]) -> int:
         """Sample an action index from the strategy distribution."""
-        r = random.random()
+        r = self._rng.random()
         cumulative = 0.0
         for a in legal_mask:
             cumulative += strategy[a]
@@ -752,7 +2056,15 @@ class CFRBot:
         Load regret and strategy tables from a pickle file.
         """
         path = path or self.profile_path
-        if not path or not os.path.exists(path):
+        if not path:
+            return
+        if not os.path.exists(path):
+            if self.inference_mode:
+                raise RuntimeError(
+                    f"[CFRBot] Missing profile {path!r}. In inference_mode, "
+                    "a trained CFR profile is required; train one or pass "
+                    "cfr:<path> to an existing profile."
+                )
             return
 
         try:
@@ -761,32 +2073,48 @@ class CFRBot:
             loaded_nodes = {
                 k: _CFRNode.from_dict(v) for k, v in data["nodes"].items()
             }
-            # Keys must have >= 5 colons to match the current format:
-            # street:n_opp:position:spr:bucket:history
-            self._nodes = {
-                k: node for k, node in loaded_nodes.items()
-                if k.count(":") >= 5
-            }
-            self._hands_played = data.get("hands_played", 0)
-            self._total_iterations = data.get("total_iterations", 0)
-            dropped = len(loaded_nodes) - len(self._nodes)
-            if dropped:
-                print(
-                    f"[CFRBot] Dropped {dropped} old-format keys "
-                    f"(pre-position/SPR). {len(self._nodes)} valid keys remain."
-                )
-                if not self._nodes:
-                    print(
-                        "  ⚠ Profile has no valid keys for current code. Bot will fall back\n"
-                        "    to heuristic until a fresh profile is trained."
-                    )
-            print(f"[CFRBot] Loaded profile from {path} "
-                  f"({len(self._nodes)} info sets, "
-                  f"{self._total_iterations} iterations)")
+            hands_played = data.get("hands_played", 0)
+            total_iterations = data.get("total_iterations", 0)
         except Exception as e:
             print(f"[CFRBot] Could not load profile from {path}: {e}")
             self._nodes = {}
+            self._legacy_nodes = {}
             return
+
+        # Gate 2A format: 7 fields, 6 colons:
+        # street:n_opp:position:spr:opp_stat:bucket:history.
+        # Older keys are retained for deterministic inference lookup fallbacks
+        # but are not written back by save().
+        self._nodes = {}
+        self._legacy_nodes = {}
+        for k, node in loaded_nodes.items():
+            if k.count(":") >= 6:
+                self._nodes[k] = node
+            else:
+                self._legacy_nodes[k] = node
+        self._hands_played = hands_played
+        self._total_iterations = total_iterations
+        legacy = len(self._legacy_nodes)
+        if legacy:
+            print(
+                f"[CFRBot] Loaded {legacy} old-format keys for "
+                f"compatibility fallback. {len(self._nodes)} current keys remain."
+            )
+
+        if not self._nodes and not self._legacy_nodes and self.inference_mode:
+            raise RuntimeError(
+                f"[CFRBot] Profile {path!r} has 0 valid info-set keys after "
+                f"loading. In inference_mode, a working profile is "
+                f"required — refusing to silently fall back to heuristic. "
+                f"Use models/cfr_regret_deep_v2.pkl or train a fresh profile."
+            )
+
+        if self._nodes or self._legacy_nodes:
+            self._profile_loaded = True
+        print(f"[CFRBot] Loaded profile from {path} "
+              f"({len(self._nodes)} current info sets, "
+              f"{len(self._legacy_nodes)} legacy info sets, "
+              f"{self._total_iterations} iterations)")
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Diagnostics
@@ -796,6 +2124,8 @@ class CFRBot:
         """Return diagnostic statistics about the CFR profile."""
         return {
             "info_sets": len(self._nodes),
+            "legacy_info_sets": len(self._legacy_nodes),
             "hands_played": self._hands_played,
             "total_iterations": self._total_iterations,
+            "recursion_calls": self._recursion_calls,
         }

@@ -7,8 +7,14 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
-from core.bot_api import Action, PlayerView
-from core.engine import eval_hand, EVAL_HAND_MAX
+from core.bot_api import Action, PlayerView, acting_opponents_for
+from core.engine import eval_hand, EVAL_HAND_MAX, RANK_TO_INT
+
+# eval_hand uses a small rank-sum heuristic with fewer than 5 cards (preflop),
+# whose maximum is pocket aces = 2*max_rank + 40.  Normalising those scores by
+# EVAL_HAND_MAX (the 5-card table max) collapses every preflop hand to ~0, so we
+# normalise the heuristic on its own scale instead.
+_PREFLOP_EVAL_MAX = 2 * max(RANK_TO_INT.values()) + 40
 
 # Card encoding (same as MLBot)
 RANKS = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8,
@@ -142,9 +148,16 @@ class RLBot:
         scale = self.starting_chips
         pot = float(state.pot) / scale
         to_call = float(state.to_call) / scale
-        hero_stack = float(state.stacks.get(state.me, 0)) / scale
-        eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
-        n_players = len(state.opponents) + 1
+        hero_stack_raw = float(state.stacks.get(state.me, 0))
+        hero_stack = hero_stack_raw / scale
+        acting_opponents = acting_opponents_for(state)
+        opp_stacks = [
+            float(state.stacks.get(pid, hero_stack_raw))
+            for pid in acting_opponents
+            if float(state.stacks.get(pid, 0)) > 0
+        ]
+        eff_stack = min([hero_stack_raw] + opp_stacks) / scale
+        n_players = len(acting_opponents) + 1
         
         # Hole cards encoding
         hole = state.hole_cards or []
@@ -181,7 +194,9 @@ class RLBot:
         position_value = position_order.get(state.position, 0.5)
         
         # Memory features
-        memory_features = self._calculate_memory_features(state.history, state.me, state.opponents)
+        memory_features = self._calculate_memory_features(
+            state.history, state.me, acting_opponents
+        )
         
         features = (
             [street, pot, to_call, hero_stack, eff_stack, n_players]
@@ -197,7 +212,10 @@ class RLBot:
         if not hole or len(hole) < 2:
             return 0.0
         score = eval_hand(hole, board)
-        return score / EVAL_HAND_MAX
+        if len(hole) + len(board) >= 5:
+            return score / EVAL_HAND_MAX
+        # Preflop / incomplete board: normalise the rank-sum heuristic.
+        return min(1.0, score / _PREFLOP_EVAL_MAX)
     
     def _calculate_memory_features(self, history, me, opponents):
         """Calculate opponent behavior features from action history."""
@@ -305,7 +323,7 @@ class RLBot:
             
             # Update memory
             if hasattr(state, 'history') and state.history:
-                self._update_memory(state.history, state.opponents)
+                self._update_memory(state.history, acting_opponents_for(state))
             
             # Use fallback if model not loaded and fallback enabled
             if not self.model_loaded and self.use_fallback and not self.training_mode:

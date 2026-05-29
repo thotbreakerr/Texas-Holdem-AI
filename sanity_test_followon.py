@@ -89,7 +89,7 @@ for street, pid, opps in all_views:
 if postflop_failures:
     PASS = False
     for street, pid, opps in postflop_failures:
-        print(f"  FAIL ❌ [{street}] {pid} sees P1 (folded) in opponents={opps}")
+        print(f"  [FAIL] [{street}] {pid} sees P1 (folded) in opponents={opps}")
 else:
     # Print a clean summary per postflop street
     postflop = [(s, pid, opps) for s, pid, opps in all_views if s != "preflop"]
@@ -102,7 +102,7 @@ else:
         for s, opp_lists in by_street.items():
             sample = opp_lists[0]
             print(f"  [{s}] sample opponents (P0's view) = {sample}  "
-                  f"P1 absent = {'P1' not in sample}  → PASS ✅")
+                  f"P1 absent = {'P1' not in sample}  → [PASS]")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEST 2 — Ctrl+C triggers bot.save()
@@ -137,21 +137,21 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
     if os.path.exists(profile):
         size = os.path.getsize(profile)
-        print(f"  Checkpoint exists after Ctrl+C: YES ({size:,} bytes)  → PASS ✅")
+        print(f"  Checkpoint exists after Ctrl+C: YES ({size:,} bytes)  → [PASS]")
         try:
             with open(profile, "rb") as f:
                 data = pickle.load(f)
             print(f"  Checkpoint is valid pickle with "
-                  f"{len(data.get('nodes', {}))} info-set nodes  → PASS ✅")
+                  f"{len(data.get('nodes', {}))} info-set nodes  → [PASS]")
         except Exception as e:
-            print(f"  Checkpoint is CORRUPT: {e}  → FAIL ❌")
+            print(f"  Checkpoint is CORRUPT: {e}  → [FAIL]")
             PASS = False
     else:
-        print("  Checkpoint does NOT exist after Ctrl+C  → FAIL ❌")
+        print("  Checkpoint does NOT exist after Ctrl+C  → [FAIL]")
         PASS = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 print()
 print("=" * 60)
-print(f"OVERALL: {'ALL CHECKS PASSED ✅' if PASS else 'SOME CHECKS FAILED ❌'}")
+print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
 print("=" * 60)

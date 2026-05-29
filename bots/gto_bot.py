@@ -14,7 +14,7 @@ Key principles:
 """
 
 import random
-from core.bot_api import Action, PlayerView
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, EVAL_HAND_MAX, _FULL_DECK
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -214,7 +214,9 @@ class GTOBot:
 
     def _postflop(self, hole, board, pot, to_call, legal, street, position,
                   state):
-        strength = self._hand_strength(hole, board, num_opponents=len(state.opponents))
+        strength = self._hand_strength(
+            hole, board, num_opponents=len(acting_opponents_for(state))
+        )
         has_draw = self._has_draw(hole, board)
 
         # ----- RIVER: enforce 2:1 value-to-bluff ratio -----
@@ -377,6 +379,10 @@ class GTOBot:
         """Monte Carlo equity estimate against num_opponents random hands."""
         if not hole or len(hole) < 2:
             return 0.0
+        # When everyone else is already all-in (or folded) the caller can pass
+        # num_opponents=0; clamp to a heads-up race so the candidate set is never
+        # empty (max() over no opp_hands previously crashed on the river).
+        num_opponents = max(1, num_opponents)
         wins = 0
         ties = 0
         base_used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)

@@ -62,7 +62,44 @@ e2 = events[2]
 assert e2.action == "fold", f"Expected 'fold', got {e2.action}"
 assert e2.amount == 0, f"Expected amount=0, got {e2.amount}"
 
-print("  ✅ PASS — amounts match engine history directly (total, not delta)")
+print("  [PASS] — amounts match engine history directly (total, not delta)")
+
+print()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  TEST 1b: extract_history rejects unknown pids
+# ═══════════════════════════════════════════════════════════════════════════
+
+print("=" * 60)
+print("TEST 1b: extract_history unknown pid guard")
+print("=" * 60)
+
+bad_view = PlayerView(
+    me="P0",
+    street="flop",
+    position="BTN",
+    hole_cards=[],
+    board=[],
+    pot=0,
+    to_call=0,
+    min_raise=0,
+    max_raise=0,
+    legal_actions=[{"type": "check"}],
+    stacks={"P0": 500, "P1": 300},
+    opponents=["P1"],
+    history=[{"street": "preflop", "pid": "P9", "type": "call", "amount": 10}],
+)
+
+try:
+    extract_history(bad_view)
+    print("  [FAIL] — expected ValueError for unknown pid")
+    PASS = False
+except ValueError as e:
+    if "P9" in str(e):
+        print("  [PASS] — unknown pid raises ValueError")
+    else:
+        print(f"  [FAIL] — wrong ValueError: {e}")
+        PASS = False
 
 print()
 
@@ -88,9 +125,9 @@ tokens = tokenize(known_events)
 print(f"  Token string: {tokens}")
 expected = "FKCSQQ"
 if tokens == expected:
-    print(f"  ✅ PASS — matches expected '{expected}'")
+    print(f"  [PASS] — matches expected '{expected}'")
 else:
-    print(f"  ❌ FAIL — expected '{expected}', got '{tokens}'")
+    print(f"  [FAIL] — expected '{expected}', got '{tokens}'")
     PASS = False
 
 print()
@@ -110,9 +147,9 @@ evt_pot_bet = ActionEvent(seat=0, street="preflop", action="bet",
 tok = tokenize([evt_pot_bet])
 print(f"  pot-sized bet (30/30): token = '{tok}'")
 if tok == "P":
-    print("  ✅ PASS — pot-sized bet stays 'P'")
+    print("  [PASS] — pot-sized bet stays 'P'")
 else:
-    print(f"  ❌ FAIL — expected 'P', got '{tok}'")
+    print(f"  [FAIL] — expected 'P', got '{tok}'")
     PASS = False
 
 print()
@@ -130,9 +167,9 @@ evt_p = ActionEvent(seat=0, street="flop", action="bet", amount=80, pot_before=8
 tok_p = tokenize([evt_p])
 print(f"  amount=80, pot_before=80: token = '{tok_p}'")
 if tok_p == "P":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected 'P', got '{tok_p}'")
+    print(f"  [FAIL] — expected 'P', got '{tok_p}'")
     PASS = False
 
 # amount=40, pot_before=80 → ratio 0.5 → Q
@@ -140,9 +177,9 @@ evt_q = ActionEvent(seat=0, street="flop", action="bet", amount=40, pot_before=8
 tok_q = tokenize([evt_q])
 print(f"  amount=40, pot_before=80: token = '{tok_q}'")
 if tok_q == "Q":
-    print("  ✅ PASS")
+    print("  [PASS]")
 else:
-    print(f"  ❌ FAIL — expected 'Q', got '{tok_q}'")
+    print(f"  [FAIL] — expected 'Q', got '{tok_q}'")
     PASS = False
 
 print()
@@ -172,17 +209,17 @@ all_tokens = tokenize(all_events)
 print(f"  All tokens: '{all_tokens}'")
 expected_all = "FKCSQMLPA"
 if all_tokens == expected_all:
-    print(f"  ✅ PASS — all tokens match '{expected_all}'")
+    print(f"  [PASS] — all tokens match '{expected_all}'")
 else:
-    print(f"  ❌ FAIL — expected '{expected_all}', got '{all_tokens}'")
+    print(f"  [FAIL] — expected '{expected_all}', got '{all_tokens}'")
     PASS = False
 
 # Verify each individual token is present
 for tok_char in "FKCSQMLPA":
     if tok_char in all_tokens:
-        print(f"  '{tok_char}' present ✅")
+        print(f"  '{tok_char}' present [PASS]")
     else:
-        print(f"  '{tok_char}' MISSING ❌")
+        print(f"  '{tok_char}' MISSING [FAIL]")
         PASS = False
 
 print()
@@ -214,9 +251,9 @@ try:
 
     # Shapes match
     if t_short.shape == t_empty.shape:
-        print(f"  ✅ PASS — stable shape (max_len=64, feature_dim={FEATURE_DIM})")
+        print(f"  [PASS] — stable shape (max_len=64, feature_dim={FEATURE_DIM})")
     else:
-        print("  ❌ FAIL — shapes differ")
+        print("  [FAIL] — shapes differ")
         PASS = False
 
     # Padding mask is zero where padded
@@ -224,22 +261,22 @@ try:
     mask_idx = FEATURE_DIM - 1
     # First 2 rows should have mask=1, rest should have mask=0
     if t_short[0, mask_idx] == 1.0 and t_short[1, mask_idx] == 1.0:
-        print("  ✅ PASS — mask=1 for real events")
+        print("  [PASS] — mask=1 for real events")
     else:
-        print("  ❌ FAIL — mask not set for real events")
+        print("  [FAIL] — mask not set for real events")
         PASS = False
 
     if t_short[2, mask_idx] == 0.0 and t_short[63, mask_idx] == 0.0:
-        print("  ✅ PASS — mask=0 for padded events")
+        print("  [PASS] — mask=0 for padded events")
     else:
-        print(f"  ❌ FAIL — padding mask not 0 (idx2={t_short[2, mask_idx]}, idx63={t_short[63, mask_idx]})")
+        print(f"  [FAIL] — padding mask not 0 (idx2={t_short[2, mask_idx]}, idx63={t_short[63, mask_idx]})")
         PASS = False
 
     # Empty tensor should have all zeros
     if t_empty.sum() == 0.0:
-        print("  ✅ PASS — empty tensor is all zeros")
+        print("  [PASS] — empty tensor is all zeros")
     else:
-        print("  ❌ FAIL — empty tensor has non-zero values")
+        print("  [FAIL] — empty tensor has non-zero values")
         PASS = False
 
     # Round-trip spot-check: known events → tensor → check features
@@ -250,17 +287,17 @@ try:
     assert t_short[0, 10] == 1.0, f"Street one-hot wrong: {t_short[0, 10]}"
     # Action one-hot: raise is idx 4, offset at position 14 (after 10 seats + 4 streets)
     assert t_short[0, 14 + 4] == 1.0, f"Action one-hot wrong: {t_short[0, 18]}"
-    print("  ✅ PASS — round-trip spot-check passed")
+    print("  [PASS] — round-trip spot-check passed")
 
     # No NaN
     if not torch.isnan(t_short).any():
-        print("  ✅ PASS — no NaN in tensor")
+        print("  [PASS] — no NaN in tensor")
     else:
-        print("  ❌ FAIL — NaN detected")
+        print("  [FAIL] — NaN detected")
         PASS = False
 
 except ImportError:
-    print("  ⚠ SKIP — torch not available")
+    print("  [OPTIONAL] SKIP — torch not available")
 
 print()
 
@@ -270,8 +307,8 @@ print()
 
 print("=" * 60)
 if PASS:
-    print("ALL CHECKS PASSED ✅")
+    print("ALL CHECKS PASSED [PASS]")
 else:
-    print("SOME CHECKS FAILED ❌")
+    print("SOME CHECKS FAILED [FAIL]")
     sys.exit(1)
 print("=" * 60)

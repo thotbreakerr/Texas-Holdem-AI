@@ -150,4 +150,4 @@ for s in ["flop", "turn", "river"]:
 
 print()
 print("="*60)
-print(f"OVERALL: {'ALL CHECKS PASSED ✅' if PASS else 'SOME CHECKS FAILED ❌'}")
+print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")

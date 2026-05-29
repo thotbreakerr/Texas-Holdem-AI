@@ -57,6 +57,17 @@ def extract_history(player_view) -> list:
     Returns
     -------
     list[ActionEvent]
+
+    Engine contract dependency
+    --------------------------
+    This function relies on player_view.stacks.keys() returning pids in seat
+    order, matching the order in which the engine constructs the stacks dict
+    from the seating ring. If the engine ever reorders stacks (for example,
+    active-only views or stack-sorted views), this mapping breaks silently.
+    The defensive ValueError below catches the mismatch case where a history
+    entry references a pid not in stacks. It does NOT catch reordering; fixing
+    that would require an explicit seat_index field on PlayerView in a future
+    Gate-2 amendment.
     """
     history = getattr(player_view, 'history', None) or []
     events = []
@@ -73,7 +84,12 @@ def extract_history(player_view) -> list:
             continue
 
         pid = entry.get("pid", "")
-        seat = pid_to_seat.get(pid, 0)
+        if pid not in pid_to_seat:
+            raise ValueError(
+                f"extract_history: pid {pid!r} not in stacks={list(stacks)}; "
+                "engine seat-order contract violated"
+            )
+        seat = pid_to_seat[pid]
         street = entry.get("street", "preflop")
         action_type = entry.get("type", "check")
 

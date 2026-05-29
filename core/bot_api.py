@@ -22,7 +22,23 @@ class PlayerView:
     stacks: Dict[str, int]
     opponents: List[str]
     history: List[Dict[str, Any]]
+    hand_id: Optional[int] = None
+    seat_indices: Optional[Dict[str, int]] = None
+    acting_opponents: Optional[List[str]] = None
+    all_in_opponents: Optional[List[str]] = None
 
 class BotAdapter:
     def act(self, view: PlayerView) -> Action:
         raise NotImplementedError
+
+
+def acting_opponents_for(view: PlayerView) -> List[str]:
+    """Opponents who are still able to make future betting decisions."""
+    explicit = getattr(view, "acting_opponents", None)
+    if explicit is not None:
+        return list(explicit)
+    stacks = getattr(view, "stacks", {}) or {}
+    return [
+        pid for pid in (getattr(view, "opponents", None) or [])
+        if int(stacks.get(pid, 0)) > 0
+    ]

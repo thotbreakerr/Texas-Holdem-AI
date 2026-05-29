@@ -8,7 +8,20 @@ matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
 
 from core.engine import Table, Seat
+from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from bots import parse_players, escalate_blinds
+
+
+def _advance_dealer(dealer_index: int, active_count: int) -> int:
+    """Advance the dealer button by one in the ACTIVE seat circle.
+
+    Bug fingerprint (now fixed): using % len(seats_total) instead of
+    % active_count produces sequences with duplicate consecutive indices
+    after eliminations (e.g. with 6 seats total but 5 active:
+    [0,1,2,3,4,0,0,1,2,3] — note the double-0 at positions 5 and 6).
+    Correct rotation: [0,1,2,3,4,0,1,2,3,4].
+    """
+    return (dealer_index + 1) % active_count
 
 
 def run_tournament_until_winner(seats, bots, base_sb, base_bb,
@@ -43,17 +56,22 @@ def run_tournament_until_winner(seats, bots, base_sb, base_bb,
 
         active_seats = [s for s in seats if s.chips > 0]
         active_bots = {s.player_id: bots[s.player_id] for s in active_seats}
+        dealer_index = normalize_dealer_seat_index(seats, dealer_index)
+        if dealer_index is None:
+            break
 
         table.play_hand(
-            seats=active_seats,
+            seats=seats,
             small_blind=sb,
             big_blind=bb,
-            dealer_index=dealer_index % len(active_seats),
+            dealer_index=dealer_index,
             bot_for=active_bots,
             on_event=None,
         )
 
-        dealer_index = (dealer_index + 1) % len(seats)
+        next_dealer = advance_dealer_seat_index(seats, dealer_index)
+        if next_dealer is not None:
+            dealer_index = next_dealer
         chip_history.append({s.player_id: s.chips for s in seats})
 
         # Check for new eliminations
@@ -74,10 +92,36 @@ def run_tournament_until_winner(seats, bots, base_sb, base_bb,
             print(f"Safety limit reached ({max_hands} hands). Stopping.")
             break
 
-    # Winner gets position 1
-    for s in seats:
-        if s.chips > 0 and not any(e[0] == s.player_id for e in eliminations):
-            eliminations.append((s.player_id, 1, hand_count))
+    # ── Assign finishing positions to survivors ──────────────────────────────
+    survivors = [s for s in seats
+                 if s.chips > 0 and not any(e[0] == s.player_id for e in eliminations)]
+
+    if len(survivors) == 1:
+        # Sole survivor = outright winner
+        eliminations.append((survivors[0].player_id, 1, hand_count))
+    elif len(survivors) > 1:
+        if not eliminations:
+            # Nobody was eliminated — tournament never really started.
+            # Flag as unfinished rather than fabricating ranks.
+            print(f"\n[WARN] Tournament unfinished: {len(survivors)} players remain "
+                  f"with zero eliminations after {hand_count} hands.")
+            for s in survivors:
+                eliminations.append((s.player_id, 0, hand_count))  # 0 = unranked
+        else:
+            # Multiple survivors with some eliminations: rank by chip count.
+            # Best surviving position = one better than worst elimination.
+            sorted_survivors = sorted(survivors, key=lambda s: s.chips, reverse=True)
+            # Next available position is 1 less than the last assigned position.
+            # (Eliminated players took the worst positions first.)
+            next_pos = len(seats) - len(eliminations)
+            # Sanity: that should equal len(survivors)
+            for rank_idx, s in enumerate(sorted_survivors):
+                pos = rank_idx + 1  # 1 = chip leader among survivors
+                # But true tournament position accounts for eliminated players:
+                pos = next_pos - len(sorted_survivors) + 1 + rank_idx
+                eliminations.append((s.player_id, pos, hand_count))
+            print(f"\n[WARN] Tournament cut short at {hand_count} hands. "
+                  f"{len(sorted_survivors)} survivors ranked by chip count.")
 
     return chip_history, hand_count, eliminations
 

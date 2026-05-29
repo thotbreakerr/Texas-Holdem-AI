@@ -11,7 +11,7 @@ opponent range rather than random hands.
 import random
 from typing import Optional
 import numpy as np
-from core.bot_api import Action, PlayerView
+from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, EVAL_HAND_MAX, RANKS, SUITS, _FULL_DECK
 
 # ── Hand-strength buckets ────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ class OpponentModelBot:
         pot = state.pot
         to_call = state.to_call
         legal = state.legal_actions
-        opponents = state.opponents
+        opponents = acting_opponents_for(state)
         position = state.position
         street = state.street
         history = state.history
