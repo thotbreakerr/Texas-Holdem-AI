@@ -626,6 +626,25 @@ def _passive(legal):
     return Action(a["type"], a.get("min"))
 
 
+def _is_effective_all_in(action: Action, legal: list) -> bool:
+    """Whether a concrete Action commits the hero's whole stack.
+
+    Mirrors probe_deep_cfr._is_all_in: a literal ``all_in`` action, or a
+    bet/raise whose amount reaches the max bettable (== hero stack).  Used by
+    the diagnostic tracer to flag bucket raises that converted into max-stack
+    raises without involving the abstract ``all_in`` row.
+    """
+    if action.type == "all_in":
+        return True
+    if action.type not in ("bet", "raise") or action.amount is None:
+        return False
+    bet_raise = [a for a in legal if a["type"] in ("bet", "raise")]
+    if not bet_raise:
+        return False
+    hi = bet_raise[0].get("max")
+    return hi is not None and action.amount >= hi
+
+
 def _infer_big_blind(view: PlayerView) -> int:
     """Recover the big blind from PlayerView history when possible.
 
@@ -1069,6 +1088,41 @@ class _DeepCFRGameState:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  DeepCFRTrace (diagnostic — non-mutating decision trace)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DeepCFRTrace:
+    """Per-decision diagnostic produced by ``DeepCFRBot.act_with_trace``.
+
+    Every field describes the SAME decision ``act()`` would make; the tracer
+    reuses ``act()``'s code path verbatim (no policy logic is duplicated), so
+    these values match real play given identical RNG/tracker state.
+
+    Probability/logit dicts are keyed by abstract action index and contain only
+    LEGAL actions — never the full 8-element tensor.  ``probs_after_search`` is
+    ``None`` when search is disabled.
+    """
+    legal_actions: List[dict]                       # raw engine legal actions
+    big_blind: int                                  # inferred big blind
+    legal_abstract_indices: List[int]
+    legal_abstract_labels: List[str]
+    regret_logits: Dict[int, float]                 # idx -> raw regret logit
+    probs_before_search: Dict[int, float]           # regret-matched, pre-search
+    probs_after_search: Optional[Dict[int, float]]  # None if search disabled
+    probs_after_cap: Dict[int, float]               # after all-in cap
+    selected_abstract_index: int
+    selected_abstract_label: str
+    sizing_value: float                             # sizing head scalar
+    final_action_type: str
+    final_action_amount: Optional[int]
+    final_is_all_in: bool                           # whole-stack commit?
+    selected_is_all_in: bool                        # abstract label == "all_in"?
+    all_in_masked: bool = False                     # inference all-in mask hid all_in?
+    search_enabled: bool = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  DeepCFRBot
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1333,6 +1387,33 @@ class DeepCFRBot:
 
     def act(self, state: PlayerView) -> Action:
         """Choose an action for the current game state."""
+        action, _ = self._decide(state, collect_trace=False)
+        return action
+
+    def act_with_trace(self, state: PlayerView) -> Tuple[Action, DeepCFRTrace]:
+        """Diagnostic twin of :meth:`act`.
+
+        Returns the SAME ``Action`` that :meth:`act` would return for ``state``
+        (given identical RNG and tracker state) together with a
+        :class:`DeepCFRTrace` describing how it was reached.  Both methods share
+        the single :meth:`_decide` code path, so the trace cannot drift from a
+        real decision and the tracker/history mutation is exactly what
+        :meth:`act` performs — no more, no less.  :meth:`act` itself is unchanged
+        and still returns only an ``Action``.
+        """
+        return self._decide(state, collect_trace=True)
+
+    def _decide(
+        self, state: PlayerView, *, collect_trace: bool = False
+    ) -> Tuple[Action, Optional[DeepCFRTrace]]:
+        """Core decision logic shared by :meth:`act` and :meth:`act_with_trace`.
+
+        Returns ``(action, trace)``.  ``trace`` is ``None`` unless
+        ``collect_trace`` is set; every trace snapshot is gated behind
+        ``collect_trace`` so the ``collect_trace=False`` path is byte-identical
+        to the original ``act()`` (same forward pass, masking, search, RNG draws
+        and tracker mutation).
+        """
         hole = state.hole_cards
         board = state.board
         pot = state.pot
@@ -1340,7 +1421,29 @@ class DeepCFRBot:
         history = state.history or []
 
         if not hole or len(hole) < 2:
-            return _passive(legal)
+            action = _passive(legal)
+            if not collect_trace:
+                return action, None
+            trace = DeepCFRTrace(
+                legal_actions=list(legal),
+                big_blind=_infer_big_blind(state),
+                legal_abstract_indices=[],
+                legal_abstract_labels=[],
+                regret_logits={},
+                probs_before_search={},
+                probs_after_search=None,
+                probs_after_cap={},
+                selected_abstract_index=-1,
+                selected_abstract_label="<no_hole_cards>",
+                sizing_value=0.0,
+                final_action_type=action.type,
+                final_action_amount=action.amount,
+                final_is_all_in=_is_effective_all_in(action, legal),
+                selected_is_all_in=False,
+                all_in_masked=False,
+                search_enabled=False,
+            )
+            return action, trace
 
         # Lazy-construct opponent tracker
         n_seats = _tracker_size_for_view(state)
@@ -1389,13 +1492,22 @@ class DeepCFRBot:
             street=state.street,
             big_blind=big_blind,
         )
-        if self._inference_all_in_mask_active():
+        all_in_masked = self._inference_all_in_mask_active()
+        if all_in_masked:
             legal_mask = self._mask_all_in(legal_mask)
 
         # Regret matching
         strategy = self._regret_match(regret_logits, legal_mask)
+        probs_before_search = (
+            {a: float(strategy[a]) for a in legal_mask} if collect_trace else None
+        )
 
-        # Real-time search (only with loaded weights)
+        # Real-time search (only with loaded weights). search_enabled tracks
+        # whether search actually refines the strategy (depth > 0); the call
+        # itself stays gated on the original condition so behavior is unchanged.
+        search_enabled = (
+            self.inference_mode and self._weights_loaded and self.search_depth > 0
+        )
         if self.inference_mode and self._weights_loaded:
             t0 = _time.monotonic()
             strategy = self._subgame_search(state, strategy, legal_mask,
@@ -1405,7 +1517,15 @@ class DeepCFRBot:
                 warnings.warn(
                     f"[DeepCFRBot] _subgame_search took {elapsed:.2f}s "
                     f"(budget: 2s at depth={self.search_depth})")
+        probs_after_search = (
+            {a: float(strategy[a]) for a in legal_mask}
+            if (collect_trace and search_enabled) else None
+        )
+
         strategy = self._cap_all_in_probability(strategy, legal_mask, state)
+        probs_after_cap = (
+            {a: float(strategy[a]) for a in legal_mask} if collect_trace else None
+        )
 
         # Sample action
         abstract_idx = self._sample_action(strategy, legal_mask)
@@ -1413,12 +1533,38 @@ class DeepCFRBot:
         # Sizing head for bet/raise actions
         if ABSTRACT_ACTIONS[abstract_idx] in ("bet_33", "bet_50", "bet_67",
                                                "bet_75", "bet_100"):
-            return _abstract_to_concrete(abstract_idx, legal, pot,
-                                         sizing_frac=sizing_val,
-                                         street=state.street,
-                                         big_blind=big_blind)
-        return _abstract_to_concrete(
-            abstract_idx, legal, pot, street=state.street, big_blind=big_blind)
+            action = _abstract_to_concrete(abstract_idx, legal, pot,
+                                           sizing_frac=sizing_val,
+                                           street=state.street,
+                                           big_blind=big_blind)
+        else:
+            action = _abstract_to_concrete(
+                abstract_idx, legal, pot, street=state.street, big_blind=big_blind)
+
+        if not collect_trace:
+            return action, None
+
+        selected_label = ABSTRACT_ACTIONS[abstract_idx]
+        trace = DeepCFRTrace(
+            legal_actions=list(legal),
+            big_blind=big_blind,
+            legal_abstract_indices=list(legal_mask),
+            legal_abstract_labels=[ABSTRACT_ACTIONS[a] for a in legal_mask],
+            regret_logits={a: float(regret_logits[a]) for a in legal_mask},
+            probs_before_search=probs_before_search,
+            probs_after_search=probs_after_search,
+            probs_after_cap=probs_after_cap,
+            selected_abstract_index=abstract_idx,
+            selected_abstract_label=selected_label,
+            sizing_value=float(sizing_val),
+            final_action_type=action.type,
+            final_action_amount=action.amount,
+            final_is_all_in=_is_effective_all_in(action, legal),
+            selected_is_all_in=(selected_label == "all_in"),
+            all_in_masked=all_in_masked,
+            search_enabled=search_enabled,
+        )
+        return action, trace
 
     def _regret_match(self, regret_logits: torch.Tensor,
                       legal_mask: List[int]) -> List[float]:
@@ -1765,8 +1911,26 @@ class DeepCFRBot:
             )
 
         # ── Hero node: full expansion ──
+        # Key Change #2: the hero expands and collects regret targets over
+        # EXACTLY the policy legal mask, never the raw target mask.  This keeps
+        # the abstract `all_in` row out of the regret targets unless that node's
+        # policy actually exposed all-in, preventing all-in regret-row poisoning
+        # before the model has enough self-play exposure to correct it:
+        #   • Shadow phase (all_in_policy_probability <= 0): policy_legal_mask is
+        #     _mask_all_in(target), so all-in is excluded whenever any non-all-in
+        #     action is legal (kept only if it is the sole legal action).
+        #   • Staged phase (0 < prob < 1): expansion/regret mask == the per-node
+        #     stochastic policy_legal_mask (the simpler/safer option the spec
+        #     prefers), so all-in is trained only on nodes where the same policy
+        #     draw exposed it.
+        #   • Full phase (prob >= 1): policy_legal_mask == target_legal_mask, so
+        #     every legal action is expanded/trained — original behavior.
+        # In the non-collecting (inference/sanity) path policy_legal_mask is
+        # already target_legal_mask, so that path is byte-identical to before.
+        # EV (below) sums over policy_legal_mask, so it now matches the expansion
+        # and regret target mask exactly.
         action_values = {}
-        expansion_legal_mask = target_legal_mask if collecting else policy_legal_mask
+        expansion_legal_mask = policy_legal_mask
         for a in expansion_legal_mask:
             before_commit = state.committed_per_seat[hero_seat]
             next_state = state.apply_action(hero_seat, a)

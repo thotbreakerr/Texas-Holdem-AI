@@ -44,7 +44,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -64,6 +64,7 @@ class Gate:
     script: str | None = None  # sanity_*.py filename (kind == "script")
     slow: bool = False         # skipped unless --full
     timeout: int = 600         # seconds
+    args: list[str] = field(default_factory=list)  # extra argv for the script
 
 
 TIER_TITLES = {
@@ -107,9 +108,17 @@ LADDER: list[Gate] = [
 
     # Tier 3 — feature / schema consistency.
     #   Deep CFR train-vs-inference feature semantics + opponent
-    #   committed / can-act / all-in input slots (FIX_REPORT #3/#4).
+    #   committed / can-act / all-in input slots (FIX_REPORT #3/#4); the
+    #   decision tracer (Key Change #1); and the Key Change #2 regret-mask
+    #   plumbing (fast mask checks only — the micro-training smoke is the
+    #   slow Tier 5 gate sanity_deep_cfr_allin_micro).
     Gate("sanity_deep_cfr_fixes", 3, "deep-cfr",
          script="sanity_deep_cfr_fixes.py", timeout=600),
+    Gate("sanity_deep_cfr_trace", 3, "deep-cfr",
+         script="sanity_deep_cfr_trace.py", timeout=120),
+    Gate("sanity_deep_cfr_allin_masks", 3, "deep-cfr",
+         script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "fast"],
+         timeout=300),
 
     # Tier 4 — chip / value accounting (always)
     Gate("sanity_aivat", 4, "all",
@@ -120,6 +129,9 @@ LADDER: list[Gate] = [
          script="sanity_preflop_strength.py", timeout=300),
 
     # Tier 5 — smoke training gates (SLOW; --full only)
+    Gate("sanity_deep_cfr_allin_micro", 5, "deep-cfr", slow=True,
+         script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "micro"],
+         timeout=900),
     Gate("sanity_deep_cfr", 5, "deep-cfr", slow=True,
          script="sanity_deep_cfr.py", timeout=1800),
     Gate("sanity_train_deep_cfr", 5, "deep-cfr", slow=True,
@@ -214,7 +226,7 @@ def build_command(gate: Gate) -> tuple[list[str] | None, str | None]:
     script_path = os.path.join(REPO_ROOT, gate.script)
     if not os.path.exists(script_path):
         return None, gate.script
-    return [sys.executable, script_path], None
+    return [sys.executable, script_path, *gate.args], None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

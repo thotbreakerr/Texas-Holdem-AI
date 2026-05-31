@@ -9,12 +9,13 @@ from __future__ import annotations
 import argparse
 import io
 import random
+import sys
 from collections import Counter
 from contextlib import redirect_stdout
 
 from core.bot_api import PlayerView
 from core.engine import _FULL_DECK
-from bots.deep_cfr_bot import DeepCFRBot
+from bots.deep_cfr_bot import DeepCFRBot, ABSTRACT_ACTIONS
 
 
 POSITIONS = ["UTG", "MP", "CO", "BTN", "SB", "BB"]
@@ -131,6 +132,60 @@ def _pct(num, den):
     return num / den * 100 if den else 0.0
 
 
+# ── Decision tracing (diagnostic, --trace N) ────────────────────────────────
+
+def _fmt_cards(cards):
+    out = []
+    for c in cards:
+        try:
+            r, s = c
+            out.append(f"{r}{s}")
+        except (TypeError, ValueError):
+            out.append(str(c))
+    return "".join(out)
+
+
+def _fmt_probs(d):
+    if not d:
+        return "(none)"
+    return "  ".join(f"{ABSTRACT_ACTIONS[i]}={d[i]:.3f}" for i in sorted(d))
+
+
+def _fmt_logits(d):
+    if not d:
+        return "(none)"
+    return "  ".join(f"{ABSTRACT_ACTIONS[i]}={d[i]:+.2f}" for i in sorted(d))
+
+
+def _print_trace(section, n, view, trace):
+    """Compact per-decision trace. Only legal abstract actions are dumped."""
+    print(f"  [{section} #{n}] hole={_fmt_cards(view.hole_cards)} "
+          f"pos={view.position} street={view.street} pot={view.pot} "
+          f"to_call={view.to_call} bb={trace.big_blind}")
+    masked = "   (all_in hidden by inference mask)" if trace.all_in_masked else ""
+    print(f"    legal abstract : {trace.legal_abstract_labels}{masked}")
+    print(f"    regret logits  : {_fmt_logits(trace.regret_logits)}")
+    print(f"    P(pre-search)  : {_fmt_probs(trace.probs_before_search)}")
+    if trace.probs_after_search is not None:
+        print(f"    P(post-search) : {_fmt_probs(trace.probs_after_search)}")
+    prev = trace.probs_after_search or trace.probs_before_search
+    if trace.probs_after_cap != prev:
+        print(f"    P(post cap)    : {_fmt_probs(trace.probs_after_cap)}")
+    print(f"    sizing head    : {trace.sizing_value:.3f}")
+    print(f"    SELECTED       : [{trace.selected_abstract_index}] "
+          f"{trace.selected_abstract_label}")
+    amt = trace.final_action_amount
+    amt_str = f" {amt}" if amt is not None else ""
+    print(f"    final action   : {trace.final_action_type}{amt_str}")
+    if trace.final_is_all_in:
+        if trace.selected_is_all_in:
+            print("    >> EFFECTIVE ALL-IN: came from the abstract 'all_in' row")
+        else:
+            print(f"    >> EFFECTIVE ALL-IN: bucket '{trace.selected_abstract_label}'"
+                  f" converted to a max-stack raise (NOT the 'all_in' row)")
+    print()
+
+
 def _print_stats(title, stats, *, healthy=None):
     n = stats["total"]
     avg_size = sum(stats["sizes"]) / len(stats["sizes"]) if stats["sizes"] else 0.0
@@ -164,12 +219,72 @@ def _preflop_health(stats):
     ]
 
 
+# ── Failure-mode gate (--fail-on-unhealthy) ─────────────────────────────────
+#
+# Hard thresholds that flag the all-in-collapse signature.  A metric "trips"
+# when it is >= its threshold.  These are coarse health bounds, not a strength
+# eval — a checkpoint can clear them and still play poorly.  Tuned to fail the
+# known-collapsed checkpoint (preflop all-in ~28%, PFR ~53%, avg raise ~37x,
+# strong all-in ~54%) while passing a non-collapsed preflop strategy.
+UNHEALTHY_THRESHOLDS = {
+    "preflop_all_in": 8.0,    # % of preflop random spots that shove
+    "preflop_pfr": 40.0,      # % preflop raise frequency
+    "preflop_avg_raise": 10.0,  # avg preflop bet/raise in pots
+    "strong_all_in": 25.0,    # % of AA/KK/AKs spots that shove
+}
+
+
+def _avg_size(stats):
+    return sum(stats["sizes"]) / len(stats["sizes"]) if stats["sizes"] else 0.0
+
+
+def _evaluate_health(pre, strong, thresholds=None):
+    """Return [(label, value, threshold, tripped)] for the failure-mode gate.
+
+    ``tripped`` is True when value >= threshold (the unhealthy direction).
+    """
+    t = thresholds or UNHEALTHY_THRESHOLDS
+    metrics = [
+        ("preflop all-in %", _pct(pre["all_in"], pre["total"]),
+         t["preflop_all_in"]),
+        ("preflop PFR %", _pct(pre["pfr"], pre["total"]),
+         t["preflop_pfr"]),
+        ("avg preflop raise (x pot)", _avg_size(pre),
+         t["preflop_avg_raise"]),
+        ("strong-hand all-in %", _pct(strong["all_in"], strong["total"]),
+         t["strong_all_in"]),
+    ]
+    return [(label, value, thr, value >= thr) for label, value, thr in metrics]
+
+
+def _print_health_gate(pre, strong):
+    """Print the failure-mode gate and return True if healthy (no metric tripped)."""
+    rows = _evaluate_health(pre, strong)
+    print("=" * 72)
+    print("HEALTH GATE (--fail-on-unhealthy)")
+    print("=" * 72)
+    tripped_any = False
+    for label, value, thr, tripped in rows:
+        mark = "FAIL" if tripped else "OK"
+        op = ">=" if tripped else "<"
+        print(f"  {mark}: {label:<28} {value:7.2f}  ({op} {thr:.1f})")
+        tripped_any = tripped_any or tripped
+    healthy = not tripped_any
+    print("-" * 72)
+    print(f"  RESULT: {'HEALTHY' if healthy else 'UNHEALTHY'}")
+    print()
+    return healthy
+
+
 def run_probe(args):
     random.seed(args.seed)
     bot = _load_bot(args.weights, args.disable_search)
 
+    trace_n = max(0, int(args.trace))
+
     pre = _new_stats()
-    for _ in range(args.samples):
+    pre_traces = []
+    for i in range(args.samples):
         hole = _random_hole()
         view = _view(
             hole,
@@ -178,7 +293,14 @@ def run_probe(args):
             to_call=10,
             stack=args.chips,
         )
-        action = bot.act(view)
+        # Swapping act()->act_with_trace() for the first N samples does not
+        # perturb the RNG stream (the trace path draws no extra randomness), so
+        # distribution stats are identical to a --trace 0 run.
+        if i < trace_n:
+            action, trace = bot.act_with_trace(view)
+            pre_traces.append((view, trace))
+        else:
+            action = bot.act(view)
         _record(pre, action, view)
 
     post = _new_stats()
@@ -201,6 +323,7 @@ def run_probe(args):
         _record(post, action, view)
 
     strong = _new_stats()
+    strong_traces = []
     strong_hands = [
         [("A", "h"), ("A", "s")],
         [("K", "h"), ("K", "s")],
@@ -214,7 +337,11 @@ def run_probe(args):
             to_call=10,
             stack=args.chips,
         )
-        action = bot.act(view)
+        if i < trace_n:
+            action, trace = bot.act_with_trace(view)
+            strong_traces.append((view, trace))
+        else:
+            action = bot.act(view)
         _record(strong, action, view)
 
     trash = _new_stats()
@@ -260,6 +387,32 @@ def run_probe(args):
           ": target is >70% folding trash early")
     print()
 
+    if trace_n and (pre_traces or strong_traces):
+        print("=" * 72)
+        print(f"E. Decision traces (first {trace_n} of each group)")
+        print("=" * 72)
+        print("Legend: an EFFECTIVE ALL-IN line distinguishes whether the")
+        print("max-stack raise came from the abstract 'all_in' row or from a")
+        print("normal bucket (e.g. bet_100) that converted to a max raise.")
+        print()
+        if pre_traces:
+            print("Preflop random spots")
+            print("-" * 40)
+            for n, (view, trace) in enumerate(pre_traces, 1):
+                _print_trace("preflop", n, view, trace)
+        if strong_traces:
+            print("Strong-hand sanity (AA/KK/AKs)")
+            print("-" * 40)
+            for n, (view, trace) in enumerate(strong_traces, 1):
+                _print_trace("strong", n, view, trace)
+
+    # Failure-mode gate is additive: only runs when --fail-on-unhealthy is
+    # passed, so default probe output and exit code (0) are unchanged.
+    if getattr(args, "fail_on_unhealthy", False):
+        healthy = _print_health_gate(pre, strong)
+        return 0 if healthy else 1
+    return 0
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -270,8 +423,19 @@ def parse_args():
     parser.add_argument("--chips", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--disable-search", action="store_true")
+    parser.add_argument(
+        "--trace", type=int, default=0, metavar="N",
+        help="Print detailed decision traces for the first N preflop random "
+             "samples and the first N strong-hand sanity samples.",
+    )
+    parser.add_argument(
+        "--fail-on-unhealthy", action="store_true",
+        help="Exit nonzero if preflop all-in >= 8%%, preflop PFR >= 40%%, avg "
+             "preflop raise >= 10x pot, or strong-hand all-in >= 25%%. Prints a "
+             "HEALTH GATE section; normal probe output is otherwise unchanged.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_probe(parse_args())
+    sys.exit(run_probe(parse_args()))

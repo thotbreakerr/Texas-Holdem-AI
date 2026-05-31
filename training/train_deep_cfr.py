@@ -50,6 +50,17 @@ CANARY_PASS_SEARCH_MAX = 0.15
 CANARY_PASS_RAW_MAX = 0.30
 CANARY_FAIL_SEARCH_MIN = 0.35
 CANARY_FAIL_RAW_MIN = 0.60
+# Additional health-metric canary bounds, layered ON TOP of the raw/search
+# all-in canary above (mirrors probe_deep_cfr.py --fail-on-unhealthy).  A metric
+# WARNs at its *_WARN level (side checkpoint only) and FAILs/aborts at its *_FAIL
+# level; the overall checkpoint status is the worst of the all-in canary and
+# these.  PFR / strong-all-in are fractions in [0,1]; avg-raise is in x-pot.
+CANARY_PFR_WARN = 0.40
+CANARY_PFR_FAIL = 0.55
+CANARY_AVG_RAISE_WARN = 10.0
+CANARY_AVG_RAISE_FAIL = 25.0
+CANARY_STRONG_ALL_IN_WARN = 0.25
+CANARY_STRONG_ALL_IN_FAIL = 0.45
 
 
 def epsilon_for_iteration(t: int, total: int) -> float:
@@ -312,6 +323,79 @@ def classify_canary(raw_all_in: float, search_all_in: float) -> str:
     return "WARN"
 
 
+_CANARY_STATUS_RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
+
+
+def _worst_canary_status(a: str, b: str) -> str:
+    """Return the more severe of two PASS/WARN/FAIL statuses."""
+    return a if _CANARY_STATUS_RANK.get(a, 0) >= _CANARY_STATUS_RANK.get(b, 0) else b
+
+
+def classify_extra_canary_metrics(metrics: dict) -> tuple[str, list[str], list[str]]:
+    """Classify the PFR / avg-raise / strong-all-in health metrics.
+
+    Returns ``(status, failed, warned)`` where ``status`` is PASS/WARN/FAIL and
+    ``failed`` / ``warned`` are human-readable label strings for the
+    ``[CANARY]`` / ``[WARN]`` log lines and the abort message.
+
+    Missing keys default to 0.0 (healthy), so a probe that returns only the
+    legacy two-key ``{raw_all_in, search_all_in}`` dict (e.g. the monkeypatched
+    probes in sanity_train_deep_cfr / sanity_train_deep_cfr_abort /
+    sanity_review_findings) classifies as PASS on these added metrics and the
+    all-in canary alone decides the outcome.
+    """
+    specs = [
+        ("preflop PFR", metrics.get("preflop_pfr", 0.0),
+         CANARY_PFR_WARN, CANARY_PFR_FAIL, "pct"),
+        ("avg preflop raise", metrics.get("preflop_avg_raise", 0.0),
+         CANARY_AVG_RAISE_WARN, CANARY_AVG_RAISE_FAIL, "x"),
+        ("strong-hand all-in", metrics.get("strong_all_in", 0.0),
+         CANARY_STRONG_ALL_IN_WARN, CANARY_STRONG_ALL_IN_FAIL, "pct"),
+    ]
+    failed: list[str] = []
+    warned: list[str] = []
+    for label, value, warn_t, fail_t, unit in specs:
+        if unit == "pct":
+            shown, warn_s, fail_s = (f"{value:.1%}", f"{warn_t:.0%}", f"{fail_t:.0%}")
+        else:
+            shown, warn_s, fail_s = (f"{value:.1f}x", f"{warn_t:.0f}x", f"{fail_t:.0f}x")
+        if value >= fail_t:
+            failed.append(f"{label}={shown} (>= {fail_s})")
+        elif value >= warn_t:
+            warned.append(f"{label}={shown} (>= {warn_s})")
+    if failed:
+        return "FAIL", failed, warned
+    if warned:
+        return "WARN", failed, warned
+    return "PASS", failed, warned
+
+
+def decide_canary_status(canary: dict, iteration: int,
+                         deploy_iteration: int) -> tuple:
+    """Combine the all-in canary and the extra health metrics into one status.
+
+    The raw/search all-in canary (``classify_canary``) is enforced at EVERY
+    iteration — unchanged.  The extra metrics (PFR / avg-raise / strong-all-in)
+    are only ENFORCED once the model is mature enough to make them meaningful:
+    ``iteration >= deploy_iteration`` (the same boundary the all-in row uses to
+    leave the inference mask).  Before that they are computed and reported but
+    do NOT change the status — an undertrained net's PFR saturates at ~85-100%
+    (verified empirically) and would otherwise force false aborts at the first
+    checkpoint.
+
+    Returns ``(status, base_status, extra_status, extra_failed, extra_warned,
+    extra_enforced)``.
+    """
+    base_status = classify_canary(
+        canary.get("raw_all_in", 0.0), canary.get("search_all_in", 0.0))
+    extra_status, extra_failed, extra_warned = classify_extra_canary_metrics(canary)
+    extra_enforced = iteration >= deploy_iteration
+    status = (_worst_canary_status(base_status, extra_status)
+              if extra_enforced else base_status)
+    return (status, base_status, extra_status, extra_failed, extra_warned,
+            extra_enforced)
+
+
 def save_promoted_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
                              optimizer: torch.optim.Optimizer, losses: dict,
                              status: str) -> str:
@@ -396,6 +480,44 @@ def _canary_is_all_in(action, view: PlayerView) -> bool:
     return action.amount is not None and action.amount >= view.max_raise
 
 
+_CANARY_POSITIONS = ["UTG", "MP", "CO", "BTN", "SB", "BB"]
+_CANARY_STRONG_POSITIONS = ["CO", "BTN"]
+# Premium hands for the strong-hand all-in canary (mirrors probe_deep_cfr.py).
+_CANARY_STRONG_HANDS = [
+    [("A", "h"), ("A", "s")],
+    [("K", "h"), ("K", "s")],
+    [("A", "h"), ("K", "h")],
+]
+
+
+def _canary_preflop_view(hole, position: str) -> PlayerView:
+    """Build the standard open-raise-or-fold preflop spot used by the canary."""
+    opponents = [f"opp{i}" for i in range(1, N_SEATS)]
+    stacks = {"hero": START_CHIPS}
+    for opp in opponents:
+        stacks[opp] = START_CHIPS
+    legal = [
+        {"type": "fold"},
+        {"type": "call"},
+        {"type": "raise", "min": BIG_BLIND * 2, "max": START_CHIPS},
+    ]
+    return PlayerView(
+        me="hero",
+        street="preflop",
+        position=position,
+        hole_cards=list(hole),
+        board=[],
+        pot=SMALL_BLIND + BIG_BLIND,
+        to_call=BIG_BLIND,
+        min_raise=BIG_BLIND * 2,
+        max_raise=START_CHIPS,
+        legal_actions=legal,
+        stacks=stacks,
+        opponents=opponents,
+        history=[],
+    )
+
+
 def _canary_views(n: int, seed: int) -> list[PlayerView]:
     rng = random.Random(seed)
     views = []
@@ -403,46 +525,42 @@ def _canary_views(n: int, seed: int) -> list[PlayerView]:
         deck = list(_FULL_DECK)
         rng.shuffle(deck)
         hole = [deck.pop(), deck.pop()]
-        opponents = [f"opp{i}" for i in range(1, N_SEATS)]
-        stacks = {"hero": START_CHIPS}
-        for opp in opponents:
-            stacks[opp] = START_CHIPS
-
-        legal = [
-            {"type": "fold"},
-            {"type": "call"},
-            {
-                "type": "raise",
-                "min": BIG_BLIND * 2,
-                "max": START_CHIPS,
-            },
-        ]
-        views.append(PlayerView(
-            me="hero",
-            street="preflop",
-            position=rng.choice(["UTG", "MP", "CO", "BTN", "SB", "BB"]),
-            hole_cards=hole,
-            board=[],
-            pot=SMALL_BLIND + BIG_BLIND,
-            to_call=BIG_BLIND,
-            min_raise=BIG_BLIND * 2,
-            max_raise=START_CHIPS,
-            legal_actions=legal,
-            stacks=stacks,
-            opponents=opponents,
-            history=[],
-        ))
+        # rng order preserved (shuffle then choice) so raw/search all-in
+        # frequencies are byte-for-byte identical to the pre-refactor canary.
+        views.append(_canary_preflop_view(hole, rng.choice(_CANARY_POSITIONS)))
     return views
 
 
-def _canary_frequency_for_depth(
+def _canary_strong_views(n: int, seed: int) -> list[PlayerView]:
+    """Deterministic AA/KK/AKs spots for the strong-hand all-in metric."""
+    rng = random.Random(seed)
+    views = []
+    for i in range(n):
+        hole = _CANARY_STRONG_HANDS[i % len(_CANARY_STRONG_HANDS)]
+        views.append(_canary_preflop_view(hole, rng.choice(_CANARY_STRONG_POSITIONS)))
+    return views
+
+
+def _canary_collect_stats(
     bot: DeepCFRBot,
     views: list[PlayerView],
     *,
     search_depth: int,
     seed: int,
     current_iteration: int,
-) -> float:
+) -> dict:
+    """Run the bot over ``views`` under deterministic inference settings.
+
+    Returns ``{"total", "all_in", "pfr", "sizes"}``.  All bot inference flags,
+    the opponent tracker, the module RNG AND the bot's per-instance RNG
+    (``bot._rng``, which drives action sampling) are saved and restored, so
+    calling this never perturbs the surrounding training loop.  Both RNGs are
+    also seeded from ``seed`` so the probe is fully reproducible for a given
+    network — without seeding bot._rng, the sampled actions would still depend
+    on the training loop's RNG state at checkpoint time.  ``pfr`` counts any
+    bet/raise/all-in (matching probe_deep_cfr); ``sizes`` collects bet/raise
+    amounts as a fraction of pot (matching probe_deep_cfr's avg-size).
+    """
     old_training = bot.network.training
     old_inference_mode = bot.inference_mode
     old_weights_loaded = bot._weights_loaded
@@ -452,11 +570,14 @@ def _canary_frequency_for_depth(
     old_opp_stats = bot._opp_stats
     old_history_len = bot._last_history_len
     old_history_snapshot = bot._last_history_snapshot
+    old_last_hand_id = bot._last_hand_id
     old_random_state = random.getstate()
+    old_bot_rng_state = bot._rng.getstate()
 
-    all_in_count = 0
+    stats = {"total": 0, "all_in": 0, "pfr": 0, "sizes": []}
     try:
         random.seed(seed)
+        bot._rng.seed(seed)
         bot.network.eval()
         bot.inference_mode = True
         bot._weights_loaded = True
@@ -469,10 +590,16 @@ def _canary_frequency_for_depth(
 
         for view in views:
             action = bot.act(view)
+            stats["total"] += 1
             if _canary_is_all_in(action, view):
-                all_in_count += 1
+                stats["all_in"] += 1
+            if action.type in ("bet", "raise", "all_in"):
+                stats["pfr"] += 1
+            if action.type in ("bet", "raise") and action.amount is not None:
+                stats["sizes"].append(action.amount / max(view.pot, 1))
     finally:
         random.setstate(old_random_state)
+        bot._rng.setstate(old_bot_rng_state)
         bot.inference_mode = old_inference_mode
         bot._weights_loaded = old_weights_loaded
         bot.search_depth = old_search_depth
@@ -481,35 +608,48 @@ def _canary_frequency_for_depth(
         bot._opp_stats = old_opp_stats
         bot._last_history_len = old_history_len
         bot._last_history_snapshot = old_history_snapshot
+        bot._last_hand_id = old_last_hand_id
         if old_training:
             bot.network.train()
         else:
             bot.network.eval()
 
-    return all_in_count / max(len(views), 1)
+    return stats
 
 
 def quick_canary_probe(bot: DeepCFRBot, device: torch.device,
                        n: int = 50, seed: int = 20260428,
                        current_iteration: int = 0) -> dict[str, float]:
-    """Return raw-policy and search-policy all-in frequencies."""
+    """Return the checkpoint health metrics for the collapse canary.
+
+    Keys: ``raw_all_in`` / ``search_all_in`` (the original all-in frequencies,
+    numerically unchanged — same views and seeds as before), plus ``preflop_pfr``
+    and ``preflop_avg_raise`` (raw policy over the random preflop spots) and
+    ``strong_all_in`` (raw policy over AA/KK/AKs spots).
+    """
     _ = device  # kept for call-site/API clarity; bot.act handles device moves.
     views = _canary_views(n, seed)
-    raw = _canary_frequency_for_depth(
-        bot,
-        views,
-        search_depth=0,
-        seed=seed + 1,
+    raw = _canary_collect_stats(
+        bot, views, search_depth=0, seed=seed + 1,
         current_iteration=current_iteration,
     )
-    search = _canary_frequency_for_depth(
-        bot,
-        views,
-        search_depth=bot.search_depth,
-        seed=seed + 2,
+    search = _canary_collect_stats(
+        bot, views, search_depth=bot.search_depth, seed=seed + 2,
         current_iteration=current_iteration,
     )
-    return {"raw_all_in": raw, "search_all_in": search}
+    strong = _canary_collect_stats(
+        bot, _canary_strong_views(n, seed), search_depth=0, seed=seed + 3,
+        current_iteration=current_iteration,
+    )
+    n_raw = max(raw["total"], 1)
+    avg_raise = sum(raw["sizes"]) / len(raw["sizes"]) if raw["sizes"] else 0.0
+    return {
+        "raw_all_in": raw["all_in"] / n_raw,
+        "search_all_in": search["all_in"] / max(search["total"], 1),
+        "preflop_pfr": raw["pfr"] / n_raw,
+        "preflop_avg_raise": avg_raise,
+        "strong_all_in": strong["all_in"] / max(strong["total"], 1),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -617,30 +757,60 @@ def run_training(args) -> dict:
         canary = quick_canary_probe(bot, device, current_iteration=iteration)
         raw_all_in = canary["raw_all_in"]
         search_all_in = canary["search_all_in"]
-        status = classify_canary(raw_all_in, search_all_in)
+        preflop_pfr = canary.get("preflop_pfr", 0.0)
+        preflop_avg_raise = canary.get("preflop_avg_raise", 0.0)
+        strong_all_in = canary.get("strong_all_in", 0.0)
+
+        # Overall status combines the original all-in canary with the added
+        # health metrics, but the extra metrics are only ENFORCED once the model
+        # is mature (iteration >= all_in_deploy_iteration); before that they are
+        # reported only.  decide_canary_status calls classify_canary by its
+        # module name so tests that monkeypatch it (sanity_review_findings) still
+        # force FAIL via the always-enforced all-in canary.
+        (status, base_status, extra_status, extra_failed, extra_warned,
+         extra_enforced) = decide_canary_status(
+            canary, iteration, bot.all_in_deploy_iteration)
+
         phase = all_in_phase_for_iteration(
             iteration,
             bot.all_in_warmup_iterations,
             bot.all_in_full_release_iteration,
         )
+        metrics_str = (
+            f"search={search_all_in:.1%}, raw={raw_all_in:.1%}, "
+            f"PFR={preflop_pfr:.1%}, avg_raise={preflop_avg_raise:.1f}x, "
+            f"strong_all_in={strong_all_in:.1%}"
+        )
+        defer_note = "" if extra_enforced else (
+            f" [PFR/avg-raise/strong-all-in reported only, enforced at iter "
+            f">= {bot.all_in_deploy_iteration}; would be {extra_status}]")
         if status == "FAIL":
+            reasons: list[str] = []
+            if base_status == "FAIL":
+                reasons.append(
+                    f"all-in (search={search_all_in:.1%} > "
+                    f"{CANARY_FAIL_SEARCH_MIN:.0%} or raw={raw_all_in:.1%} > "
+                    f"{CANARY_FAIL_RAW_MIN:.0%})")
+            if extra_enforced:
+                reasons.extend(extra_failed)
             raise RuntimeError(
-                f"All-in collapse at iter {iteration}: "
-                f"phase={phase} search={search_all_in:.1%}, "
-                f"raw={raw_all_in:.1%}"
+                f"All-in collapse at iter {iteration}: phase={phase} "
+                f"{metrics_str} -- FAILED: {'; '.join(reasons)}"
             )
         if status == "WARN":
+            reasons = []
+            if base_status == "WARN":
+                reasons.append("all-in freq")
+            if extra_enforced:
+                reasons.extend(extra_warned)
             print(
-                f"[WARN] iter {iteration}: all-in freq "
-                f"phase={phase} search={search_all_in:.1%}, "
-                f"raw={raw_all_in:.1%} -- side checkpoint only",
+                f"[WARN] iter {iteration}: phase={phase} {metrics_str}{defer_note} "
+                f"-- side checkpoint only ({'; '.join(reasons)})",
                 flush=True,
             )
         else:
             print(
-                f"[CANARY] iter {iteration}: all-in freq "
-                f"phase={phase} search={search_all_in:.1%}, "
-                f"raw={raw_all_in:.1%}",
+                f"[CANARY] iter {iteration}: phase={phase} {metrics_str}{defer_note}",
                 flush=True,
             )
         written = save_promoted_checkpoint(

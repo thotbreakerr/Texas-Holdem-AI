@@ -13,7 +13,7 @@ Sections:
   8. AIVAT leaf recoverable errors are logged
   9. Big blind inference from history
  10. All-in curriculum schedule
- 11. Shadow all-in targets
+ 11. Shadow all-in targets EXCLUDED (Key Change #2 — reversed contract)
  12. All-in detox isolation
  13. Checkpoint promotion
  14. Accelerated all-in curriculum smoke
@@ -47,6 +47,9 @@ from training.train_deep_cfr import (
     all_in_policy_probability_for_iteration,
     all_in_phase_for_iteration,
     classify_canary,
+    classify_extra_canary_metrics,
+    decide_canary_status,
+    _worst_canary_status,
     safe_checkpoint_path,
     save_promoted_checkpoint,
     warn_checkpoint_path,
@@ -713,8 +716,17 @@ print()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 print("=" * 60)
-print("Section 11: shadow all-in targets")
+print("Section 11: shadow all-in targets EXCLUDED (Key Change #2)")
 print("=" * 60)
+# CONTRACT REVERSAL (Key Change #2).  This section previously asserted that in
+# the shadow phase all-in was hidden from the policy mask but STILL written as a
+# regret target (target flag == 1.0).  Key Change #1's tracer proved that exact
+# behavior was the all-in collapse mechanism: shadow-training the `all_in`
+# regret row gave it positive regret (action_value[all_in] - EV, with EV taken
+# over a mask that excluded all_in), so the row was poisoned long before
+# self-play could correct it.  The new contract is the opposite — in the shadow
+# phase all-in must be excluded from BOTH the policy mask AND the regret target
+# mask whenever any non-all-in action is legal.
 
 try:
     with redirect_stdout(io.StringIO()):
@@ -764,12 +776,24 @@ try:
     all_in_idx = ABSTRACT_ACTIONS.index("all_in")
     root_policy_mask = seen_masks[0]
     target_mask = shadow_r.buffer[0][2]
+    # The regret target mask (legal_mask_vec) must agree with the policy mask:
+    # every action trained as a target must be the same set the policy expanded.
+    target_indices = {i for i in range(NUM_ACTIONS)
+                      if float(target_mask[i].item()) == 1.0}
     print(f"  root policy mask: {[ABSTRACT_ACTIONS[i] for i in root_policy_mask]}")
+    print(f"  regret target mask: {[ABSTRACT_ACTIONS[i] for i in sorted(target_indices)]}")
     print(f"  all-in target flag: {float(target_mask[all_in_idx].item()):.0f}")
-    if all_in_idx not in root_policy_mask and float(target_mask[all_in_idx].item()) == 1.0:
-        print("  [PASS] — all-in is trained as a target while hidden from policy")
+    all_in_excluded = (
+        all_in_idx not in root_policy_mask
+        and float(target_mask[all_in_idx].item()) == 0.0
+    )
+    masks_aligned = target_indices == set(root_policy_mask)
+    if all_in_excluded and masks_aligned:
+        print("  [PASS] — shadow all-in excluded from BOTH policy and regret "
+              "target masks; policy and target masks aligned")
     else:
-        print("  [FAIL] — shadow all-in contract broken")
+        print("  [FAIL] — shadow all-in contract broken "
+              f"(excluded={all_in_excluded}, aligned={masks_aligned})")
         PASS = False
 except Exception as e:
     print(f"  [FAIL] — exception: {type(e).__name__}: {e}")
@@ -873,6 +897,62 @@ try:
         print("  [PASS] — canary thresholds classify pass/warn/fail")
     else:
         print("  [FAIL] — canary threshold classification wrong")
+        PASS = False
+
+    # Live-canary health-metric classifier (PFR / avg-raise / strong-all-in).
+    # A constructed metric object must classify FAIL over the fail thresholds,
+    # WARN in the warn band, and PASS when healthy.  This is the regression that
+    # proves PFR — which is intentionally NOT hard-gated in the micro smoke
+    # (it saturates at ~85-100% there) — IS enforced in the live canary.
+    pfr_fail = classify_extra_canary_metrics({"preflop_pfr": 0.60})[0]
+    pfr_warn = classify_extra_canary_metrics({"preflop_pfr": 0.45})[0]
+    avg_fail = classify_extra_canary_metrics({"preflop_avg_raise": 30.0})[0]
+    avg_warn = classify_extra_canary_metrics({"preflop_avg_raise": 12.0})[0]
+    strong_fail = classify_extra_canary_metrics({"strong_all_in": 0.50})[0]
+    strong_warn = classify_extra_canary_metrics({"strong_all_in": 0.30})[0]
+    healthy = classify_extra_canary_metrics(
+        {"preflop_pfr": 0.20, "preflop_avg_raise": 3.0, "strong_all_in": 0.05})[0]
+    # And the combined gate: a clean all-in canary + PFR over the fail threshold
+    # must still drive the overall checkpoint status to FAIL.
+    combined_pfr_fail = _worst_canary_status(
+        classify_canary(0.0, 0.0),
+        classify_extra_canary_metrics({"preflop_pfr": 0.60})[0],
+    )
+    print(f"  PFR=60%->{pfr_fail}, PFR=45%->{pfr_warn}, "
+          f"avg=30x->{avg_fail}, avg=12x->{avg_warn}, "
+          f"strong=50%->{strong_fail}, strong=30%->{strong_warn}, "
+          f"healthy->{healthy}, combined(clean all-in + PFR=60%)->{combined_pfr_fail}")
+    if (pfr_fail == "FAIL" and pfr_warn == "WARN"
+            and avg_fail == "FAIL" and avg_warn == "WARN"
+            and strong_fail == "FAIL" and strong_warn == "WARN"
+            and healthy == "PASS" and combined_pfr_fail == "FAIL"):
+        print("  [PASS] — live-canary metrics classify PFR/avg-raise/strong-all-in "
+              "warn/fail; PFR over fail threshold forces overall FAIL")
+    else:
+        print("  [FAIL] — live-canary metric classification wrong")
+        PASS = False
+
+    # Deferred enforcement: the extra metrics (PFR/avg-raise/strong-all-in) must
+    # NOT change the status before iteration >= deploy_iteration, but MUST once
+    # the model is mature.  A clean all-in canary + a PFR-over-fail metric:
+    #   - early (iter < deploy)  -> PASS (reported only, no false abort)
+    #   - mature (iter >= deploy)-> FAIL
+    # The always-enforced all-in canary is unaffected by the deploy boundary.
+    DEPLOY = 100
+    clean_high_pfr = {"raw_all_in": 0.0, "search_all_in": 0.0, "preflop_pfr": 0.60}
+    collapsed_allin = {"raw_all_in": 0.99, "search_all_in": 0.99, "preflop_pfr": 0.0}
+    early = decide_canary_status(clean_high_pfr, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
+    mature = decide_canary_status(clean_high_pfr, iteration=DEPLOY, deploy_iteration=DEPLOY)
+    allin_early = decide_canary_status(collapsed_allin, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
+    print(f"  deferral: PFR=60% early(status,enforced)=({early[0]},{early[5]}), "
+          f"mature=({mature[0]},{mature[5]}); all-in collapse early={allin_early[0]}")
+    if (early[0] == "PASS" and early[5] is False
+            and mature[0] == "FAIL" and mature[5] is True
+            and allin_early[0] == "FAIL"):
+        print("  [PASS] — extra-metric enforcement deferred to iter >= deploy; "
+              "all-in canary still FAILs pre-deploy")
+    else:
+        print("  [FAIL] — deferred extra-metric enforcement wrong")
         PASS = False
 except Exception as e:
     print(f"  [FAIL] — exception: {type(e).__name__}: {e}")
