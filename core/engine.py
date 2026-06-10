@@ -330,9 +330,15 @@ class Table:
 
     def play_hand(self, seats: List[Seat | Dict[str, Any]], small_blind: int, big_blind: int,
                   dealer_index: int, bot_for: Dict[str, BotAdapter], on_event=None,
-                  log_decisions: bool = False) -> Dict[str, int]:
+                  log_decisions: bool = False,
+                  logger: Optional[DecisionLogger] = None) -> Dict[str, int]:
 
-        logger = DecisionLogger(enabled=log_decisions)
+        # An externally provided logger spans multiple hands (one session
+        # file per tournament — required for ML training memory features);
+        # otherwise fall back to a per-hand logger owned by this call.
+        owns_logger = logger is None
+        if owns_logger:
+            logger = DecisionLogger(enabled=log_decisions)
 
         hand_id = self.hand_counter
         logger.start_hand(hand_id)
@@ -440,7 +446,8 @@ class Table:
                 for pid, delta in net.items():
                     logger.log_result(pid, delta)
                 logger.flush()
-                logger.close()
+                if owns_logger:
+                    logger.close()
 
                 return net
 
@@ -475,7 +482,8 @@ class Table:
             logger.log_result(pid, delta)
 
         logger.flush()
-        logger.close()
+        if owns_logger:
+            logger.close()
 
         return net
 
@@ -751,6 +759,7 @@ class Table:
             if logger is not None:
                 logger.log_decision({
                     "player": pid,
+                    "position": view.position,
                     "street": street,
                     "hole": hole[pid],
                     "board": list(board),

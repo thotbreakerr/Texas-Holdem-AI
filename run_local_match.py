@@ -25,9 +25,15 @@ def _advance_dealer(dealer_index: int, active_count: int) -> int:
 
 
 def run_tournament_until_winner(seats, bots, base_sb, base_bb,
-                                blind_increase_every, max_hands):
+                                blind_increase_every, max_hands,
+                                decision_logger=None):
     """Run tournament until one player remains. Returns chip history, hand count,
-    elimination order [(player_id, position, hand_eliminated)]."""
+    elimination order [(player_id, position, hand_eliminated)].
+
+    decision_logger: optional session-scoped DecisionLogger shared by every
+    hand of this tournament (ML training data). The caller owns it and must
+    close it after the tournament ends.
+    """
     table = Table()
     chip_history = [{s.player_id: s.chips for s in seats}]
     dealer_index = 0
@@ -67,6 +73,7 @@ def run_tournament_until_winner(seats, bots, base_sb, base_bb,
             dealer_index=dealer_index,
             bot_for=active_bots,
             on_event=None,
+            logger=decision_logger,
         )
 
         next_dealer = advance_dealer_seat_index(seats, dealer_index)
@@ -201,6 +208,12 @@ def main():
     parser.add_argument("--rl_model", type=str, default=None,
                         help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
                              "Rewrites any 'rl' entry in --players to use this model.")
+    parser.add_argument("--log-session", action="store_true",
+                        help="Write one session-scoped ML decision log for the "
+                             "whole tournament (required format for "
+                             "train_ml_bot.py — one .jsonl file per tournament)")
+    parser.add_argument("--log-dir", type=str, default="logs",
+                        help="Directory for --log-session output (default: logs)")
     args = parser.parse_args()
 
     from bots import parse_players, create_bot, escalate_blinds
@@ -216,14 +229,30 @@ def main():
     seats = [Seat(player_id=pid, chips=args.chips) for pid, _, _ in player_specs]
     bots = {pid: create_bot(btype) for pid, btype, _ in player_specs}
 
-    chip_history, total_hands, eliminations = run_tournament_until_winner(
-        seats=seats,
-        bots=bots,
-        base_sb=args.sb,
-        base_bb=args.bb,
-        blind_increase_every=args.blind_increase,
-        max_hands=args.max_hands,
-    )
+    # One session-scoped decision log per tournament (ML training data).
+    # The header row marks the file as a full session so train_ml_bot.py
+    # can trust its cumulative opponent-memory replay.
+    decision_logger = None
+    if args.log_session:
+        from core.logger import DecisionLogger
+        decision_logger = DecisionLogger(
+            enabled=True, directory=args.log_dir, session_scoped=True
+        )
+        print(f"Logging ML decisions to: {decision_logger.path}")
+
+    try:
+        chip_history, total_hands, eliminations = run_tournament_until_winner(
+            seats=seats,
+            bots=bots,
+            base_sb=args.sb,
+            base_bb=args.bb,
+            blind_increase_every=args.blind_increase,
+            max_hands=args.max_hands,
+            decision_logger=decision_logger,
+        )
+    finally:
+        if decision_logger is not None:
+            decision_logger.close()
 
     print_summary_table(seats, bot_types, eliminations, total_hands)
     plot_tournament_progress(chip_history, player_ids, bot_types, args.output)

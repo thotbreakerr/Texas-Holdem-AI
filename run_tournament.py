@@ -309,6 +309,15 @@ class TournamentUI:
     # ── Tournament loop ───────────────────────────────────────────────────────
 
     def _run_tournament(self):
+        # Restart reuses the same bot adapters with a fresh Table, which
+        # restarts hand ids at 0 — clear any cross-hand bot state (e.g.
+        # MLBot's cumulative opponent memory) so reused instances neither
+        # dedup-away the new tournament's actions nor leak old stats.
+        for adapter in self.bots.values():
+            reset = getattr(adapter, "reset_memory", None)
+            if callable(reset):
+                reset()
+
         seats = [Seat(player_id=pid, chips=self.starting_chips)
                  for pid in self.player_ids]
         by_pid = {s.player_id: s for s in seats}
