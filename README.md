@@ -1,3 +1,4 @@
+
 # Texas Hold'em Bot
 
 A poker engine with pluggable AI bots. Ships with nine bot types ranging from simple heuristics to neural-network, reinforcement-learning, game-theoretic, and opponent-modeling strategies, plus a live tournament UI, batch statistics runner, and training pipelines for the ML, RL, and CFR bots.
@@ -82,7 +83,7 @@ The game engine (`core/engine.py`) handles the full hand lifecycle: blinds, bett
 
 `core/bot_api.py` defines the three interfaces all bots implement: `Action` (type + optional amount), `PlayerView` (read-only game state without opponent hole cards), and `BotAdapter` (requires `act(state) -> Action`).
 
-`core/logger.py` writes per-decision JSONL logs used for ML training. Each entry captures hand ID, player, hole cards, board, pot, action chosen, and legal actions.
+`core/logger.py` writes per-decision JSONL logs used for ML training. Each entry captures hand ID, player, position, hole cards, board, pot, action chosen, and legal actions. For training data, create one **session-scoped** logger per tournament (`DecisionLogger(session_scoped=True)` passed to `Table.play_hand(..., logger=...)`, or simply `run_local_match.py --log-session`) — this writes a `session_start` header row that marks the file as one full tournament, which `train_ml_bot.py` requires for cumulative opponent-memory features. Per-hand logs (the engine's internal fallback) carry no header and are rejected for training by default.
 
 ## Player Specs
 
@@ -116,9 +117,15 @@ A heuristic bot that classifies hands into tiers (premium pairs, broadway cards,
 
 ### ML Bot
 
-Supervised learning bot using a 3-layer feedforward network (PokerMLP: 26 input features, 128 hidden units, 6 output action classes). Trained on decision logs from other bots. Features include hand strength, pot odds, position, and opponent memory (aggression, tightness, VPIP tracked from the last 10 observed actions per opponent). Falls back to a hand-strength heuristic when the model is untrained or confidence is low.
+Supervised learning bot using a 3-layer feedforward network (PokerMLP: 26 input features, 128 hidden units, 6 output action classes). Trained on decision logs from other bots. Features include hand strength, pot odds, position, and opponent memory (cumulative per-opponent aggression, tightness, and VPIP across the tournament; checks do not count as VPIP). Training and inference share one feature builder (`core/ml_features.py`), so logged decisions and live `PlayerView`s produce identical vectors. Falls back to a hand-strength heuristic when the model is untrained or confidence is low.
+
+Checkpoints carry a `feature_schema_version` marker; MLBot **refuses** legacy raw state dicts and wrong-version checkpoints (they were trained with incompatible feature semantics) and falls back to the heuristic. When reusing one MLBot instance across tournaments, call `reset_memory()` at each tournament boundary.
 
 ```bash
+# 1. Generate session-scoped training logs (one .jsonl per tournament)
+python run_local_match.py --players "smart,smart,mc100,random" --log-session
+
+# 2. Train on them
 python training/train_ml_bot.py --log_dir logs --epochs 8
 python training/train_ml_bot.py --log_dir logs --filter_players P3
 python training/train_ml_bot.py --log_dir logs --filter_winners
@@ -202,10 +209,13 @@ python training/train_cfr_bot_multiway.py --profile models/cfr_deep_v2.pkl
 
 ### ML Training
 
-**train_ml_bot.py** -- Supervised learning on JSONL decision logs. Trains PokerMLP with Adam optimizer, ReduceLROnPlateau scheduler, 80/20 train/val split. Supports filtering by player (`--filter_players`) or winning hands only (`--filter_winners`). Requires decision logs in `logs/` (generate by running tournaments with logging enabled).
+**train_ml_bot.py** -- Supervised learning on JSONL decision logs. Trains PokerMLP with Adam optimizer, ReduceLROnPlateau scheduler, 80/20 train/val split. Supports filtering by player (`--filter_players`) or winning hands only (`--filter_winners`). Requires **session-scoped** decision logs in `logs/` — generate them with `run_local_match.py --log-session` (one tournament per invocation, one file per tournament). Files without a `session_start` header (legacy per-hand logs) are rejected unless `--allow-legacy-logs` is passed, because cumulative opponent-memory features cannot be reconstructed from them. Saved checkpoints embed `feature_schema_version` so stale models cannot be silently loaded by MLBot.
+
+> **Migration note (2026-06-10, Phase 2/2.1):** decision logs and ML checkpoints created before the shared feature builder (`core/ml_features.py`) are obsolete. Old logs lack position and session headers; old checkpoints (`models/ml_model*.pt` saved as raw state dicts) were trained with mismatched feature semantics and are refused at load time. Regenerate logs with `--log-session` and retrain.
 
 ```bash
-python training/train_ml_bot.py --log_dir logs --epochs 8
+python run_local_match.py --players "smart,smart,mc100,random" --log-session   # data
+python training/train_ml_bot.py --log_dir logs --epochs 8                      # train
 ```
 
 ## Adding a Bot

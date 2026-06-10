@@ -124,6 +124,12 @@ LADDER: list[Gate] = [
     # the default fast tier (not gated behind --full).
     Gate("sanity_deep_cfr_fold_collapse", 3, "deep-cfr",
          script="sanity_deep_cfr_fold_collapse.py", timeout=180),
+    # ML supervised path (Phase 2/2.1): train-vs-inference 26-feature parity
+    # via the shared builder, session-log safety (legacy per-hand logs
+    # rejected), cross-session memory dedup/reset, and ML checkpoint
+    # feature-schema versioning.
+    Gate("sanity_ml_feature_parity", 3, "all",
+         script="sanity_ml_feature_parity.py", timeout=300),
 
     # Tier 4 — chip / value accounting (always)
     Gate("sanity_aivat", 4, "all",
@@ -132,6 +138,11 @@ LADDER: list[Gate] = [
          script="sanity_icm_payouts.py", timeout=300),
     Gate("sanity_preflop_strength", 4, "all",
          script="sanity_preflop_strength.py", timeout=300),
+    # PPO trajectory & reward-credit correctness for the RL path (fast;
+    # legal-action masking, stored-vs-executed actions, per-hand/terminal
+    # reward credit, ratio==1 with unchanged weights, fail-closed masks).
+    Gate("sanity_rl_ppo", 4, "all",
+         script="sanity_rl_ppo.py", timeout=300),
 
     # Tier 5 — smoke training gates (SLOW; --full only)
     Gate("sanity_deep_cfr_allin_micro", 5, "deep-cfr", slow=True,

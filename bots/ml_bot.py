@@ -1,28 +1,23 @@
+import pickle
+
 import torch
 from core.bot_api import Action, acting_opponents_for
-from core.engine import eval_hand, EVAL_HAND_MAX, RANK_TO_INT
 from bots.poker_mlp import PokerMLP
 
-# eval_hand uses a small rank-sum heuristic with fewer than 5 cards (preflop),
-# whose maximum is pocket aces = 2*max_rank + 40.  Normalising those scores by
-# EVAL_HAND_MAX (the 5-card table max) collapses every preflop hand to ~0, so we
-# normalise the heuristic on its own scale instead.
-_PREFLOP_EVAL_MAX = 2 * max(RANK_TO_INT.values()) + 40
-
-
-
-# CARD ENCODING ------------------------------------------------------
-
-RANKS = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8,
-         "9":9, "T":10, "J":11, "Q":12, "K":13, "A":14}
-SUITS = {"c":0, "d":1, "h":2, "s":3}
-
-def encode_card(card):
-    rank, suit = card
-    return [RANKS[rank], SUITS[suit]]
-
-
-STREET_MAP = {"preflop":0, "flop":1, "turn":2, "river":3}
+# Feature logic is shared with training/train_ml_bot.py — see core/ml_features.py.
+# Names re-exported for backwards compatibility.
+from core.ml_features import (
+    FEATURE_DIM,
+    FEATURE_SCHEMA_VERSION,
+    RANKS,
+    SUITS,
+    STREET_MAP,
+    PREFLOP_EVAL_MAX as _PREFLOP_EVAL_MAX,
+    encode_card,
+    estimate_hand_strength,
+    build_features,
+    OpponentMemory,
+)
 
 def _as_view(state):
     """Convert a dict state to an attribute-accessible object if needed."""
@@ -46,113 +41,109 @@ class MLBot:
         self.temperature = temperature
         self.training_mode = training_mode
         self.starting_chips = max(1, starting_chips)  # normalise stack/pot features
-        self.model = PokerMLP(input_dim=26, hidden=128, num_classes=6)
+        self.model = PokerMLP(input_dim=FEATURE_DIM, hidden=128, num_classes=6)
         self.model_trained = False
 
-        # SHORT-TERM MEMORY: Track opponent behavior during this tournament
-        self.opponent_stats = {}  # opponent_id -> running stats dict
-        self.hand_history = []  # Recent hands in this tournament
+        # TOURNAMENT MEMORY: cumulative opponent stats across all hands this
+        # instance acts in (shared semantics with training — core/ml_features.py)
+        self.memory = OpponentMemory()
 
         try:
             checkpoint = torch.load(model_path, map_location=device)
-            # Check if model dimensions match
-            first_layer_weight = checkpoint.get('net.0.weight', None)
-            if first_layer_weight is not None:
-                expected_input_dim = first_layer_weight.shape[1]
-                if expected_input_dim == 20:
-                    print(f"Warning: Model file has old 20-feature format. Need to retrain with 26 features.")
-                    print("Using fallback strategy until model is retrained.")
-                    self.model_trained = False
-                elif expected_input_dim == 23:
-                    print(f"Warning: Model file has 23-feature format. Need to retrain with 26 features (includes memory).")
-                    print("Using fallback strategy until model is retrained.")
-                    self.model_trained = False
-                elif expected_input_dim == 26:
-                    # New model with 26 features - load it
-                    self.model.load_state_dict(checkpoint)
-                    self.model.eval()
+            state_dict = self._validate_checkpoint(checkpoint, model_path)
+            if state_dict is not None:
+                try:
+                    self.model.load_state_dict(state_dict)
                     self.model_trained = True
-                else:
-                    print(f"Warning: Model has unexpected input dimension {expected_input_dim}. Using fallback.")
-                    self.model_trained = False
-            else:
-                # Try loading anyway
-                self.model.load_state_dict(checkpoint)
-                self.model.eval()
-                self.model_trained = True
-        except (FileNotFoundError, OSError, RuntimeError) as e:
+                except (RuntimeError, ValueError, TypeError, KeyError,
+                        AttributeError) as e:
+                    print(f"Warning: REFUSING checkpoint {model_path}: "
+                          f"state_dict does not load into PokerMLP ({e}). "
+                          f"Retrain with training/train_ml_bot.py. "
+                          f"Using fallback.")
+                    # load_state_dict may partially copy params before
+                    # raising — rebuild so fallback weights are untouched
+                    # by the corrupt file.
+                    self.model = PokerMLP(input_dim=FEATURE_DIM, hidden=128,
+                                          num_classes=6)
+        except (FileNotFoundError, OSError, RuntimeError,
+                EOFError, pickle.UnpicklingError) as e:
+            # EOFError: empty/truncated file; UnpicklingError: random bytes
+            # or a non-checkpoint pickle — unreadable files fall back loudly
+            # instead of crashing the caller.
             print(f"Warning: Could not load model from {model_path}: {e}")
             print("Using untrained model (random weights).")
-            self.model.eval()
+        self.model.eval()
+
+    def _validate_checkpoint(self, checkpoint, model_path):
+        """Return the checkpoint's state dict if compatible, else None.
+
+        Valid checkpoints are {"state_dict": ..., "feature_schema_version": N}
+        with N == FEATURE_SCHEMA_VERSION (written by training/train_ml_bot.py).
+        Raw state dicts predate feature-schema versioning — they were trained
+        with the OLD feature semantics (collapsed preflop strength, MP-default
+        position, check-as-VPIP) and are REFUSED: their weights are
+        incompatible with what the current builder feeds the network.
+        Also refused (never crash): version-marked checkpoints whose
+        state_dict is missing, not a dict, or does not look like PokerMLP
+        weights (no 2-D 'net.0.weight' tensor).
+        """
+        if isinstance(checkpoint, dict) and "feature_schema_version" in checkpoint:
+            version = checkpoint["feature_schema_version"]
+            if version != FEATURE_SCHEMA_VERSION:
+                print(f"Warning: REFUSING checkpoint {model_path}: feature schema "
+                      f"v{version} != current v{FEATURE_SCHEMA_VERSION}. "
+                      f"Retrain with training/train_ml_bot.py. Using fallback.")
+                return None
+            state_dict = checkpoint.get("state_dict")
+            if not isinstance(state_dict, dict) or not state_dict:
+                print(f"Warning: REFUSING malformed checkpoint {model_path}: "
+                      f"schema marker present but 'state_dict' is missing or "
+                      f"not a dict (corrupt or incorrectly saved file). "
+                      f"Retrain with training/train_ml_bot.py. Using fallback.")
+                return None
+        else:
+            # Legacy raw state-dict checkpoint — no schema marker.
+            print(f"Warning: REFUSING legacy checkpoint {model_path}: no "
+                  f"feature_schema_version marker, so it was trained with the "
+                  f"old (pre-parity) feature semantics. Retrain with "
+                  f"training/train_ml_bot.py. Using fallback.")
+            return None
+
+        first_layer_weight = state_dict.get('net.0.weight', None)
+        if (not isinstance(first_layer_weight, torch.Tensor)
+                or first_layer_weight.dim() != 2):
+            print(f"Warning: REFUSING malformed checkpoint {model_path}: "
+                  f"'net.0.weight' is missing or not a 2-D tensor — the "
+                  f"state_dict does not match PokerMLP. Using fallback.")
+            return None
+        input_dim = first_layer_weight.shape[1]
+        if input_dim != FEATURE_DIM:
+            print(f"Warning: Model has input dimension {input_dim}, expected "
+                  f"{FEATURE_DIM}. Using fallback.")
+            return None
+        return state_dict
 
     def _make_features(self, state):
         """
-        Produce feature vector with hand strength, pot odds, and position.
-        Now 26 dimensions: 20 original + 3 new features + 3 memory features
+        Produce the canonical 26-feature vector via the shared builder
+        (core/ml_features.py) so training and inference stay in lockstep.
         """
         state = _as_view(state)
 
-        street = STREET_MAP.get(state.street, 0)
-        # Normalise monetary values so features share the same [0, ~2] scale.
-        scale = self.starting_chips
-        pot = float(state.pot) / scale
-        to_call = float(state.to_call) / scale
-        hero_stack_raw = float(state.stacks.get(state.me, 0))
-        hero_stack = hero_stack_raw / scale
-        acting_opponents = acting_opponents_for(state)
-        opp_stacks = [
-            float(state.stacks.get(pid, hero_stack_raw))
-            for pid in acting_opponents
-            if float(state.stacks.get(pid, 0)) > 0
-        ]
-        eff_stack = min([hero_stack_raw] + opp_stacks) / scale
-        n_players = len(acting_opponents) + 1
-
-        # Hole cards encoding (pad to 4 numbers)
-        hole = state.hole_cards or []
-        hole_enc = []
-        for i in range(2):
-            if i < len(hole):
-                hole_enc.extend(encode_card(hole[i]))
-            else:
-                hole_enc.extend([0, 0])  # Padding
-
-        # Board encoding (pad to 10 numbers for 5 cards)
-        board = state.board or []
-        board_enc = []
-        for i in range(5):
-            if i < len(board):
-                board_enc.extend(encode_card(board[i]))
-            else:
-                board_enc.extend([0, 0])  # Padding
-
-        # Hand strength estimate
-        hand_strength = self._estimate_hand_strength(hole, board)
-
-        # Pot odds
-        if pot + to_call > 0:
-            pot_odds = to_call / (pot + to_call)
-        else:
-            pot_odds = 0.0
-
-        # Position encoding (0.0 = early/tight, 1.0 = late/loose)
-        position_order = {
-            "UTG": 0.0, "UTG+1": 0.1, "MP": 0.3, "LJ": 0.4,
-            "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.3
-        }
-        position_value = position_order.get(state.position, 0.5)
-
-        # Calculate memory features from running opponent stats
-        opponents = acting_opponents_for(state)
-        memory_features = self._calculate_memory_features(opponents)
-
-        # FULL 26-feature vector
-        features = (
-            [street, pot, to_call, hero_stack, eff_stack, n_players]
-            + hole_enc
-            + board_enc
-            + [hand_strength, pot_odds, position_value]  # 3 advanced features
-            + memory_features  # 3 memory features
+        features = build_features(
+            street=state.street,
+            pot=state.pot,
+            to_call=state.to_call,
+            stacks=state.stacks,
+            me=state.me,
+            hole=state.hole_cards,
+            board=state.board,
+            position=getattr(state, "position", None),
+            opponents=getattr(state, "opponents", None),
+            acting_opponents=getattr(state, "acting_opponents", None),
+            memory_features=self.memory.features_for(acting_opponents_for(state)),
+            starting_chips=self.starting_chips,
         )
 
         x = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
@@ -160,13 +151,7 @@ class MLBot:
 
     def _estimate_hand_strength(self, hole, board):
         """Hand strength estimate using eval_hand, normalised to [0.0, 1.0]."""
-        if not hole or len(hole) < 2:
-            return 0.0
-        score = eval_hand(hole, board)
-        if len(hole) + len(board) >= 5:
-            return score / EVAL_HAND_MAX
-        # Preflop / incomplete board: normalise the rank-sum heuristic.
-        return min(1.0, score / _PREFLOP_EVAL_MAX)
+        return estimate_hand_strength(hole, board)
 
     # ----------------------------------------------------------
     # ACT ------------------------------------------------------
@@ -175,9 +160,8 @@ class MLBot:
         state = _as_view(state)
         legal = state.legal_actions
 
-        # Update running opponent stats from history
-        if hasattr(state, 'history') and state.history:
-            self._update_opponent_stats(state.history, acting_opponents_for(state))
+        # Update cumulative opponent memory from this hand's history so far
+        self._update_memory(state)
 
         # If model not trained and fallback enabled, use fallback
         if not self.model_trained and self.use_fallback:
@@ -294,78 +278,23 @@ class MLBot:
                 return Action("bet", amt)
         return self._choose("check", legal)
 
-    def _calculate_memory_features(self, opponents):
+    def reset_memory(self):
+        """Start a fresh tournament: clear cumulative opponent memory.
+
+        MUST be called between tournaments when one MLBot instance is reused
+        across Tables — a new Table restarts hand ids at 0, so stale dedup
+        keys would otherwise silently swallow the new tournament's actions
+        (and opponent stats from the old tournament would leak in).
         """
-        Calculate opponent behavior features from running stats.
-        Returns [avg_aggression, avg_tightness, avg_vpip].
-        Uses all accumulated stats across hands, not just last N actions.
+        self.memory.reset()
+
+    def _update_memory(self, state):
         """
-        if not opponents or not self.opponent_stats:
-            return [0.5, 0.5, 0.5]  # Neutral values
-
-        total_aggression = 0.0
-        total_tightness = 0.0
-        total_vpip = 0.0
-        counted = 0
-
-        for opp_id in opponents:
-            if opp_id in self.opponent_stats:
-                stats = self.opponent_stats[opp_id]
-                total = stats['action_count']
-                if total > 0:
-                    total_aggression += stats['aggressive_count'] / total
-                    total_tightness += stats['fold_count'] / total
-                    total_vpip += stats['vpip_count'] / total
-                    counted += 1
-
-        if counted == 0:
-            return [0.5, 0.5, 0.5]
-
-        return [
-            total_aggression / counted,
-            total_tightness / counted,
-            total_vpip / counted,
-        ]
-
-    def _update_opponent_stats(self, history, opponents):
+        Feed the current hand's history into cumulative opponent memory.
+        Stats accumulate across hands (deduplicated per hand_id + index);
+        VPIP/aggression/tightness definitions live in core/ml_features.py.
         """
-        Update running opponent stats from current hand's history.
-        Tracks cumulative stats across all hands with deduplication.
-        Engine history entries use top-level keys:
-          {"pid": player_id, "type": action_type, "street": ..., ...}
-        """
-        if not history or not opponents:
-            return
-
-        for entry in history:
-            if not isinstance(entry, dict):
-                continue
-            player = entry.get("pid")
-            action_type = entry.get("type", "fold")
-            if player not in opponents:
-                continue
-
-            if player not in self.opponent_stats:
-                self.opponent_stats[player] = {
-                    'action_count': 0,
-                    'aggressive_count': 0,
-                    'fold_count': 0,
-                    'vpip_count': 0,
-                    '_seen_entries': set(),
-                }
-
-            # Deduplicate: avoid re-counting entries we've already processed
-            entry_key = (player, action_type, entry.get("street", ""), entry.get("seq", id(entry)))
-            stats = self.opponent_stats[player]
-            if entry_key in stats['_seen_entries']:
-                continue
-            stats['_seen_entries'].add(entry_key)
-
-            stats['action_count'] += 1
-
-            if action_type in ("bet", "raise"):
-                stats['aggressive_count'] += 1
-            if action_type == "fold":
-                stats['fold_count'] += 1
-            if action_type in ("call", "bet", "raise", "check"):
-                stats['vpip_count'] += 1
+        self.memory.observe_history(
+            getattr(state, "history", None),
+            hand_id=getattr(state, "hand_id", None),
+        )

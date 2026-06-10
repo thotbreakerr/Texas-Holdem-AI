@@ -5,7 +5,6 @@ Learns optimal strategies through trial and error.
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import random
 from collections import deque
 from core.bot_api import Action, PlayerView, acting_opponents_for
 from core.engine import eval_hand, EVAL_HAND_MAX, RANK_TO_INT
@@ -27,37 +26,49 @@ def encode_card(card):
 
 STREET_MAP = {"preflop":0, "flop":1, "turn":2, "river":3}
 
+# Logit fill value for illegal actions.  exp(-1e9) underflows to exactly 0.0
+# in float32, so masked actions get probability 0 and can never be sampled.
+_MASK_FILL = -1e9
+
+# Action-head layout: 0=fold, 1=check, 2=call, 3/4/5=raise small/medium/large.
+_TYPE_TO_IDX = {"fold": 0, "check": 1, "call": 2}
+
+# NOTE: no dropout in either network.  Dropout makes every forward pass
+# stochastic, so the log-probs recorded at rollout time and the log-probs
+# recomputed during the PPO update disagree even with unchanged weights —
+# the importance ratio is then ≠ 1 before any optimisation step, which
+# corrupts the clipped surrogate objective.  Removing the layers also shifts
+# the nn.Sequential state-dict keys, so checkpoints saved by the old
+# (dropout) architecture no longer load; callers already handle that by
+# starting fresh, and those checkpoints were trained on corrupted PPO data.
+
 class PolicyNetwork(nn.Module):
-    """Policy network that outputs action probabilities."""
-    def __init__(self, input_dim=26, hidden=256):  # Increased from 256 to 512
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden, hidden // 2),
-            nn.ReLU(),
-            nn.Linear(hidden // 2, 6)  # 6 actions: fold, check, call, raise_small, raise_medium, raise_large
-        )
-    
-    def forward(self, x):
-        return self.net(x)
-
-
-class ValueNetwork(nn.Module):
-    """Value network that estimates V(s) for PPO baseline."""
+    """Policy network that outputs action logits (deterministic forward)."""
     def __init__(self, input_dim=26, hidden=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.ReLU(),
-            nn.Dropout(0.1),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 6)  # 6 actions: fold, check, call, raise_small, raise_medium, raise_large
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ValueNetwork(nn.Module):
+    """Value network that estimates V(s) for PPO baseline (deterministic forward)."""
+    def __init__(self, input_dim=26, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
             nn.Linear(hidden // 2, 1),  # single scalar value output
@@ -78,6 +89,10 @@ class RLBot:
                  use_fallback=True, starting_chips=500):
         self.device = device
         self.training_mode = training_mode
+        # NOTE: epsilon-greedy exploration was removed — uniform-random actions
+        # recorded with on-policy log-probs corrupt the PPO importance ratio.
+        # Exploration comes from sampling the policy + the entropy bonus.
+        # The arg is kept so existing callers don't break.
         self.exploration_rate = exploration_rate
         self.use_fallback = use_fallback
         self.starting_chips = max(1, starting_chips)  # used to normalise stack/pot features
@@ -307,7 +322,70 @@ class RLBot:
                 amt = max(a["min"], min(a["max"], pot * 0.5))
                 return Action("bet", round(amt, 2))
         return self._choose("check", legal)
-    
+
+    def _legal_action_mask(self, legal):
+        """
+        Boolean mask of shape (1, 6) over the action head:
+        True where the index maps to a currently legal engine action.
+        Raise buckets (3-5) are legal whenever a "bet" or "raise" is legal.
+
+        Fail-closed: an empty mask during training raises instead of
+        fabricating an all-legal mask — training must never continue on
+        invalid data.  In eval mode we stay permissive (all-True) so the
+        fallback machinery can keep the bot playable.
+        """
+        types = {a["type"] for a in legal}
+        aggressive = bool(types & {"bet", "raise"})
+        mask = [
+            "fold" in types,
+            "check" in types,
+            "call" in types,
+            aggressive, aggressive, aggressive,
+        ]
+        if not any(mask):
+            if self.training_mode:
+                raise ValueError(
+                    f"empty legal-action mask during training "
+                    f"(legal_actions={legal!r}); refusing to assume all "
+                    f"actions are legal"
+                )
+            mask = [True] * 6
+        return torch.tensor(mask, dtype=torch.bool,
+                            device=self.device).unsqueeze(0)
+
+    def _masked_policy_dist(self, states, masks):
+        """
+        Masked policy distribution over the action head.
+
+        Single source of truth for action probabilities: both rollout
+        sampling (act) and PPO log-prob recomputation (_ppo_update) go
+        through here, so with unchanged weights the importance ratio for a
+        stored action is exactly 1 (the networks are deterministic — no
+        dropout/batch-norm).
+        """
+        logits = self.policy_net(states)
+        logits = logits.masked_fill(~masks, _MASK_FILL)
+        return torch.distributions.Categorical(logits=logits)
+
+    @staticmethod
+    def _executed_action_idx(action, sampled_idx):
+        """
+        Action-head index corresponding to the action actually executed.
+
+        Used as a consistency *detector*, not a repair: if this disagrees
+        with the sampled index, act() raises rather than re-anchoring the
+        stored probability.  Raise-bucket aliasing is intentional and
+        allowed: indices 3/4/5 all map to type "bet"/"raise" (differing
+        only in amount), so an aggressive executed action keeps the
+        sampled bucket index.
+        """
+        idx = _TYPE_TO_IDX.get(action.type)
+        if idx is not None:
+            return idx
+        # bet/raise: keep the sampled bucket; a non-aggressive sampled index
+        # that produced an aggressive action is a mismatch (detected above).
+        return sampled_idx if sampled_idx >= 3 else 3
+
     def act(self, state):
         """Choose action using policy network."""
         try:
@@ -329,52 +407,61 @@ class RLBot:
             if not self.model_loaded and self.use_fallback and not self.training_mode:
                 return self._fallback_strategy(state)
             
-            # Get features
+            # Get features and legal-action mask
             features = self._make_features(state)
-            
-            # Get action probabilities
-            if self.training_mode:
-                # Training mode: need gradients for the PPO update
-                logits = self.policy_net(features)
-                probs  = torch.softmax(logits, dim=1)
-                value  = self.value_net(features)   # shape: (1,)
-            else:
-                # Eval mode: no gradients needed
-                with torch.no_grad():
-                    logits = self.policy_net(features)
-                    probs  = torch.softmax(logits, dim=1)
+            mask = self._legal_action_mask(legal)
 
-            # Epsilon-greedy exploration during training
-            if self.training_mode and random.random() < self.exploration_rate:
-                # Explore: random action — still track log_prob for PPO ratio
-                random_action = random.randint(0, 5)
-                action_idx = torch.tensor([random_action], device=self.device)
-                dist = torch.distributions.Categorical(probs)
+            # Rollout probability computation never needs gradients — the
+            # PPO update recomputes log-probs from the stored states through
+            # the same _masked_policy_dist path.
+            with torch.no_grad():
+                dist = self._masked_policy_dist(features, mask)
+                if self.training_mode:
+                    value = self.value_net(features)   # shape: (1,)
+                    # Sample from the masked policy (exploration comes from
+                    # sampling + the entropy bonus; epsilon-greedy was removed
+                    # because it breaks the PPO importance ratio)
+                    action_idx = dist.sample()
+                else:
+                    # Eval mode: greedy over legal actions
+                    action_idx = dist.probs.argmax(dim=1)
                 log_prob = dist.log_prob(action_idx)
-            elif self.training_mode:
-                # Exploit: sample from policy
-                dist = torch.distributions.Categorical(probs)
-                action_idx = dist.sample()
-                log_prob = dist.log_prob(action_idx)
-            else:
-                # Eval mode: greedy
-                action_idx = probs.argmax(dim=1)
-                log_prob = torch.log(probs[0, action_idx] + 1e-8)
+
+            # Convert to the actual engine action BEFORE storing the step so
+            # the stored action always matches the executed one.
+            action = self._action_idx_to_action(action_idx.item(), legal)
 
             # Store trajectory step for PPO update
             if self.training_mode:
+                executed_idx = self._executed_action_idx(action, action_idx.item())
+                if executed_idx != action_idx.item():
+                    # Cannot happen under the mask.  Fail loudly: silently
+                    # "repairing" the stored sample would record a probability
+                    # that doesn't account for every label that falls back to
+                    # this executed action.
+                    raise RuntimeError(
+                        f"sampled action index {action_idx.item()} converted "
+                        f"to '{action.type}' (index {executed_idx}); fallback "
+                        f"conversion would silently change the stored action "
+                        f"(legal={legal!r})"
+                    )
                 self.current_episode.append({
                     'state':    features,
                     'action':   action_idx.item(),
-                    'log_prob': log_prob.detach(),   # old π(a|s) — frozen
-                    'value':    value.detach(),       # V(s) old estimate — frozen
+                    'log_prob': log_prob,   # old π(a|s) — no-grad, frozen
+                    'value':    value,       # V(s) old estimate — no-grad, frozen
+                    'mask':     mask,        # legal-action mask, reused in updates
                     'legal_actions': legal,
                 })
-            
-            # Convert to actual action
-            return self._action_idx_to_action(action_idx.item(), legal)
-        
+
+            return action
+
         except Exception as e:
+            if self.training_mode:
+                # Never silently substitute a fallback action during training:
+                # the executed action would no longer match the stored
+                # trajectory (or be missing from it entirely).
+                raise
             # If anything goes wrong, use fallback
             if self.use_fallback:
                 try:
@@ -431,21 +518,49 @@ class RLBot:
     
     def record_reward(self, reward):
         """
-        Record reward for the most recent hand's steps only.
+        Record the reward for the hand that just finished.
 
-        Call this after each hand with the normalised chip delta
-        ``(final_chips - starting_chips) / starting_chips``.
-        Only the steps belonging to the hand just played are tagged;
-        earlier hands keep their own rewards.
+        Call this once per hand with the hand's chip delta normalised by a
+        stable baseline (big blinds or the initial stack — NOT the current
+        stack).  The reward is assigned to the hand's final decision only;
+        earlier decisions get 0 so the chip delta is counted exactly once.
+        GAE/discounting propagates the credit backwards through the hand.
+
+        No-decision hands (e.g. all-in from the blinds, so the bot never
+        acted this hand) produce no new transition; their chip delta is
+        added onto the most recent policy transition in the episode so the
+        episode return still reflects the true chip outcome.  If the bot has
+        made no decision in the entire episode there is nothing to credit
+        and the reward is dropped (see sanity_rl_ppo.py section 11).
         """
         if self.training_mode and self.current_episode:
             # Tag only the steps that belong to the hand that just finished
-            for step in self.current_episode[self._hand_step_start:]:
-                step['reward'] = reward
-            # Advance the marker so the next hand's reward won't overwrite these
-            self._hand_step_start = len(self.current_episode)
+            steps = self.current_episode[self._hand_step_start:]
+            if steps:
+                for step in steps[:-1]:
+                    step['reward'] = 0.0
+                steps[-1]['reward'] = reward
+                # Advance the marker so the next hand won't overwrite these
+                self._hand_step_start = len(self.current_episode)
+            else:
+                # No-decision hand: attach the chip delta to the most recent
+                # policy transition (reward arrives after the last action).
+                last = self.current_episode[-1]
+                last['reward'] = last.get('reward', 0.0) + reward
             self.episode_rewards.append(reward)
-    
+
+    def record_terminal_bonus(self, bonus):
+        """
+        Add a terminal win/loss bonus onto the episode's final transition.
+
+        Must be called after the last hand's ``record_reward`` and before
+        ``end_episode``.  Unlike ``record_reward`` (which only tags steps of
+        the not-yet-rewarded hand), this always reaches the last stored step.
+        """
+        if self.training_mode and self.current_episode:
+            last = self.current_episode[-1]
+            last['reward'] = last.get('reward', 0.0) + bonus
+
     def end_episode(self):
         """Buffer the completed episode; run PPO update every batch_size episodes."""
         if not self.training_mode or not self.current_episode:
@@ -465,7 +580,12 @@ class RLBot:
 
     def flush_buffer(self):
         """Force a PPO update on any remaining buffered episodes (call at end of training)."""
-        if self.training_mode and self.episode_buffer:
+        if not self.training_mode:
+            return
+        # Close out any in-progress episode first so the final episode of a
+        # training run is never silently dropped.
+        self.end_episode()
+        if self.episode_buffer:
             self._ppo_update(self.episode_buffer)
             self.episode_buffer = []
 
@@ -492,7 +612,7 @@ class RLBot:
 
         Args:
             episodes: list of episode buffers, each a list of step dicts
-                      with keys: state, action, log_prob, value, reward
+                      with keys: state, action, log_prob, value, mask, reward
         """
         GAMMA     = 0.99
         LAMBDA    = 0.95
@@ -506,6 +626,7 @@ class RLBot:
         all_old_log_probs = []
         all_returns      = []
         all_advantages   = []
+        all_masks        = []
 
         for ep in episodes:
             # Only keep steps that received a reward assignment
@@ -531,11 +652,22 @@ class RLBot:
                 next_value     = values[t]
 
             for step, adv, ret in zip(steps, advantages, returns):
+                # Fail closed: a step without its acting-time legal mask
+                # cannot be trained on — assuming "all actions legal" would
+                # silently shift the recomputed distribution.
+                step_mask = step.get('mask')
+                if step_mask is None:
+                    raise ValueError(
+                        "trajectory step is missing its legal-action mask; "
+                        "refusing to assume all actions were legal during "
+                        "the PPO update"
+                    )
                 all_states.append(step['state'])
                 all_actions.append(step['action'])
                 all_old_log_probs.append(step['log_prob'])
                 all_advantages.append(adv)
                 all_returns.append(ret)
+                all_masks.append(step_mask)
 
         if not all_states:
             return
@@ -543,9 +675,12 @@ class RLBot:
         # Stack into tensors
         states_t       = torch.cat(all_states, dim=0).to(self.device)
         actions_t      = torch.tensor(all_actions, dtype=torch.long).to(self.device)
-        old_log_probs_t = torch.stack(all_old_log_probs).to(self.device).squeeze()
+        # reshape(-1), not squeeze(): squeeze() on a single-step batch would
+        # produce a 0-d tensor and break indexing below.
+        old_log_probs_t = torch.stack(all_old_log_probs).to(self.device).reshape(-1)
         advantages_t   = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
         returns_t      = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
+        masks_t        = torch.cat(all_masks, dim=0).to(self.device)
 
         # Normalise advantages across the whole batch
         if advantages_t.numel() > 1 and advantages_t.std() > 1e-8:
@@ -557,8 +692,10 @@ class RLBot:
             indices = torch.randperm(n, device=self.device)
 
             # ── Policy loss ──────────────────────────────────────────
-            logits       = self.policy_net(states_t[indices])
-            dist         = torch.distributions.Categorical(logits=logits)
+            # Same masked-distribution path as rollout sampling, so the
+            # ratio is exactly 1 for unchanged weights (epoch 1, step 0).
+            dist         = self._masked_policy_dist(states_t[indices],
+                                                    masks_t[indices])
             new_log_probs = dist.log_prob(actions_t[indices])
             entropy      = dist.entropy().mean()
 

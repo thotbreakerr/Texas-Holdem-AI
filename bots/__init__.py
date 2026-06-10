@@ -103,6 +103,19 @@ class _PlayerViewAdapter(BotAdapter):
     def act(self, view: PlayerView) -> Action:
         return self.bot.act(view)
 
+    def reset_memory(self):
+        """Tournament boundary: forward to bots with cross-hand state.
+
+        MLBot (and any future bot with cumulative opponent memory) must be
+        reset when an instance is reused across Tables — a new Table
+        restarts hand ids at 0, so stale dedup keys would silently swallow
+        the new tournament's actions and old stats would leak in. No-op
+        for bots without a reset_memory method.
+        """
+        reset = getattr(self.bot, "reset_memory", None)
+        if callable(reset):
+            reset()
+
 
 def _wrap(bot) -> BotAdapter:
     """Wrap a bot object in a BotAdapter."""

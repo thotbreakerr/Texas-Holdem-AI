@@ -16,8 +16,8 @@ experiences every table position (BTN, SB, BB, UTG) equally.
 
 Reward signal
 ─────────────
-Per-hand normalised chip delta only:
-    reward = (chips_after_RL − chips_before_RL) / max(chips_before_RL, 1)
+Per-hand chip delta normalised by the constant starting stack:
+    reward = (chips_after_RL − chips_before_RL) / chips_per_player
 
 No asymmetric terminal win/loss bonus is applied.
 
@@ -242,7 +242,10 @@ def train_multi_deep_rl_bot(
                 log_decisions=False,
             )
 
-            # Per-hand reward: normalised chip delta for the RL bot only.
+            # Per-hand reward: chip delta for the RL bot only, normalised by
+            # the constant starting stack (a stable baseline — dividing by
+            # the current stack made identical chip swings worth wildly
+            # different rewards depending on stack depth).
             # Seat objects are mutated in-place by the engine, so reading
             # chips from the Seat after play_hand gives the post-hand count.
             if rl_pid in result and chips_before_rl > 0:
@@ -250,7 +253,7 @@ def train_multi_deep_rl_bot(
                     (s for s in seats if s.player_id == rl_pid), None
                 )
                 chips_after_rl = rl_seat_after.chips if rl_seat_after else 0
-                hand_reward    = (chips_after_rl - chips_before_rl) / chips_before_rl
+                hand_reward    = (chips_after_rl - chips_before_rl) / chips_per_player
                 rl_bot.record_reward(hand_reward)
                 episode_reward += hand_reward
 

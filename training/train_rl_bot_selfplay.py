@@ -117,6 +117,7 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
         model_path="",           # skip the internal auto-load
         training_mode=True,
         learning_rate=3e-4,
+        starting_chips=chips_per_player,
     )
     # Graceful checkpoint load: 256-unit weights won't match 512-unit networks.
     # On any error (missing file OR size mismatch) just start fresh.
@@ -247,11 +248,14 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
                 log_decisions=False,
             )
 
-            # Per-hand reward: normalised chip delta for proper credit assignment
+            # Per-hand reward: chip delta normalised by the constant initial
+            # stack.  Dividing by the current stack (the old behaviour) made
+            # identical chip swings worth wildly different rewards depending
+            # on stack depth, so the baseline must be stable across the run.
             chips_after = sum(s.chips for s in seats if s.player_id == "P2")
             if "P2" in result:
                 rl_bot.record_reward(
-                    (chips_after - chips_before) / max(chips_before, 1)
+                    (chips_after - chips_before) / chips_per_player
                 )
 
             dealer_index = (dealer_index + 1) % len(seats)
@@ -266,9 +270,11 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
         won            = winner == "P2"
         final_reward   = (final_chips_p2 - initial_chips_p2) / max(initial_chips_p2, 1)
 
-        # Terminal bonus: global win/loss signal on top of per-hand rewards
+        # Terminal bonus: global win/loss signal added onto the episode's
+        # final transition.  (record_reward would be a no-op here — every
+        # hand's steps are already tagged, so its slice would be empty.)
         final_bonus = 1.0 if won else -0.5
-        rl_bot.record_reward(final_bonus)
+        rl_bot.record_terminal_bonus(final_bonus)
 
         if won:
             wins += 1

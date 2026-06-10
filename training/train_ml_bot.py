@@ -13,17 +13,31 @@ from bots.poker_mlp import PokerMLP
 
 import torch.nn as nn
 
-RANKS = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8,
-         "9":9, "T":10, "J":11, "Q":12, "K":13, "A":14}
-SUITS = {"c":0, "d":1, "h":2, "s":3}
+# Feature logic is shared with bots/ml_bot.py inference — core/ml_features.py
+# is the single source of truth for the 26-feature vector. Names re-exported
+# for backwards compatibility.
+from core.ml_features import (
+    FEATURE_SCHEMA_VERSION,
+    RANKS,
+    SUITS,
+    STREET_MAP,
+    encode_card,
+    build_features,
+    OpponentMemory,
+)
+from core.logger import LOG_FORMAT_VERSION
 
-STREET_MAP = {"preflop":0, "flop":1, "turn":2, "river":3}
 
+def make_checkpoint(state_dict):
+    """Wrap a state dict with the feature-schema marker MLBot requires.
 
-def encode_card(card):
-    """Convert ['A','h'] -> [14, 2]"""
-    rank, suit = card
-    return [RANKS[rank], SUITS[suit]]
+    MLBot refuses raw state dicts (legacy, pre-parity feature semantics) and
+    checkpoints whose feature_schema_version differs from the current one.
+    """
+    return {
+        "state_dict": state_dict,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+    }
 
 
 
@@ -72,209 +86,286 @@ class PokerDataset(Dataset):
     }
 
     def __init__(self, log_folder, filter_players=None, filter_winners_only=False,
-                 starting_chips=500):
+                 starting_chips=500, allow_unmarked_sessions=False):
         """
         Args:
             log_folder: Directory containing log files
             filter_players: List of player IDs to include (e.g., ["P3"] for MonteCarloBot only)
             filter_winners_only: If True, only include decisions from hands that were won
             starting_chips: Used to normalise pot and stack features to [0, ~2] scale
+            allow_unmarked_sessions: Accept files WITHOUT a {"session_start": ...}
+                header (legacy per-hand logs). Off by default because memory
+                features are cumulative per session: a per-hand file silently
+                truncates opponent memory to a single hand, which does NOT
+                match what a live bot saw. Generate proper logs with
+                `run_local_match.py --log-session`.
+
+        Features come from core.ml_features.build_features — the exact same
+        builder MLBot uses at inference time. Memory features are produced by
+        replaying each log file through OpponentMemory exactly as a live bot
+        would have observed it (see _iter_file_samples).
+
+        Raises ValueError when unmarked files are present and not allowed,
+        and ALWAYS (not bypassable) when a file is corrupt: every non-empty
+        row must be valid JSON and a JSON object, and a session header must
+        be the first row, appear exactly once, and carry a nonempty
+        session_id with log_format_version == LOG_FORMAT_VERSION. Corrupt
+        rows are hard errors, never "legacy": a damaged line could be a
+        second session_start, and skipping it would merge two tournaments
+        into one cumulative-memory replay.
         """
         self.samples = []
         self.starting_chips = max(1, starting_chips)
-        # Load all decisions first to build memory context
-        all_decisions = []  # Will store all decisions in order
-        for path in glob.glob(f"{log_folder}/**/*.jsonl", recursive=True):
+        self.missing_position_rows = 0  # legacy logs without "position"
+        self.unmarked_session_files = []  # files without a session_start header
+        self.invalid_session_files = []   # [(path, reason)] — corrupt files
+
+        files = sorted(glob.glob(f"{log_folder}/**/*.jsonl", recursive=True))
+        parsed = []
+        for path in files:
+            decisions, hand_results, has_session_header, file_error = \
+                self._load_file(path)
+            if file_error is not None:
+                self.invalid_session_files.append((path, file_error))
+                continue
+            if not has_session_header:
+                self.unmarked_session_files.append(path)
+            parsed.append((decisions, hand_results))
+
+        if self.invalid_session_files:
+            details = "; ".join(f"{os.path.basename(p)}: {reason}"
+                                for p, reason in self.invalid_session_files[:5])
+            more = len(self.invalid_session_files) - 5
+            raise ValueError(
+                f"{len(self.invalid_session_files)} log file(s) are corrupt "
+                f"({details}{f'; +{more} more' if more > 0 else ''}). A "
+                f"trainable log must contain only valid JSON object rows, "
+                f"and a session header must be the first row, appear "
+                f"exactly once, and contain a nonempty session_id with "
+                f"log_format_version={LOG_FORMAT_VERSION}. Corrupt or "
+                f"concatenated files can merge multiple sessions into one "
+                f"cumulative-memory replay, so they are never trainable "
+                f"(not bypassable with allow_unmarked_sessions). Regenerate "
+                f"with `run_local_match.py --log-session`."
+            )
+
+        if self.unmarked_session_files and not allow_unmarked_sessions:
+            shown = ", ".join(os.path.basename(p)
+                              for p in self.unmarked_session_files[:5])
+            more = len(self.unmarked_session_files) - 5
+            raise ValueError(
+                f"{len(self.unmarked_session_files)} log file(s) lack a session "
+                f"header ({shown}{f', +{more} more' if more > 0 else ''}). "
+                f"These are legacy/per-hand logs: cumulative opponent-memory "
+                f"features cannot be reconstructed from them, so training on "
+                f"them would not match live inference. Regenerate with "
+                f"`run_local_match.py --log-session`, or pass "
+                f"allow_unmarked_sessions=True / --allow-legacy-logs to "
+                f"proceed anyway."
+            )
+        if self.unmarked_session_files:
+            print(f"[WARN] {len(self.unmarked_session_files)} log file(s) lack a "
+                  f"session header — treating each file as its own session. "
+                  f"Opponent-memory features from these files are NOT "
+                  f"trustworthy for cumulative-memory training.")
+
+        for decisions, hand_results in parsed:
+            self._iter_file_samples(
+                decisions, hand_results, filter_players, filter_winners_only
+            )
+
+        if self.missing_position_rows:
+            print(f"[WARN] {self.missing_position_rows} decision rows lack 'position' "
+                  f"(legacy logs) — defaulted to MP. Regenerate logs with the "
+                  f"current engine for true positions.")
+
+    @staticmethod
+    def _validate_session_header(row):
+        """Return None if a session_start row is well-formed, else a reason."""
+        info = row.get("session_start")
+        if not isinstance(info, dict):
+            return "malformed session_start row (payload is not an object)"
+        session_id = info.get("session_id")
+        if not isinstance(session_id, str) or not session_id.strip():
+            return "empty or missing session_id"
+        version = info.get("log_format_version")
+        if version != LOG_FORMAT_VERSION:
+            return (f"log_format_version {version!r} != required "
+                    f"{LOG_FORMAT_VERSION}")
+        return None
+
+    @staticmethod
+    def _load_file(path):
+        """Read one .jsonl file ->
+        (decision rows, hand winners, has_session_header, file_error).
+
+        Session-scoped logs (DecisionLogger(session_scoped=True)) start with a
+        {"session_start": {...}} row marking the file as one full tournament.
+        Strict rules — violations set file_error (a reason string) and the
+        caller rejects such files unconditionally:
+          * the header must be the FIRST non-empty row, appear exactly once,
+            and pass _validate_session_header;
+          * every non-empty row must be valid JSON AND a JSON object.
+        Malformed rows are NEVER skipped as noise: a corrupt line could be a
+        damaged second session_start, so skipping it would silently merge
+        two tournaments into one cumulative-memory replay. Unlike
+        header-less legacy files, corrupt files are not opt-in loadable.
+        """
+        decisions = []
+        hand_results = {}  # hand_id -> winner player_id (positive net)
+        has_session_header = False
+        file_error = None
+        row_idx = 0  # counts non-empty lines, including unparseable ones
+        try:
             with open(path) as f:
-                for line_num, line in enumerate(f):
+                for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
                         row = json.loads(line)
-                        if "chosen_action" in row:
-                            # Store with file path and line number for ordering
-                            row['_file'] = path
-                            row['_line'] = line_num
-                            all_decisions.append(row)
-                    except:
+                    except (json.JSONDecodeError, ValueError):
+                        file_error = file_error or \
+                            f"invalid JSON at row {row_idx}"
+                        row_idx += 1
                         continue
+                    if not isinstance(row, dict):
+                        file_error = file_error or \
+                            (f"row {row_idx} is not a JSON object "
+                             f"({type(row).__name__})")
+                        row_idx += 1
+                        continue
+                    if "session_start" in row:
+                        if has_session_header:
+                            file_error = file_error or \
+                                "multiple session_start rows"
+                        elif row_idx > 0:
+                            file_error = file_error or \
+                                "session_start is not the first row"
+                        else:
+                            file_error = file_error or \
+                                PokerDataset._validate_session_header(row)
+                        has_session_header = True
+                    elif "chosen_action" in row:
+                        decisions.append(row)
+                    elif "result" in row and "hand_id" in row:
+                        if row["result"].get("net", 0) > 0:
+                            hand_results[row["hand_id"]] = row["result"].get("player")
+                    row_idx += 1
+        except OSError as e:
+            print(f"[WARN] Could not read {path}: {e}")
+        return decisions, hand_results, has_session_header, file_error
 
-        # Load hand results to track winners
-        hand_results = {}  # hand_id -> winner player_id
+    def _iter_file_samples(self, decisions, hand_results,
+                           filter_players, filter_winners_only):
+        """Build samples for one session file, replaying opponent memory.
+
+        Parity with live inference: a live MLBot only observes view.history
+        at its own act() calls — i.e. each hand's action prefix up to its own
+        decisions, accumulated across hands. We replay that exactly with one
+        OpponentMemory per hero: when hero P acts in hand H, P's memory is
+        fed every action of H that happened before this decision (and nothing
+        after P's last action in H — P never saw those live).
+        """
+        memories = {}      # hero player_id -> OpponentMemory
+        hand_entries = {}  # hand_id -> [(player, action_type), ...] in order
+        fed = {}           # (hero, hand_id) -> count of entries already fed
+
+        for row in decisions:
+            me = row.get("player")
+            chosen = row.get("chosen_action") or {}
+            act_type = chosen.get("type")
+            hand_id = row.get("hand_id")
+
+            entries = hand_entries.setdefault(hand_id, [])
+
+            # ---- replay memory the hero would have at this decision ----
+            mem = memories.setdefault(me, OpponentMemory())
+            start = fed.get((me, hand_id), 0)
+            for actor, actor_action in entries[start:]:
+                mem.observe(actor, actor_action)
+            fed[(me, hand_id)] = len(entries)
+
+            sample = self._make_sample(row, mem, filter_players,
+                                       filter_winners_only, hand_results)
+            if sample is not None:
+                self.samples.append(sample)
+
+            # Record this decision AFTER feature building — at act() time the
+            # hero's own current action is not yet part of history.
+            if act_type is not None:
+                entries.append((me, act_type))
+
+    def _make_sample(self, row, mem, filter_players, filter_winners_only,
+                     hand_results):
+        """Encode one logged decision -> (features, label), or None if filtered."""
+        player_id = row.get("player")
+        if filter_players and player_id not in filter_players:
+            return None
+
         if filter_winners_only:
-            for path in glob.glob(f"{log_folder}/**/*.jsonl", recursive=True):
-                with open(path) as f:
-                    for line in f:
-                        try:
-                            row = json.loads(line)
-                            if "result" in row and "hand_id" in row:
-                                result = row["result"]
-                                if result.get("net", 0) > 0:  # Winner (positive net)
-                                    hand_results[row["hand_id"]] = result.get("player")
-                        except:
-                            continue
+            hand_id = row.get("hand_id")
+            if hand_id not in hand_results or hand_results[hand_id] != player_id:
+                return None
 
-        # Process each decision with memory context
-        for decision_idx, row in enumerate(all_decisions):
-            if "chosen_action" not in row:
-                continue
+        chosen = row["chosen_action"]
+        act_type = chosen["type"]
+        act_amt = chosen["amount"]
 
-            # Filter by player
-            player_id = row.get("player")
-            if filter_players and player_id not in filter_players:
-                continue
-
-            # Filter by winner
-            if filter_winners_only:
-                hand_id = row.get("hand_id")
-                if hand_id not in hand_results or hand_results[hand_id] != player_id:
-                    continue
-
-            chosen = row["chosen_action"]
-            act_type = chosen["type"]
-            act_amt = chosen["amount"]
-
-            # --------- LABEL ENCODING ---------
-            if act_type in ("fold", "check", "call"):
-                label = self.ACTION_MAP[act_type]
-
-            elif act_type in ("raise", "bet"):
-                legal = next(
-                    (la for la in row["legal"]
-                     if la["type"] in ("raise", "bet")),
-                    None
-                )
-                if legal is None:
-                    label = self.ACTION_MAP["call"]
+        # --------- LABEL ENCODING ---------
+        if act_type in ("fold", "check", "call"):
+            label = self.ACTION_MAP[act_type]
+        elif act_type in ("raise", "bet"):
+            legal = next(
+                (la for la in row["legal"]
+                 if la["type"] in ("raise", "bet")),
+                None
+            )
+            if legal is None:
+                label = self.ACTION_MAP["call"]
+            else:
+                lo, hi = legal["min"], legal["max"]
+                if act_amt <= lo + (hi - lo) * 0.33:
+                    label = self.ACTION_MAP["raise_small"]
+                elif act_amt <= lo + (hi - lo) * 0.66:
+                    label = self.ACTION_MAP["raise_medium"]
                 else:
-                    lo, hi = legal["min"], legal["max"]
-                    if act_amt <= lo + (hi - lo) * 0.33:
-                        label = self.ACTION_MAP["raise_small"]
-                    elif act_amt <= lo + (hi - lo) * 0.66:
-                        label = self.ACTION_MAP["raise_medium"]
-                    else:
-                        label = self.ACTION_MAP["raise_large"]
-            else:
-                continue
+                    label = self.ACTION_MAP["raise_large"]
+        else:
+            return None
 
-            # --------- FEATURE ENCODING ---------
-            hole = row.get("hole", [])
-            hole_enc = []
+        # --------- FEATURE ENCODING (shared with MLBot inference) ---------
+        position = row.get("position")
+        if position is None:
+            self.missing_position_rows += 1
+            position = "MP"  # legacy logs only — engine now logs position
 
-            for c in hole:
-                hole_enc += encode_card(c)
+        acting_opponents = row.get("acting_opponents")
+        memory_features = mem.features_for(
+            acting_opponents if acting_opponents is not None
+            else [pid for pid in row.get("opponents", [])
+                  if float(row["stacks"].get(pid, 0)) > 0]
+        )
 
-            while len(hole_enc) < 4:
-                hole_enc.append(0)
+        features = build_features(
+            street=row["street"],
+            pot=row["pot"],
+            to_call=row["to_call"],
+            stacks=row["stacks"],
+            me=player_id,
+            hole=row.get("hole", []),
+            board=row["board"],
+            position=position,
+            opponents=row.get("opponents"),
+            acting_opponents=acting_opponents,
+            memory_features=memory_features,
+            starting_chips=self.starting_chips,
+        )
 
-            board = row["board"]
-            board_enc = []
-            for c in board:
-                board_enc += encode_card(c)
-            while len(board_enc) < 10:
-                board_enc.append(0)
-
-            street = STREET_MAP[row["street"]]
-            # Normalise monetary features to [0, ~2] scale (same as MLBot inference)
-            scale = self.starting_chips
-            pot = float(row["pot"]) / scale
-            to_call = float(row["to_call"]) / scale
-
-            stacks = row["stacks"]
-            me = row["player"]
-            hero_stack_raw = float(stacks[me])
-            hero_stack = hero_stack_raw / scale
-            acting_opponents = row.get("acting_opponents")
-            if acting_opponents is None:
-                acting_opponents = [
-                    pid for pid in row.get("opponents", [])
-                    if float(stacks.get(pid, 0)) > 0
-                ]
-            opp_stacks = [
-                float(stacks.get(pid, hero_stack_raw))
-                for pid in acting_opponents
-                if float(stacks.get(pid, 0)) > 0
-            ]
-            eff_stack = min([hero_stack_raw] + opp_stacks) / scale
-            n_players = len(acting_opponents) + 1
-
-            # Hand strength — normalised the same way as MLBot._estimate_hand_strength()
-            if hole and len(hole) >= 2:
-                from core.engine import eval_hand, EVAL_HAND_MAX
-                score = eval_hand(hole, board)
-                hand_strength = score / EVAL_HAND_MAX
-            else:
-                hand_strength = 0.0
-
-            # Pot odds
-            if pot + to_call > 0:
-                pot_odds = to_call / (pot + to_call)
-            else:
-                pot_odds = 0.0
-
-            # Position encoding — matches ml_bot.py position_order
-            position_order = {
-                "UTG": 0.0, "UTG+1": 0.1, "MP": 0.3, "LJ": 0.4,
-                "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.3
-            }
-            position = row.get("position", "MP")
-            position_value = position_order.get(position, 0.5)
-
-            # NEW: Calculate memory features from previous decisions
-            opponents = acting_opponents
-            memory_features = self._calculate_memory_features(
-                all_decisions, decision_idx, me, opponents, row.get("_file")
-            )
-
-            features = [
-                street, pot, to_call,
-                hero_stack, eff_stack, n_players
-            ] + hole_enc + board_enc + [hand_strength, pot_odds, position_value] + memory_features
-
-            self.samples.append(
-                (
-                    torch.tensor(features, dtype=torch.float32),
-                    torch.tensor(label)
-                )
-            )
-
-    def _calculate_memory_features(self, all_decisions, current_idx, me, opponents, current_file):
-        """
-        Calculate opponent behavior features from previous decisions in the same session.
-        Returns [avg_aggression, avg_tightness, avg_vpip]
-        """
-        if not opponents:
-            return [0.5, 0.5, 0.5]  # Neutral values
-
-        # Get previous decisions from same file (same tournament session)
-        previous_decisions = [
-            d for d in all_decisions[:current_idx]
-            if d.get("_file") == current_file and d.get("player") in opponents
-        ]
-
-        if not previous_decisions:
-            return [0.5, 0.5, 0.5]  # No history yet
-
-        # Calculate stats from last 10 opponent actions
-        recent = previous_decisions[-10:]
-
-        total_actions = len(recent)
-        if total_actions == 0:
-            return [0.5, 0.5, 0.5]
-
-        aggressive_count = sum(1 for d in recent
-                              if d.get("chosen_action", {}).get("type") in ("bet", "raise"))
-        fold_count = sum(1 for d in recent
-                        if d.get("chosen_action", {}).get("type") == "fold")
-        vpip_count = sum(1 for d in recent
-                        if d.get("chosen_action", {}).get("type") in ("call", "bet", "raise"))
-
-        avg_aggression = aggressive_count / total_actions
-        avg_tightness = fold_count / total_actions
-        avg_vpip = vpip_count / total_actions
-
-        return [avg_aggression, avg_tightness, avg_vpip]
+        return (
+            torch.tensor(features, dtype=torch.float32),
+            torch.tensor(label),
+        )
 
     def __len__(self):
         return len(self.samples)
@@ -372,7 +463,8 @@ def train_model(
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
             save_dir = os.path.join(project_root, "models")
             os.makedirs(save_dir, exist_ok=True)
-            torch.save(best_state, os.path.join(save_dir, "ml_model_best.pt"))
+            torch.save(make_checkpoint(best_state),
+                       os.path.join(save_dir, "ml_model_best.pt"))
             print(f"  -> New best model saved (val_loss={avg_val:.4f})")
 
     # Restore best weights for return
@@ -431,13 +523,19 @@ if __name__ == "__main__":
                         help="Only train on decisions from these players (e.g., --filter_players P3)")
     parser.add_argument("--filter_winners", action="store_true",
                         help="Only train on decisions from winning hands")
+    parser.add_argument("--allow-legacy-logs", action="store_true",
+                        help="Accept log files without a session header "
+                             "(per-hand/legacy logs). Memory features from "
+                             "such files are untrustworthy — prefer "
+                             "regenerating with run_local_match.py --log-session")
     args = parser.parse_args()
 
     print("Loading logs...")
     dataset = PokerDataset(
         log_folder=args.log_dir,
         filter_players=args.filter_players,
-        filter_winners_only=args.filter_winners
+        filter_winners_only=args.filter_winners,
+        allow_unmarked_sessions=args.allow_legacy_logs,
     )
 
     if len(dataset) == 0:
@@ -475,6 +573,7 @@ if __name__ == "__main__":
     # ---- SAVE MODEL ----
     save_path = "models/ml_model.pt"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(model.state_dict(), save_path)
+    torch.save(make_checkpoint(model.state_dict()), save_path)
 
-    print(f"\nModel saved to: {save_path}")
+    print(f"\nModel saved to: {save_path} "
+          f"(feature schema v{FEATURE_SCHEMA_VERSION})")
