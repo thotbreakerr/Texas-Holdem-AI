@@ -1,8 +1,13 @@
 """
 Monte Carlo Counterfactual Regret Minimisation (MCCFR) Bot
 ----------------------------------------------------------
-A simplified MCCFR agent for No-Limit Texas Hold'em that converges
-toward a Nash equilibrium strategy over time.
+A simplified MCCFR agent for No-Limit Texas Hold'em that reduces
+counterfactual regret over sampled trajectories. NOTE on guarantees:
+with six players, card/bet/position/SPR abstraction, decision-rooted
+traversals, and the engineering approximations below, this is a
+best-effort regret minimiser — NOT a provably Nash-convergent solver
+(CFR's equilibrium guarantee holds for two-player zero-sum games
+without these approximations).
 
 Key design choices:
   * Bet abstraction – six sizing buckets: 33/50/67/75/100% pot + all-in.
@@ -10,7 +15,9 @@ Key design choices:
     postflop hand-strength percentile bins (10 buckets).
   * Position abstraction – 4 positional buckets (early/middle/late/blinds).
   * SPR abstraction – 3 stack-to-pot ratio buckets (low/mid/high).
-  * External-sampling MCCFR with regret-matching.
+  * External-sampling MCCFR with regret-matching (vanilla, per Lanctot
+    et al. 2009 — NOT CFR+/MCCFR+: no regret flooring, no linear
+    averaging; see TRAINING_PLAN.md Phase-3 note 2026-06-10).
   * Strategy profile + cumulative regret tables persist across hands
     within a session and can be serialised to disk.
 """
@@ -30,6 +37,7 @@ from core.engine import eval_hand, _FULL_DECK, EVAL_HAND_MAX
 from core.equity import equity as _canonical_equity
 from core.equity import equity_bucket as _canonical_equity_bucket
 from core.action_history import ActionEvent, tokenize as _canonical_tokenize
+from core.action_history import sizing_token as _sizing_token
 from core.aivat import Snapshot as _Snapshot, value as _aivat_value
 from core.opponent_stats import OpponentStatTracker as _OpponentStatTracker
 from core.table_order import street_action_order as _shared_street_action_order
@@ -69,6 +77,13 @@ _POSTFLOP_BUCKETS = 50
 # ── Tree CFR constants (Gate 2A) ──────────────────────────────────────────────
 _MAX_CFR_DEPTH = 8        # covers ~2 betting rounds in 6-handed play
 _DEFAULT_SEARCH_DEPTH = 3 # real-time subgame solve depth at inference
+
+# CFR profile format version (Phase 3.1). Version 3 marks profiles trained
+# with the Phase-3 semantics: canonical (realized-size) tree tokenization,
+# unweighted ES regret updates, and opponent-node + traversal-root
+# strategy_sum averaging. Older/unstamped profiles mix incompatible
+# regret/strategy semantics and must NOT be resumed for training.
+PROFILE_FORMAT_VERSION = 3
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -921,12 +936,21 @@ class _GameState:
             )
             raise_size = max(0, new_bet - prev_bet)
 
-        # Token for history
-        token_map = {
-            0: "F", 1: "K" if to_call == 0 else "C",
-            2: "S", 3: "Q", 4: "M", 5: "L", 6: "P", 7: "A",
-        }
-        s.history_tokens += token_map.get(abstract_idx, "?")
+        # Token for history.
+        # Sizing actions tokenize from the REALIZED total and the pot
+        # before the action — the same bucketing live play uses
+        # (core.action_history.sizing_token). A fixed per-bucket token
+        # diverged from live tokenization for raises, min-raise clamps,
+        # and all-in clamps, orphaning tree-trained info sets.
+        if abstract_idx >= 2:
+            # Engine `amount` semantics: actor's TOTAL street contribution.
+            realized_total = s.committed_per_seat[seat]
+            token = _sizing_token(realized_total, self.pot)
+        elif abstract_idx == 0:
+            token = "F"
+        else:
+            token = "K" if to_call == 0 else "C"
+        s.history_tokens += token
         s.street_actions += 1
 
         full_raise = (
@@ -1164,7 +1188,10 @@ class _CFRNode:
 
     def get_average_strategy(self, legal_mask: List[int]) -> List[float]:
         """
-        Average strategy is the one that converges to Nash equilibrium.
+        Cumulative average strategy — the standard CFR deployment policy.
+        (In two-player zero-sum unabstracted CFR this is the iterate that
+        converges to equilibrium; in this six-player abstracted setup it
+        is a best-effort approximation with no such guarantee.)
         """
         strategy = [0.0] * NUM_ACTIONS
         total = sum(self.strategy_sum[a] for a in legal_mask)
@@ -1207,8 +1234,9 @@ class CFRBot:
     profile_path : str | None
         Path for persisting regret / strategy tables. ``None`` = in-memory only.
     use_average : bool
-        If ``True`` (default), play the average strategy (Nash convergent).
-        If ``False``, play the current regret-matched strategy.
+        If ``True`` (default), play the cumulative average strategy (the
+        standard CFR deployment policy). If ``False``, play the current
+        regret-matched strategy.
     """
 
     def __init__(
@@ -1218,6 +1246,7 @@ class CFRBot:
         use_average: bool = True,
         inference_mode: bool = False,
         search_depth: int = _DEFAULT_SEARCH_DEPTH,
+        allow_stale_profile: bool = False,
     ):
         self.iterations = iterations
         self.profile_path = profile_path
@@ -1227,6 +1256,11 @@ class CFRBot:
         self.inference_mode = inference_mode
         self._training = not inference_mode  # inverse for clarity in tree-CFR
         self._search_depth = search_depth
+        # Explicit override for the load() profile-format gate: permits
+        # resuming TRAINING from a profile whose format_version predates
+        # PROFILE_FORMAT_VERSION. Off by default on purpose — stale
+        # profiles carry pre-Phase-3 regret/strategy semantics.
+        self.allow_stale_profile = allow_stale_profile
 
         # Node map: info_set_key → _CFRNode
         self._nodes: Dict[str, _CFRNode] = {}
@@ -1385,8 +1419,19 @@ class CFRBot:
         # ── Choose action from strategy ─────────────────────────
         node = self._lookup_node(info_key)
 
-        # Unseen node: fall back to equity-based heuristic
-        if node is None or sum(node.strategy_sum) == 0.0:
+        # Deployability (Phase 3.1): a node can hold positive regret with
+        # zero strategy_sum on the legal actions (profiles trained before
+        # root averaging landed, or infosets visited only in regret role).
+        # Deploy the regret-matched current strategy then, instead of
+        # discarding the training.
+        has_avg = node is not None and any(
+            node.strategy_sum[a] > 0.0 for a in legal_mask)
+        has_regret = node is not None and any(
+            node.regret_sum[a] > 0.0 for a in legal_mask)
+
+        # Untrained node: fall back to subgame search (inference) or an
+        # equity-based heuristic (training).
+        if not has_avg and not has_regret:
             # Item 5: Even with empty profile, try subgame search
             if self.inference_mode:
                 return self._search_fallback(state, legal_mask, legal, pot,
@@ -1396,7 +1441,7 @@ class CFRBot:
             return self._heuristic_action(legal_mask, equity, pot, to_call,
                                           legal, current_bet=current_bet)
 
-        if self.use_average:
+        if self.use_average and has_avg:
             avg_strategy = node.get_average_strategy(legal_mask)
         else:
             avg_strategy = node.get_strategy(legal_mask)
@@ -1568,8 +1613,7 @@ class CFRBot:
             )
             if state is None:
                 continue
-            reach = {s: 1.0 for s in range(len(state.stacks))}
-            self._cfr_recurse(state, state.hero_seat, reach, depth=0)
+            self._cfr_recurse(state, state.hero_seat, depth=0)
             completed += 1
 
         self._total_iterations += completed
@@ -1789,13 +1833,33 @@ class CFRBot:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _cfr_recurse(self, state: _GameState, hero_seat: int,
-                     reach_probs: Dict[int, float], depth: int) -> float:
-        """External-sampling MCCFR recursive traversal.
+                     depth: int) -> float:
+        """External-sampling MCCFR recursive traversal (Lanctot et al. 2009).
 
         state: current _GameState
         hero_seat: which seat we're computing regret for this iteration
-        reach_probs: {seat -> reach probability under each player's strategy}
         depth: recursion depth, bounded by _MAX_CFR_DEPTH
+
+        No explicit reach weighting appears in the updates, on purpose:
+        opponent actions are SAMPLED from their current strategy, so any
+        sampled path already occurs with frequency proportional to the
+        opponents' reach probability. Therefore:
+          * Regret increments at hero nodes are unweighted. (A previous
+            version also multiplied by cf_reach, which counted opponent
+            reach twice — expected weight pi_opp^2 instead of pi_opp.)
+          * strategy_sum accumulates at OPPONENT nodes, unweighted: the
+            opponent's own sampled actions supply their reach weighting
+            in expectation. All training seats share one table
+            (train_cfr_bot_multiway), so every info set receives
+            average-strategy mass from the traversals of other seats.
+          * strategy_sum ALSO accumulates at the hero TRAVERSAL-ROOT node
+            (depth 0, Phase 3.1). Traversals are decision-rooted with the
+            hero acting first, so the hero's reach at the root is exactly
+            1 and the unweighted increment is the textbook average-
+            strategy update. Without it, infosets that only ever occur as
+            a traversal root — e.g. the hand's FIRST voluntary action,
+            whose token history is empty — collect regret but zero
+            strategy_sum, and act() would discard the training entirely.
         """
         self._recursion_calls += 1  # Gate 3A: anti-substitution counter
         if state.is_terminal() or depth >= _MAX_CFR_DEPTH:
@@ -1803,8 +1867,7 @@ class CFRBot:
 
         if state.is_chance_node():
             next_state = state.advance_street()
-            return self._cfr_recurse(next_state, hero_seat, reach_probs,
-                                     depth + 1)
+            return self._cfr_recurse(next_state, hero_seat, depth + 1)
 
         seat = state.seat_to_act()
         if seat < 0:
@@ -1816,13 +1879,21 @@ class CFRBot:
         strategy = node.get_strategy(legal_mask)
 
         if seat != hero_seat:
-            # Opponent: sample one action (external sampling)
+            # Opponent: accumulate the average strategy here (textbook
+            # external sampling), then sample one action on-policy.
+            for a in legal_mask:
+                node.strategy_sum[a] += strategy[a]
             action = self._sample_action(strategy, legal_mask)
             next_state = state.apply_action(seat, action)
-            new_reach = dict(reach_probs)
-            new_reach[seat] = new_reach.get(seat, 1.0) * strategy[action]
-            return self._cfr_recurse(next_state, hero_seat, new_reach,
-                                     depth + 1)
+            return self._cfr_recurse(next_state, hero_seat, depth + 1)
+
+        # Hero at the traversal root: hero reach is exactly 1 here, so the
+        # unweighted increment is the exact average-strategy update (see
+        # docstring). Deeper hero nodes still accumulate nothing — their
+        # mass arrives via other seats' traversals (shared table).
+        if depth == 0:
+            for a in legal_mask:
+                node.strategy_sum[a] += strategy[a]
 
         # Hero: expand all legal actions
         action_utils = {}
@@ -1832,28 +1903,18 @@ class CFRBot:
             added_cost = max(
                 0, next_state.committed_per_seat[hero_seat] - before_commit
             )
-            new_reach = dict(reach_probs)
-            new_reach[hero_seat] = new_reach.get(hero_seat, 1.0) * strategy[a]
             action_utils[a] = (
-                self._cfr_recurse(next_state, hero_seat, new_reach, depth + 1)
+                self._cfr_recurse(next_state, hero_seat, depth + 1)
                 - added_cost
             )
 
         node_util = sum(strategy[a] * action_utils.get(a, 0.0)
                         for a in legal_mask)
 
-        # Counterfactual reach = product of all opponents' reach probs
-        cf_reach = 1.0
-        for s, rp in reach_probs.items():
-            if s != hero_seat:
-                cf_reach *= rp
-        self_reach = reach_probs.get(hero_seat, 1.0)
-
-        # Update regrets and average strategy
+        # Unweighted regret update — sampling already supplies the
+        # opponents' reach (see docstring).
         for a in legal_mask:
-            node.regret_sum[a] += cf_reach * (action_utils.get(a, 0.0)
-                                              - node_util)
-            node.strategy_sum[a] += self_reach * strategy[a]
+            node.regret_sum[a] += action_utils.get(a, 0.0) - node_util
 
         return node_util
 
@@ -1861,19 +1922,31 @@ class CFRBot:
     #  Gate 2A: Real-time subgame search (item 5)
     # ──────────────────────────────────────────────────────────────────────────
 
+    # Inference-search shaping constants (mirror Path B,
+    # deep_cfr_bot.py:1140-1142). Subtree EVs come from ONE sampled
+    # opponent line per node with unknown opponent cards, so they are
+    # noisy; temper, clip, and blend instead of letting a raw chip-unit
+    # exp() collapse onto the argmax of that noise.
+    _SEARCH_TEMPERATURE = 20.0      # advantage scale, in big blinds
+    _SEARCH_ADVANTAGE_CLIP = 2.0    # max |advantage| after temperature
+    _SEARCH_BLEND = 0.25            # weight of search vs trained prior
+
     def _subgame_search(self, state: PlayerView, prior: List[float],
                         legal_mask: List[int], depth: int = 3) -> List[float]:
         """Depth-limited subgame search rooted at the current state.
 
-        Builds a small game tree, evaluates leaves via AIVAT, returns a
-        refined strategy = softmax(prior * exp(ev)).
+        Builds a small game tree, evaluates leaves via AIVAT, and blends
+        the resulting action EVs back into the trained prior (see
+        _shape_search_strategy).
         """
         gs, hero_seat = _build_game_state_from_view(
             state,
             opp_stat_bucket=self._compute_opp_stat_bucket(state),
         )
 
-        # Evaluate each candidate hero action
+        # Evaluate each candidate hero action. EVs are converted from
+        # chips to big-blind units so shaping is chip-scale invariant.
+        big_blind = max(1, int(gs.big_blind or 1))
         action_evs = {}
         for a in legal_mask:
             before_commit = gs.committed_per_seat[hero_seat]
@@ -1882,16 +1955,45 @@ class CFRBot:
                 0, next_state.committed_per_seat[hero_seat] - before_commit
             )
             ev = self._search_subtree(next_state, hero_seat, depth - 1) - added_cost
-            action_evs[a] = ev
+            action_evs[a] = ev / big_blind
 
-        # Refined strategy: softmax over (prior * exp(ev))
+        return self._shape_search_strategy(action_evs, prior, legal_mask)
+
+    def _shape_search_strategy(self, action_evs: Dict[int, float],
+                               prior: List[float],
+                               legal_mask: List[int]) -> List[float]:
+        """Blend noisy search EVs (in big-blind units) into the prior.
+
+        Mirrors Path B's cautious shaping (deep_cfr_bot.py:1731-1762):
+          1. advantage = (ev - prior-weighted baseline) / temperature
+          2. clip advantage to +/- _SEARCH_ADVANTAGE_CLIP
+          3. w = prior * exp(advantage), normalized
+          4. final = 0.75 * prior + 0.25 * w   (_SEARCH_BLEND)
+        A single noisy EV sample can therefore shift — but never
+        override — the trained average strategy. The old shaping used
+        exp() on raw chip EVs, where a 20-chip gap (e^20) annihilated
+        the prior and argmaxed single-sample noise.
+        """
         refined = [0.0] * NUM_ACTIONS
-        max_ev = max(action_evs.values()) if action_evs else 0.0
+        if not legal_mask:
+            return refined
+
+        prior_total = sum(max(prior[a], 0.0) for a in legal_mask)
+        if prior_total > 0:
+            prior_norm = {a: max(prior[a], 0.0) / prior_total
+                          for a in legal_mask}
+        else:
+            prior_norm = {a: 1.0 / len(legal_mask) for a in legal_mask}
+
+        baseline = sum(prior_norm[a] * action_evs.get(a, 0.0)
+                       for a in legal_mask)
 
         total = 0.0
         for a in legal_mask:
-            ev = action_evs.get(a, 0.0)
-            w = max(prior[a], 1e-6) * math.exp(ev - max_ev)
+            adv = (action_evs.get(a, 0.0) - baseline) / self._SEARCH_TEMPERATURE
+            adv = max(-self._SEARCH_ADVANTAGE_CLIP,
+                      min(self._SEARCH_ADVANTAGE_CLIP, adv))
+            w = max(prior_norm[a], 1e-6) * math.exp(adv)
             refined[a] = w
             total += w
 
@@ -1899,9 +2001,12 @@ class CFRBot:
             for a in legal_mask:
                 refined[a] /= total
         else:
-            n = len(legal_mask)
             for a in legal_mask:
-                refined[a] = 1.0 / n
+                refined[a] = prior_norm[a]
+
+        blend = self._SEARCH_BLEND
+        for a in legal_mask:
+            refined[a] = (1.0 - blend) * prior_norm[a] + blend * refined[a]
 
         return refined
 
@@ -2040,6 +2145,7 @@ class CFRBot:
             os.makedirs(dirn, exist_ok=True)
 
         data = {
+            "format_version": PROFILE_FORMAT_VERSION,
             "nodes": {k: v.to_dict() for k, v in self._nodes.items()},
             "hands_played": self._hands_played,
             "total_iterations": self._total_iterations,
@@ -2075,11 +2181,29 @@ class CFRBot:
             }
             hands_played = data.get("hands_played", 0)
             total_iterations = data.get("total_iterations", 0)
+            format_version = int(data.get("format_version", 0) or 0)
         except Exception as e:
             print(f"[CFRBot] Could not load profile from {path}: {e}")
             self._nodes = {}
             self._legacy_nodes = {}
             return
+
+        # Profile format gate (Phase 3.1): refuse to RESUME TRAINING from a
+        # profile that predates PROFILE_FORMAT_VERSION — its regrets and
+        # strategy sums were accumulated under pre-Phase-3 semantics
+        # (cf_reach double count, fixed-token tree histories, hero-node
+        # averaging) and would silently poison a fresh run. Inference-mode
+        # loads stay permitted (read-only play / eval against old profiles).
+        if (not self.inference_mode
+                and not self.allow_stale_profile
+                and format_version < PROFILE_FORMAT_VERSION):
+            raise RuntimeError(
+                f"[CFRBot] Profile {path!r} has format_version="
+                f"{format_version} (< {PROFILE_FORMAT_VERSION}). Training "
+                f"must start from a fresh profile — move/delete the old "
+                f"file, point --profile at a new path, or pass "
+                f"allow_stale_profile=True to override explicitly."
+            )
 
         # Gate 2A format: 7 fields, 6 colons:
         # street:n_opp:position:spr:opp_stat:bucket:history.

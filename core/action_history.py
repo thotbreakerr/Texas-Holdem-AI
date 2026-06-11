@@ -7,6 +7,10 @@ Extracted from the inline tokenizer in bots/cfr_bot.py (session 2026-04-26).
 
 Both Path A and Path B import from here. This module is read-only
 after Gate 1 closes.
+
+Phase-3 amendment (2026-06-10): sizing_token() extracted from tokenize()
+so the tree traversal (_GameState.apply_action) and live-play tokenization
+share one bucketing. No behavior change to tokenize() itself.
 """
 from __future__ import annotations
 
@@ -119,6 +123,36 @@ def extract_history(player_view) -> list:
     return events
 
 
+def sizing_token(amount: int, pot_before: int) -> str:
+    """Map a bet/raise TOTAL street contribution to its sizing token.
+
+    Single source of truth for sizing buckets. Used by tokenize() below
+    (live play) AND by Path A's tree traversal (_GameState.apply_action),
+    so info-set keys learned in the tree stay reachable at inference.
+
+    amount:     the actor's resulting total street contribution
+                (engine `amount` semantics — total, not delta).
+    pot_before: pot snapshot before this action's chips went in.
+    """
+    if pot_before > 0:
+        ratio = amount / pot_before
+    else:
+        ratio = 1.0
+
+    # Bin ratio into one of 6 sizing tokens
+    if ratio >= 1.2:
+        return "A"   # all-in / over-pot
+    if ratio >= 0.85:
+        return "P"   # pot-sized (~100%)
+    if ratio >= 0.70:
+        return "L"   # large (~75%)
+    if ratio >= 0.55:
+        return "M"   # medium (~67%)
+    if ratio >= 0.40:
+        return "Q"   # quarter-ish (~50%)
+    return "S"       # small (~33%)
+
+
 def tokenize(events) -> str:
     """Path A's tokenizer -- replaces the inline scheme in cfr_bot.py.
 
@@ -149,27 +183,7 @@ def tokenize(events) -> str:
         elif action == "call":
             tokens.append("C")
         elif action in ("bet", "raise", "all_in"):
-            amt = event.amount
-            pot = event.pot_before
-
-            if pot > 0:
-                ratio = amt / pot
-            else:
-                ratio = 1.0
-
-            # Bin ratio into one of 6 sizing tokens
-            if ratio >= 1.2:
-                tokens.append("A")   # all-in / over-pot
-            elif ratio >= 0.85:
-                tokens.append("P")   # pot-sized (~100%)
-            elif ratio >= 0.70:
-                tokens.append("L")   # large (~75%)
-            elif ratio >= 0.55:
-                tokens.append("M")   # medium (~67%)
-            elif ratio >= 0.40:
-                tokens.append("Q")   # quarter-ish (~50%)
-            else:
-                tokens.append("S")   # small (~33%)
+            tokens.append(sizing_token(event.amount, event.pot_before))
         else:
             tokens.append("?")
 

@@ -493,20 +493,33 @@ try:
         print("  [FAIL] — no info-sets were created")
         PASS = False
 
+    # Phase 3 (2026-06-10): textbook external sampling accumulates regret
+    # at hero (traverser) nodes and strategy_sum at OPPONENT nodes — a
+    # single info-set only gets both if it is visited in both roles across
+    # traversals. Check each accumulator on its own node population.
     candidate_keys = new_keys if new_keys else list(bot8._nodes)
-    chosen_key = None
+    regret_key = None
+    strategy_key = None
     for key in candidate_keys:
         node = bot8._nodes[key]
-        has_regret = any(abs(x) > 1e-12 for x in node.regret_sum)
-        has_strategy = any(abs(x) > 1e-12 for x in node.strategy_sum)
-        if has_regret and has_strategy:
-            chosen_key = key
+        if regret_key is None and any(abs(x) > 1e-12 for x in node.regret_sum):
+            regret_key = key
+        if strategy_key is None and any(abs(x) > 1e-12 for x in node.strategy_sum):
+            strategy_key = key
+        if regret_key and strategy_key:
             break
 
-    if chosen_key is not None:
-        print(f"  [PASS] — accumulators updated for key '{chosen_key[:50]}...'")
+    if regret_key is not None:
+        print(f"  [PASS] — regret accumulated (hero node) "
+              f"'{regret_key[:50]}...'")
     else:
-        print("  [FAIL] — no info-set had both nonzero regret_sum and strategy_sum")
+        print("  [FAIL] — no info-set accumulated regret_sum")
+        PASS = False
+    if strategy_key is not None:
+        print(f"  [PASS] — strategy_sum accumulated (opponent node) "
+              f"'{strategy_key[:50]}...'")
+    else:
+        print("  [FAIL] — no info-set accumulated strategy_sum")
         PASS = False
 
 except Exception as e:

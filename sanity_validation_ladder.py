@@ -105,6 +105,23 @@ LADDER: list[Gate] = [
          script="sanity_cfr_sizing_parity.py", timeout=300),
     Gate("sanity_cfr_equity", 2, "cfr",
          script="sanity_cfr_equity.py", timeout=600),
+    # Phase 3 (2026-06-10) — MCCFR / Path A correctness gates:
+    #   ES estimator weighting (regret + strategy-sum placement),
+    #   tree/live history-token parity, inference-search shaping.
+    Gate("sanity_mccfr_es_update", 2, "cfr",
+         script="sanity_mccfr_es_update.py", timeout=300),
+    Gate("sanity_cfr_token_parity", 2, "cfr",
+         script="sanity_cfr_token_parity.py", timeout=120),
+    Gate("sanity_cfr_search_shaping", 2, "cfr",
+         script="sanity_cfr_search_shaping.py", timeout=120),
+    # Phase 3.1 (2026-06-11) — retrain blockers from the second audit:
+    #   decision-root strategy_sum coverage + act() deployability + the
+    #   profile format_version gate; short all-in-call history parity
+    #   (engine records actual paid amount, reconstruction matches pot).
+    Gate("sanity_cfr_root_coverage", 2, "cfr",
+         script="sanity_cfr_root_coverage.py", timeout=300),
+    Gate("sanity_cfr_allin_call_reconstruction", 2, "all",
+         script="sanity_cfr_allin_call_reconstruction.py", timeout=120),
 
     # Tier 3 — feature / schema consistency.
     #   Deep CFR train-vs-inference feature semantics + opponent

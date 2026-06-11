@@ -776,12 +776,20 @@ class Table:
                     "hand_id": hand_id,
                 })
 
-            # Add to history BEFORE modifying contrib
+            # Add to history BEFORE modifying contrib.
+            # Calls record the chips ACTUALLY paid — min(stack, to_call) —
+            # instead of None: a short-stack call-for-less would otherwise
+            # be reconstructed downstream as the full to_call (CFR
+            # contribution rebuild), breaking pot/contribution parity and
+            # silently skipping training traversals.
+            history_amount = action.amount
+            if action.type == "call":
+                history_amount = min(seat.chips, to_call)
             history.append({
                 "street": street,
                 "pid": pid,
                 "type": action.type,
-                "amount": action.amount,
+                "amount": history_amount,
                 "to_call_before": to_call,
                 "pot_before": pot + sum(contrib.values()),
             })
