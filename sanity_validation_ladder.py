@@ -73,7 +73,7 @@ TIER_TITLES = {
     2: "CFR / Deep CFR reconstruction & abstraction",
     3: "feature / schema consistency",
     4: "chip / value accounting",
-    5: "smoke training gates (slow)",
+    5: "training robustness (fast) + smoke training gates (slow)",
     6: "eval / readiness",
 }
 
@@ -141,6 +141,16 @@ LADDER: list[Gate] = [
     # the default fast tier (not gated behind --full).
     Gate("sanity_deep_cfr_fold_collapse", 3, "deep-cfr",
          script="sanity_deep_cfr_fold_collapse.py", timeout=180),
+    # Phase 4 (2026-06-11) — Deep CFR retrain-readiness gates:
+    #   tree-vs-engine action-history parity (I3/B1: shove labels, clamped
+    #   raises, call-for-less amounts compared event-by-event against real
+    #   engine hands) and the training-state curriculum (I6: player counts
+    #   2-6, 10-200BB depths, engine action order, opp_mask with n<6, and
+    #   blind-level scale invariance of the feature encoding).
+    Gate("sanity_deep_cfr_history_parity", 3, "deep-cfr",
+         script="sanity_deep_cfr_history_parity.py", timeout=180),
+    Gate("sanity_deep_cfr_curriculum", 3, "deep-cfr",
+         script="sanity_deep_cfr_curriculum.py", timeout=300),
     # ML supervised path (Phase 2/2.1): train-vs-inference 26-feature parity
     # via the shared builder, session-log safety (legacy per-hand logs
     # rejected), cross-session memory dedup/reset, and ML checkpoint
@@ -161,7 +171,17 @@ LADDER: list[Gate] = [
     Gate("sanity_rl_ppo", 4, "all",
          script="sanity_rl_ppo.py", timeout=300),
 
-    # Tier 5 — smoke training gates (SLOW; --full only)
+    # Tier 5 — training robustness (fast) + smoke training gates (SLOW; --full only)
+    # Phase 4 (2026-06-11) — trainer robustness gates.  Fast (stubbed
+    # traversals / short real subprocesses), so NOT gated behind --full:
+    #   nonfinite_guard — B2/I5 finiteness guard (NaN loss skips the step,
+    #   threshold abort, counter persisted in checkpoint metadata);
+    #   signals — B5/M4 SIGINT/SIGTERM save a checkpoint and exit 130/143,
+    #   plus the B4/I9 shadow_only stamp and the 1M --iterations default.
+    Gate("sanity_deep_cfr_nonfinite_guard", 5, "deep-cfr",
+         script="sanity_deep_cfr_nonfinite_guard.py", timeout=600),
+    Gate("sanity_train_deep_cfr_signals", 5, "deep-cfr",
+         script="sanity_train_deep_cfr_signals.py", timeout=600),
     Gate("sanity_deep_cfr_allin_micro", 5, "deep-cfr", slow=True,
          script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "micro"],
          timeout=900),

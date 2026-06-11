@@ -738,12 +738,19 @@ def run_checks(variant: str):
         original_search_subtree = search_bot._search_subtree
 
         def biased_value_head(state, hero_seat, depth):
-            """Reproduce the observed bad value ordering: all-in >> other actions."""
+            """Reproduce the observed bad value ordering: all-in >> other actions.
+
+            The tree now records a shove as the engine does — a plain
+            "bet"/"raise" whose actor has no chips behind (I3/B1 history
+            parity fix) — so an all-in line is detected from the actor's
+            post-action stack, not from a dedicated "all_in" label.
+            """
             if not state.history_events:
                 return 0.0
             last = state.history_events[-1]
-            if last.action == "all_in":
-                return 115.0
+            if (last.action in ("bet", "raise")
+                    and state.stacks[last.seat] <= 0):
+                return 115.0  # whole-stack commit == the old "all_in" line
             if last.action in ("bet", "raise"):
                 return 88.0
             if last.action == "call":

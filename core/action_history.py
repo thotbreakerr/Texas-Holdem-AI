@@ -44,6 +44,12 @@ class ActionEvent:
 _STREETS = ("preflop", "flop", "turn", "river")
 _STREET_TO_IDX = {s: i for i, s in enumerate(_STREETS)}
 
+# NOTE on "all_in" (2026-06-11, I3/B1 parity fix): the engine has no all-in
+# action type (a shove is a bet/raise that happens to commit the whole stack),
+# and the Deep CFR tree now mirrors that — neither producer emits "all_in"
+# events anymore.  The label stays in the vocabulary so tensor shapes and
+# previously trained checkpoints are unchanged; its one-hot channel simply
+# goes unused.
 _ACTIONS = ("fold", "check", "call", "bet", "raise", "all_in")
 _ACTION_TO_IDX = {a: i for i, a in enumerate(_ACTIONS)}
 
@@ -199,8 +205,17 @@ _N_ACTIONS = len(_ACTIONS)
 # Per-event: seat_onehot + street_onehot + action_onehot + amount_norm + pot_norm + mask
 FEATURE_DIM = _N_SEATS_MAX + _N_STREETS + _N_ACTIONS + 2 + 1  # = 23
 
+# Reference big blind for the chip-feature scale (Fix 5 / I6).  Every chip
+# quantity is rescaled to this blind level before normalization
+# (chips * REF_BIG_BLIND / big_blind), making the encoding blind-level
+# invariant: the same spot at 5/10 and at 50/100 produces identical tensors.
+# At big_blind == REF_BIG_BLIND the rescale factor is exactly 1.0, so all
+# historical 5/10 encodings (and the checkpoints trained on them) are
+# byte-identical to before.
+REF_BIG_BLIND = 10
 
-def to_tensor(events, max_len=64):
+
+def to_tensor(events, max_len=64, big_blind: int = REF_BIG_BLIND):
     """Path B's input -- fixed-shape padded tensor for GRU consumption.
 
     Each event encoded as [seat_onehot, street_onehot, action_onehot,
@@ -211,6 +226,11 @@ def to_tensor(events, max_len=64):
     ----------
     events : list[ActionEvent]
     max_len : int
+    big_blind : int
+        The game's big blind in chips.  Event amounts/pots are rescaled to
+        the REF_BIG_BLIND chip scale before the log-normalization so the
+        features are blind-level invariant (see REF_BIG_BLIND above).
+        Defaults to REF_BIG_BLIND, which reproduces the historical encoding.
 
     Returns
     -------
@@ -219,6 +239,9 @@ def to_tensor(events, max_len=64):
     if torch is None:
         raise ImportError("torch is required for to_tensor()")
 
+    import math
+
+    bb = max(1, int(big_blind or REF_BIG_BLIND))
     tensor = torch.zeros(max_len, FEATURE_DIM, dtype=torch.float32)
 
     for i, event in enumerate(events[:max_len]):
@@ -239,15 +262,16 @@ def to_tensor(events, max_len=64):
         tensor[i, offset + action_idx] = 1.0
         offset += _N_ACTIONS
 
-        # Normalized amount (log scale, capped)
+        # Normalized amount (log scale, capped), at the reference blind scale.
         # Use log(1 + amount) / log(1 + 10000) to normalize to ~[0, 1]
-        import math
-        amount_norm = math.log1p(event.amount) / math.log1p(10000)
+        amount_eq = event.amount * REF_BIG_BLIND / bb
+        amount_norm = math.log1p(amount_eq) / math.log1p(10000)
         tensor[i, offset] = min(amount_norm, 1.0)
         offset += 1
 
-        # Normalized pot
-        pot_norm = math.log1p(event.pot_before) / math.log1p(10000)
+        # Normalized pot, at the reference blind scale
+        pot_eq = event.pot_before * REF_BIG_BLIND / bb
+        pot_norm = math.log1p(pot_eq) / math.log1p(10000)
         tensor[i, offset] = min(pot_norm, 1.0)
         offset += 1
 

@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from core.bot_api import Action, PlayerView, BotAdapter, acting_opponents_for
 from core.action_history import (
     ActionEvent, extract_history, to_tensor as history_to_tensor,
-    FEATURE_DIM as HIST_FEATURE_DIM,
+    FEATURE_DIM as HIST_FEATURE_DIM, REF_BIG_BLIND,
 )
 from core.opponent_stats import OpponentStatTracker, OpponentStats
 from core.table_order import street_action_order
@@ -299,12 +299,20 @@ def _build_card_ids(hole_cards, board) -> torch.Tensor:
 
 
 def _build_scalars(pot, to_call, hero_stack, position, street, n_opp,
-                   opp_stacks) -> torch.Tensor:
-    """Return (_SCALAR_DIM,) float tensor."""
-    norm = max(pot, 1.0)
-    pot_n = math.log1p(pot) / math.log1p(10000)
-    call_n = math.log1p(to_call) / math.log1p(10000)
-    stack_n = math.log1p(hero_stack) / math.log1p(10000)
+                   opp_stacks, big_blind: int = REF_BIG_BLIND) -> torch.Tensor:
+    """Return (_SCALAR_DIM,) float tensor.
+
+    Chip quantities are rescaled to the 10-chip reference big blind
+    (``x * REF_BIG_BLIND / big_blind``) before the log-normalization, so the
+    encoding is blind-level invariant — the same spot at 5/10 and at 50/100
+    yields identical features.  At big_blind == 10 the rescale is exactly 1,
+    keeping all historical 5/10 encodings byte-identical.  SPR and the
+    one-hots are ratios/labels and need no rescaling.
+    """
+    bb = max(1, int(big_blind or REF_BIG_BLIND))
+    pot_n = math.log1p(pot * REF_BIG_BLIND / bb) / math.log1p(10000)
+    call_n = math.log1p(to_call * REF_BIG_BLIND / bb) / math.log1p(10000)
+    stack_n = math.log1p(hero_stack * REF_BIG_BLIND / bb) / math.log1p(10000)
 
     pos_oh = [0.0] * 4
     pos_oh[_POSITION_MAP.get(position, 1)] = 1.0
@@ -381,20 +389,38 @@ def _fill_public_opp_features(
     pot: int,
     can_act: bool,
     all_in: bool,
+    big_blind: int = REF_BIG_BLIND,
 ):
     opp_mask[0, index] = 1.0
-    opp_features[0, index, 0] = min(1.0, max(0, int(stack)) / 1000.0)
+    # Stack channel: fraction of a 100-BB stack at the reference blind,
+    # capped at 1.0 (depths beyond 100 BB saturate — the pre-existing
+    # semantic; hero's own depth stays fully resolved via the log-scaled
+    # scalar).  committed/pot is already a ratio, hence blind-invariant.
+    bb = max(1, int(big_blind or REF_BIG_BLIND))
+    stack_eq = max(0, int(stack)) * REF_BIG_BLIND / bb
+    opp_features[0, index, 0] = min(1.0, stack_eq / 1000.0)
     opp_features[0, index, 1] = min(1.0, max(0, int(committed)) / max(int(pot), 1))
     opp_features[0, index, 2] = 1.0 if can_act else 0.0
     opp_features[0, index, 3] = 1.0 if all_in else 0.0
 
 
 def build_network_input(view: PlayerView, opp_tracker=None) -> dict:
-    """Convert a PlayerView into the dict of tensors the network expects."""
+    """Convert a PlayerView into the dict of tensors the network expects.
+
+    Chip features are normalized at the inferred big-blind scale so the
+    encoding matches training (the tree passes its exact big_blind) and is
+    invariant to eval-time blind escalation.  At the standard 5/10 blinds the
+    inference is exact and the encoding identical to the historical one.
+    """
     card_ids = _build_card_ids(view.hole_cards, view.board).unsqueeze(0)
 
+    # Engine views never carry the blind size; reconstruct it the same way
+    # the sizing logic does (bounded, exact for standard blind posting).
+    big_blind = _infer_big_blind(view)
+
     events = _safe_extract_history(view)
-    hist_tensor = history_to_tensor(events, max_len=_HISTORY_MAX_LEN)
+    hist_tensor = history_to_tensor(events, max_len=_HISTORY_MAX_LEN,
+                                    big_blind=big_blind)
     hist_mask = hist_tensor[:, -1]  # last channel is mask
     hist_tensor = hist_tensor.unsqueeze(0)
     hist_mask = hist_mask.unsqueeze(0)
@@ -445,11 +471,12 @@ def build_network_input(view: PlayerView, opp_tracker=None) -> dict:
             pot=view.pot,
             can_act=opid in acting,
             all_in=opid in all_in or stack <= 0,
+            big_blind=big_blind,
         )
 
     scalars = _build_scalars(
         view.pot, view.to_call, hero_stack, view.position,
-        view.street, n_opp, opp_stacks,
+        view.street, n_opp, opp_stacks, big_blind=big_blind,
     ).unsqueeze(0)
 
     return {
@@ -892,7 +919,16 @@ class _DeepCFRGameState:
                 }
                 if label == "all_in":
                     target_total = hi
-                    action_type = "all_in"
+                    # Train/serve parity (I3/B1): the real engine has no
+                    # "all_in" action type — a shove is recorded in history as
+                    # the underlying "bet"/"raise" — so the tree must emit the
+                    # same label.  Emitting "all_in" here trained the history
+                    # GRU's all-in channel on prefixes that never occur at
+                    # play time (engine histories activate the bet/raise
+                    # channel instead).  "all_in" stays in the _ACTIONS
+                    # vocabulary so tensor shapes and old checkpoints are
+                    # unchanged; the channel simply goes unused.
+                    action_type = spec["type"]
                 elif new.street == "preflop" and spec["type"] == "raise":
                     target_total = _preflop_raise_target(label, new.big_blind, lo)
                     target_total = max(lo, min(hi, target_total))
@@ -1044,7 +1080,14 @@ class _DeepCFRGameState:
         hole = list(self.hole_cards.get(hero_seat, ()))
         card_ids = _build_card_ids(hole, self.board).unsqueeze(0)
 
-        hist_tensor = history_to_tensor(self.history_events, max_len=_HISTORY_MAX_LEN)
+        # Training-side normalization uses the tree's EXACT big blind, so the
+        # chip features match what inference reconstructs via _infer_big_blind
+        # and stay invariant to the game's blind level (Fix 5 / I6).
+        big_blind = max(1, int(self.big_blind or 1))
+
+        hist_tensor = history_to_tensor(self.history_events,
+                                        max_len=_HISTORY_MAX_LEN,
+                                        big_blind=big_blind)
         hist_mask = hist_tensor[:, -1]
 
         opp_features = torch.zeros(1, _MAX_OPPONENTS, _OPP_FEAT_DIM)
@@ -1064,6 +1107,7 @@ class _DeepCFRGameState:
                 pot=self.pot,
                 can_act=stack > 0,
                 all_in=stack <= 0,
+                big_blind=big_blind,
             )
 
         opp_stacks = [self.stacks[i] for i in opp_seats if self.stacks[i] > 0]
@@ -1075,6 +1119,7 @@ class _DeepCFRGameState:
             self.street,
             max(1, len(opp_seats)),
             opp_stacks,
+            big_blind=big_blind,
         ).unsqueeze(0)
 
         return {

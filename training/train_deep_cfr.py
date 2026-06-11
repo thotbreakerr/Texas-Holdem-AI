@@ -34,6 +34,7 @@ from bots.deep_cfr_bot import (
 )
 from core.action_history import ActionEvent
 from core.bot_api import PlayerView
+from core.table_order import street_action_order
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -43,6 +44,18 @@ N_SEATS = 6
 START_CHIPS = 1000
 BIG_BLIND = 10
 SMALL_BLIND = 5
+
+# Training-state curriculum (Fix 5 / I6).  Tournaments are decided heads-up,
+# short-stacked, at escalated blinds — states a fixed "6 seats x 1000 chips"
+# trainer never samples.  Each training state now randomizes the player count
+# and the stack depths; blinds stay at 5/10 because the network features are
+# big-blind-relative (see core.action_history.REF_BIG_BLIND), which makes the
+# blind level a pure scale factor — varying chip depth at fixed blinds covers
+# escalated blinds at fixed chips too.
+CURRICULUM_PLAYER_COUNTS = (2, 3, 4, 5, 6)
+CURRICULUM_MIN_DEPTH_BB = 10     # shortest stack: 10 big blinds
+CURRICULUM_MAX_DEPTH_BB = 200    # deepest stack: 200 big blinds
+CURRICULUM_SHARED_DEPTH_PROB = 0.5  # 50% one depth for all seats, 50% per-seat
 ALL_IN_WARMUP_ITERATIONS = 100_000
 ALL_IN_DEPLOY_ITERATION = 150_000
 ALL_IN_FULL_RELEASE_ITERATION = 350_000
@@ -70,6 +83,11 @@ CANARY_STRONG_ALL_IN_WARN = 0.25
 CANARY_STRONG_ALL_IN_FAIL = 0.45
 CANARY_STRONG_CONTINUE_WARN = 0.80  # continue < this -> at least WARN
 CANARY_STRONG_CONTINUE_FAIL = 0.60  # continue < this -> FAIL (fold collapse)
+# Finiteness guard (B2/I5): a non-finite total loss skips the optimizer step.
+# Skipping forever is its own silent failure mode (the run "trains" while no
+# parameter ever moves), so this many CONSECUTIVE skips abort the run with a
+# nonzero exit.  The consecutive counter resets on any successful finite step.
+NONFINITE_SKIPS_ABORT_THRESHOLD = 50
 
 
 def epsilon_for_iteration(t: int, total: int) -> float:
@@ -138,8 +156,18 @@ def pick_device(arg: str) -> torch.device:
 #  Build initial game state
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_initial_state(n_seats: int = N_SEATS, hero_seat: int = 0) -> _DeepCFRGameState:
-    """Construct a fresh preflop _DeepCFRGameState with random hole cards."""
+def build_initial_state(n_seats: int = N_SEATS, hero_seat: int = 0,
+                        stacks: list[int] | None = None) -> _DeepCFRGameState:
+    """Construct a fresh preflop _DeepCFRGameState with random hole cards.
+
+    Seat 0 is the button and ``ring_order`` runs clockwise from it, exactly
+    like the engine's dealer-first ring.  ``stacks`` optionally sets per-seat
+    chip counts (curriculum); the default is the classic equal START_CHIPS.
+
+    Blind seats mirror core.engine.Table.play_hand: heads-up the BUTTON posts
+    the small blind (and acts first preflop; the BB acts first postflop);
+    with 3+ players seat 1 posts the SB and seat 2 the BB.
+    """
     deck = list(_FULL_DECK)
     random.shuffle(deck)
 
@@ -147,12 +175,20 @@ def build_initial_state(n_seats: int = N_SEATS, hero_seat: int = 0) -> _DeepCFRG
     for seat in range(n_seats):
         hole_cards[seat] = (deck.pop(), deck.pop())
 
-    stacks = [START_CHIPS] * n_seats
+    if stacks is None:
+        stacks = [START_CHIPS] * n_seats
+    else:
+        if len(stacks) != n_seats:
+            raise ValueError(
+                f"stacks has {len(stacks)} entries for n_seats={n_seats}")
+        stacks = [int(s) for s in stacks]
     committed = [0] * n_seats
 
-    # Post blinds (seats 1=SB, 2=BB for 6-handed)
-    sb_seat = 1 % n_seats
-    bb_seat = 2 % n_seats
+    # Post blinds (engine convention; min() handles stacks below the blind)
+    if n_seats == 2:
+        sb_seat, bb_seat = 0, 1   # heads-up: the button is the small blind
+    else:
+        sb_seat, bb_seat = 1, 2
     sb_amt = min(SMALL_BLIND, stacks[sb_seat])
     bb_amt = min(BIG_BLIND, stacks[bb_seat])
     stacks[sb_seat] -= sb_amt
@@ -161,8 +197,13 @@ def build_initial_state(n_seats: int = N_SEATS, hero_seat: int = 0) -> _DeepCFRG
     committed[bb_seat] = bb_amt
     pot = sb_amt + bb_amt
 
-    # Preflop action order: UTG first (seat 3 for 6-handed), then 4, 5, 0, 1, 2
-    seat_order = [(3 + i) % n_seats for i in range(n_seats)]
+    # Preflop action order from the shared engine helper: UTG first for 3+
+    # players (seat 3 clockwise from the button), button/SB first heads-up.
+    # A seat already all-in from posting its blind cannot act — the engine
+    # skips such seats without a history entry, so they are excluded here.
+    ring = list(range(n_seats))
+    seat_order = [s for s in street_action_order("preflop", ring)
+                  if stacks[s] > 0]
 
     return _DeepCFRGameState(
         pot=pot,
@@ -177,8 +218,48 @@ def build_initial_state(n_seats: int = N_SEATS, hero_seat: int = 0) -> _DeepCFRG
         history_events=[],
         deck_remaining=deck,
         big_blind=BIG_BLIND,
-        ring_order=list(range(n_seats)),
+        ring_order=ring,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Training-state curriculum (Fix 5 / I6)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def sample_stack_depth_chips(rng=random) -> int:
+    """One stack depth in CHIPS, log-uniform between 10 BB and 200 BB.
+
+    Log-uniform (rather than uniform) gives short-stack regimes — where
+    tournaments are actually decided — as much sample mass as deep ones.
+    """
+    log_lo = math.log(CURRICULUM_MIN_DEPTH_BB)
+    log_hi = math.log(CURRICULUM_MAX_DEPTH_BB)
+    depth_bb = math.exp(rng.uniform(log_lo, log_hi))
+    return max(1, int(round(depth_bb * BIG_BLIND)))
+
+
+def sample_curriculum_stacks(n_seats: int, rng=random) -> list:
+    """Per-seat chip stacks: 50% one shared depth, 50% independent depths."""
+    if rng.random() < CURRICULUM_SHARED_DEPTH_PROB:
+        depth = sample_stack_depth_chips(rng)
+        return [depth] * n_seats
+    return [sample_stack_depth_chips(rng) for _ in range(n_seats)]
+
+
+def sample_curriculum_state(iteration: int, rng=random):
+    """Random training state matching the eval distribution (I6).
+
+    Returns ``(state, hero_seat)``.  Player count is uniform over 2..6,
+    stacks are 10-200 BB log-uniform (shared or per-seat), blinds stay 5/10
+    (the features are BB-relative, so blind level is a pure scale factor),
+    and the hero seat keeps rotating with the iteration index.
+    """
+    n_seats = rng.choice(CURRICULUM_PLAYER_COUNTS)
+    hero_seat = (iteration - 1) % n_seats   # same rotation rule as before
+    stacks = sample_curriculum_stacks(n_seats, rng)
+    state = build_initial_state(n_seats=n_seats, hero_seat=hero_seat,
+                                stacks=stacks)
+    return state, hero_seat
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -278,7 +359,19 @@ def train_step(
     total_loss = r_loss + v_loss + s_loss
     optimizer.zero_grad()
     did_step = bool(total_loss.requires_grad)
-    if total_loss.requires_grad:
+
+    # Finiteness guard (B2/I5): clip_grad_norm_ does NOT protect against NaN —
+    # one NaN gradient makes the total norm NaN, the clip coefficient NaN, and
+    # then optimizer.step() writes NaN into EVERY parameter, silently
+    # corrupting all later checkpoints.  On a non-finite loss we skip the
+    # optimizer step entirely (parameters stay untouched) and report the skip
+    # so the training loop can count and, past a threshold, abort.
+    nonfinite_skip = False
+    if did_step and not bool(torch.isfinite(total_loss).item()):
+        nonfinite_skip = True
+        did_step = False
+
+    if did_step:
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=10.0)
         optimizer.step()
@@ -286,6 +379,7 @@ def train_step(
     return r_loss_val, v_loss_val, s_loss_val, {
         "heads_trained": heads_trained,
         "did_step": did_step,
+        "nonfinite_skip": nonfinite_skip,
     }
 
 
@@ -294,11 +388,23 @@ def train_step(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
-                    optimizer: torch.optim.Optimizer, losses: dict):
-    """Atomic save of training state."""
+                    optimizer: torch.optim.Optimizer, losses: dict,
+                    *, nonfinite_skips: int = 0,
+                    shadow_only: bool | None = None):
+    """Atomic save of training state.
+
+    ``nonfinite_skips`` is the cumulative count of optimizer steps skipped by
+    the finiteness guard (B2/I5) — persisted so an operator inspecting a
+    checkpoint can see whether the run hit numerical trouble.
+
+    ``shadow_only`` is stamped (as ``True``) only on FINAL checkpoints whose
+    ``iteration`` is below the all-in deploy gate — inference will permanently
+    mask all-in for such a model (B4/I9).  ``None`` omits the key (mid-run
+    checkpoints, where being below the gate is normal and transient).
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp_path = path + ".tmp"
-    torch.save({
+    payload = {
         "iteration": iteration,
         "config": bot.config,
         "network_state_dict": bot.network.state_dict(),
@@ -307,7 +413,11 @@ def save_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
         "all_in_deploy_iteration": bot.all_in_deploy_iteration,
         "all_in_full_release_iteration": bot.all_in_full_release_iteration,
         "losses": {k: v[-100:] for k, v in losses.items()},  # last 100 only
-    }, tmp_path)
+        "nonfinite_skips": int(nonfinite_skips),
+    }
+    if shadow_only is not None:
+        payload["shadow_only"] = bool(shadow_only)
+    torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
 
 
@@ -424,23 +534,34 @@ def decide_canary_status(canary: dict, iteration: int,
 
 def save_promoted_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
                              optimizer: torch.optim.Optimizer, losses: dict,
-                             status: str) -> str:
+                             status: str, *, nonfinite_skips: int = 0,
+                             shadow_only: bool | None = None) -> str:
     """Save according to canary promotion rules and return the written path."""
+    extra = {"nonfinite_skips": nonfinite_skips, "shadow_only": shadow_only}
     if status == "PASS":
-        save_checkpoint(path, iteration, bot, optimizer, losses)
-        save_checkpoint(safe_checkpoint_path(path), iteration, bot, optimizer, losses)
+        save_checkpoint(path, iteration, bot, optimizer, losses, **extra)
+        save_checkpoint(safe_checkpoint_path(path), iteration, bot, optimizer,
+                        losses, **extra)
         return path
     if status == "WARN":
         side_path = warn_checkpoint_path(path, iteration)
-        save_checkpoint(side_path, iteration, bot, optimizer, losses)
+        save_checkpoint(side_path, iteration, bot, optimizer, losses, **extra)
         return side_path
     raise RuntimeError(f"cannot save checkpoint for status {status!r}")
 
 
 def load_checkpoint(path: str, bot: DeepCFRBot,
-                    optimizer: torch.optim.Optimizer) -> int:
-    """Restore training state. Returns iteration number."""
+                    optimizer: torch.optim.Optimizer,
+                    meta_out: dict | None = None) -> int:
+    """Restore training state. Returns iteration number.
+
+    When ``meta_out`` is given, run-level metadata that does not belong on the
+    bot (currently the cumulative ``nonfinite_skips`` counter) is copied into
+    it so a resumed run can keep counting where the prior run stopped.
+    """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if meta_out is not None:
+        meta_out["nonfinite_skips"] = int(ckpt.get("nonfinite_skips", 0) or 0)
     bot.network.load_state_dict(ckpt["network_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     bot.all_in_warmup_iterations = int(
@@ -746,9 +867,17 @@ def run_training(args) -> dict:
     value_buf = ReservoirBuffer(capacity=1_000_000)
     sizing_buf = ReservoirBuffer(capacity=1_000_000)
 
+    # Cumulative + consecutive counters for the finiteness guard (B2/I5).
+    # "total" persists across resumes via checkpoint metadata; "consecutive"
+    # resets on any successful finite optimizer step.
+    nonfinite = {"total": 0, "consecutive": 0}
+
     start_iter = 0
     if args.resume and os.path.exists(args.resume):
-        start_iter = load_checkpoint(args.resume, bot, optimizer)
+        resume_meta: dict = {}
+        start_iter = load_checkpoint(args.resume, bot, optimizer,
+                                     meta_out=resume_meta)
+        nonfinite["total"] = int(resume_meta.get("nonfinite_skips", 0))
         bot.all_in_warmup_iterations = args.all_in_warmup_iterations
         bot.all_in_deploy_iteration = args.all_in_deploy_iteration
         bot.all_in_full_release_iteration = args.all_in_full_release_iteration
@@ -765,13 +894,24 @@ def run_training(args) -> dict:
     optimizer_steps_taken = 0
     head_steps = {"regret": 0, "value": 0, "sizing": 0}
 
-    # SIGINT handler for safe checkpoint
-    interrupted = [False]
-    def _sigint_handler(sig, frame):
-        interrupted[0] = True
-        print("\n[train_deep_cfr] SIGINT received — saving checkpoint …")
-    original_handler = signal.getsignal(signal.SIGINT)
-    signal.signal(signal.SIGINT, _sigint_handler)
+    # Signal handling (B5/M4): SIGINT *and* SIGTERM both request a graceful
+    # stop — finish the current traversal, save a final checkpoint, and report
+    # status="interrupted" so main() can exit 128+signum (130/143).  Pre-fix,
+    # SIGINT exited 0 with status "complete" (an orchestrator keying on the
+    # exit code would treat an under-trained model as finished) and SIGTERM
+    # was untrapped (an OS kill lost the in-flight checkpoint).
+    interrupted = {"flag": False, "signum": None}
+
+    def _signal_handler(signum, frame):
+        interrupted["flag"] = True
+        interrupted["signum"] = signum
+        print(f"\n[train_deep_cfr] {signal.Signals(signum).name} received — "
+              f"saving checkpoint …", flush=True)
+
+    original_sigint = signal.getsignal(signal.SIGINT)
+    original_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     print("=" * 70)
     print("TRAINING DEEP CFR PLUS")
@@ -783,6 +923,10 @@ def run_training(args) -> dict:
     print(f"  Batch size:         {args.batch_size}")
     print(f"  Learning rate:      {args.lr}")
     print(f"  AIVAT sims:         {args.aivat_sims}")
+    print(f"  Curriculum:         players {CURRICULUM_PLAYER_COUNTS[0]}-"
+          f"{CURRICULUM_PLAYER_COUNTS[-1]}, "
+          f"{CURRICULUM_MIN_DEPTH_BB}-{CURRICULUM_MAX_DEPTH_BB} BB "
+          f"log-uniform (50% shared / 50% per-seat depths)")
     print(f"  Exploration eps:    0.30 → 0.05")
     print(f"  All-in shadow:      before iteration {args.all_in_warmup_iterations}")
     print(f"  All-in deploy gate: before iteration {args.all_in_deploy_iteration}")
@@ -798,12 +942,70 @@ def run_training(args) -> dict:
 
     t0 = _time.monotonic()
     abort_without_save = False
+    nonfinite_abort = False
     last_checkpoint_iter = None
     last_checkpoint_written = None
+    # Iteration accounting (4.1): the number of FULLY completed iterations.
+    # The loop variable cannot be trusted for this — a signal breaks at the
+    # TOP of iteration t+1, where the loop variable already reads t+1 even
+    # though only t iterations ran (and it does not exist at all if the
+    # signal lands before the first iteration).  Every report and checkpoint
+    # stamp below uses this counter, so --resume continues exactly where the
+    # run stopped instead of silently skipping one iteration.
+    completed_iter = start_iter
 
-    def checkpoint_with_canary(iteration: int) -> tuple[str, str]:
+    def final_shadow_stamp(iteration: int) -> bool | None:
+        """Shadow-only stamp decision for a FINAL checkpoint (B4/I9).
+
+        A final checkpoint below the all-in deploy gate yields a model whose
+        inference permanently masks all-in.  Warn loudly and stamp the
+        checkpoint metadata, but still save — smoke runs are intentionally
+        short and must keep working (warn-and-stamp, NOT refuse).  Returns
+        True (stamp) or None (omit the key entirely).
+        """
+        if iteration >= bot.all_in_deploy_iteration:
+            return None
+        print(
+            f"\n[WARN] FINAL checkpoint at iteration {iteration} is below "
+            f"the all-in deploy gate ({bot.all_in_deploy_iteration}).\n"
+            f"       Inference for this model will PERMANENTLY mask the "
+            f"all-in action — it is a SHADOW-ONLY artifact, not a "
+            f"deployable bot.\n"
+            f"       Stamping checkpoint metadata \"shadow_only\": true. "
+            f"Train with --iterations >= "
+            f"{bot.all_in_deploy_iteration} (TRAINING_PLAN step 7 uses "
+            f"1,000,000) for a deployable model.\n",
+            flush=True,
+        )
+        return True
+
+    def save_emergency_checkpoint(iteration: int, reason: str) -> str:
+        """Final save for an interrupted/aborted run — NEVER runs the canary.
+
+        SIGINT/SIGTERM and the non-finite-loss abort must always preserve
+        work for --resume and post-mortem.  Routing them through
+        checkpoint_with_canary would (a) lose the checkpoint outright on a
+        FAIL verdict and (b) spend ~150 bot.act() probe calls inside a
+        SIGTERM grace window where a supervisor may escalate to SIGKILL.
+        The canary still gates every PROMOTED checkpoint: the deploy-grade
+        artifacts remain the canary-vetted save/safe pair, and this save
+        only refreshes args.save_path (it never touches the .safe copy).
+        """
+        shadow_only = final_shadow_stamp(iteration)  # the run ends here
+        save_checkpoint(args.save_path, iteration, bot, optimizer, losses,
+                        nonfinite_skips=nonfinite["total"],
+                        shadow_only=shadow_only)
+        print(f"[train_deep_cfr] Emergency checkpoint ({reason}) saved to "
+              f"{args.save_path} — collapse canary skipped.", flush=True)
+        return args.save_path
+
+    def checkpoint_with_canary(iteration: int, *,
+                               final: bool = False) -> tuple[str, str]:
+        shadow_only = final_shadow_stamp(iteration) if final else None
         if args.disable_collapse_canary:
-            save_checkpoint(args.save_path, iteration, bot, optimizer, losses)
+            save_checkpoint(args.save_path, iteration, bot, optimizer, losses,
+                            nonfinite_skips=nonfinite["total"],
+                            shadow_only=shadow_only)
             return "DISABLED", args.save_path
 
         canary = quick_canary_probe(bot, device, current_iteration=iteration)
@@ -869,16 +1071,20 @@ def run_training(args) -> dict:
             optimizer,
             losses,
             status,
+            nonfinite_skips=nonfinite["total"],
+            shadow_only=shadow_only,
         )
         return status, written
 
     try:
         for t in range(start_iter + 1, args.iterations + 1):
-            if interrupted[0]:
+            if interrupted["flag"]:
                 break
 
-            hero_seat = (t - 1) % N_SEATS
-            state = build_initial_state(n_seats=N_SEATS, hero_seat=hero_seat)
+            # Curriculum sampling (Fix 5 / I6): random player count 2-6 and
+            # 10-200 BB stack depths so heads-up / short-stack endgames are
+            # in-distribution, with the original hero-seat rotation.
+            state, hero_seat = sample_curriculum_state(t)
 
             bot.network.eval()
             eps = epsilon_for_iteration(t, args.iterations)
@@ -899,6 +1105,11 @@ def run_training(args) -> dict:
                 allow_all_in=allow_all_in,
                 all_in_policy_probability=all_in_policy_probability,
             )
+            # Iteration t's traversal is done — count it.  The gradient step
+            # and checkpoint below are interval-based aggregates over the
+            # buffers, not part of "did iteration t run", so an abort inside
+            # them still reports t completed iterations.
+            completed_iter = t
 
             # Periodic gradient steps
             if t % args.update_interval == 0:
@@ -908,21 +1119,54 @@ def run_training(args) -> dict:
                     regret_buf, value_buf, sizing_buf,
                     args.batch_size, device,
                 )
-                losses["regret"].append(r_loss)
-                losses["value"].append(v_loss)
-                losses["sizing"].append(s_loss)
-                if step_info["did_step"]:
-                    optimizer_steps_taken += 1
-                for head, trained in step_info["heads_trained"].items():
-                    if trained:
-                        head_steps[head] += 1
-                if step_info["heads_trained"]["regret"]:
-                    gradient_steps_taken += 1
+                if step_info.get("nonfinite_skip"):
+                    # Finiteness guard tripped (B2/I5): parameters were left
+                    # untouched.  Log the three component losses so the bad
+                    # head is identifiable, and keep the NaN out of the loss
+                    # history (checkpoints store that history).
+                    nonfinite["total"] += 1
+                    nonfinite["consecutive"] += 1
+                    print(
+                        f"[WARN] iter {t}: non-finite loss — optimizer step "
+                        f"SKIPPED (r={r_loss}, v={v_loss}, s={s_loss}; "
+                        f"consecutive={nonfinite['consecutive']}, "
+                        f"total={nonfinite['total']})",
+                        flush=True,
+                    )
+                    if nonfinite["consecutive"] >= NONFINITE_SKIPS_ABORT_THRESHOLD:
+                        print(
+                            f"[ABORT] {nonfinite['consecutive']} consecutive "
+                            f"non-finite losses (threshold "
+                            f"{NONFINITE_SKIPS_ABORT_THRESHOLD}) — training "
+                            f"signal is broken, aborting. Parameters are "
+                            f"finite (every bad step was skipped); the final "
+                            f"checkpoint is still saved.",
+                            flush=True,
+                        )
+                        nonfinite_abort = True
+                        break
+                else:
+                    losses["regret"].append(r_loss)
+                    losses["value"].append(v_loss)
+                    losses["sizing"].append(s_loss)
+                    if step_info["did_step"]:
+                        optimizer_steps_taken += 1
+                        # A successful finite step ends any non-finite streak.
+                        nonfinite["consecutive"] = 0
+                    for head, trained in step_info["heads_trained"].items():
+                        if trained:
+                            head_steps[head] += 1
+                    if step_info["heads_trained"]["regret"]:
+                        gradient_steps_taken += 1
 
-            # Checkpoint
+            # Checkpoint.  A periodic save landing exactly on the last
+            # iteration IS the run's final checkpoint — mark it as such so
+            # the shadow-only stamp/warning (B4/I9) cannot be skipped just
+            # because --iterations is a multiple of --checkpoint-interval.
             if t % args.checkpoint_interval == 0:
                 try:
-                    _, last_checkpoint_written = checkpoint_with_canary(t)
+                    _, last_checkpoint_written = checkpoint_with_canary(
+                        t, final=(t >= args.iterations))
                     last_checkpoint_iter = t
                 except RuntimeError:
                     # All-in collapse canary tripped mid-run.  Break out of the
@@ -940,12 +1184,49 @@ def run_training(args) -> dict:
                                elapsed)
 
     except KeyboardInterrupt:
-        interrupted[0] = True
+        # Belt-and-braces: our handler replaces the default SIGINT behavior,
+        # so this only triggers for a KeyboardInterrupt raised by other means.
+        interrupted["flag"] = True
+        interrupted["signum"] = interrupted["signum"] or signal.SIGINT
         print("\n[train_deep_cfr] KeyboardInterrupt — saving checkpoint …")
     finally:
-        # Final save
-        final_iter = min(t, args.iterations) if 't' in dir() else start_iter
-        if abort_without_save:
+        # Final save.  completed_iter — NOT the loop variable — is the number
+        # of fully completed iterations (see its definition above), so the
+        # report and checkpoint metadata never claim an iteration that only
+        # started.
+        final_iter = completed_iter
+        if interrupted["flag"] or nonfinite_abort:
+            # Emergency save (4.1): unconditional and canary-free.  This may
+            # re-save an iteration a periodic checkpoint already covered —
+            # cheap, and it guarantees args.save_path holds the latest state
+            # with the correct final shadow_only stamp for --resume.
+            #
+            # Checked BEFORE abort_without_save on purpose (4.2): a signal
+            # can land while a periodic canary probe is mid-flight, and when
+            # that probe then FAILs, both flags are set at once.  The run is
+            # still an interrupt — the result tail below reports
+            # status="interrupted" — so the save policy must match (pre-4.2
+            # the abort branch won and the "interrupted" run saved nothing).
+            # The FAILed canary still did its job: it kept this network out
+            # of the promoted save/.safe pair; this save only refreshes
+            # args.save_path.
+            reason = ("nonfinite_abort" if nonfinite_abort else
+                      signal.Signals(int(interrupted["signum"]
+                                         or signal.SIGINT)).name)
+            last_checkpoint_written = save_emergency_checkpoint(
+                final_iter, reason)
+            if abort_without_save:
+                # Post-mortem breadcrumb for the double-flag case above.
+                print("[train_deep_cfr] NOTE: a periodic collapse-canary "
+                      "FAIL was also observed this run — the emergency "
+                      "checkpoint is for --resume/post-mortem only; the "
+                      ".safe copy remains the last canary-vetted artifact.",
+                      flush=True)
+        elif abort_without_save:
+            # An actual canary probe FAILED on this exact network at a
+            # periodic checkpoint, and NO emergency (signal / non-finite
+            # abort) is active: the policy is collapsed, so refusing to
+            # save it (and stopping) IS the intended behavior.
             print(
                 "[ABORT] Final checkpoint not saved because the all-in "
                 "collapse canary tripped.",
@@ -953,13 +1234,15 @@ def run_training(args) -> dict:
             )
         elif final_iter != last_checkpoint_iter:
             try:
-                _, last_checkpoint_written = checkpoint_with_canary(final_iter)
+                _, last_checkpoint_written = checkpoint_with_canary(
+                    final_iter, final=True)
             except RuntimeError as exc:
                 print(f"[ABORT] Final checkpoint not saved: {exc}", flush=True)
                 abort_without_save = True
         else:
             _ = last_checkpoint_written
-        signal.signal(signal.SIGINT, original_handler)
+        signal.signal(signal.SIGINT, original_sigint)
+        signal.signal(signal.SIGTERM, original_sigterm)
 
     elapsed_total = _time.monotonic() - t0
     if gradient_steps_taken == 0:
@@ -971,22 +1254,68 @@ def run_training(args) -> dict:
             f"--iterations {args.iterations}. Try --batch-size 32 for short runs."
         )
 
-    if abort_without_save:
+    if interrupted["flag"]:
+        # SIGINT/SIGTERM: the finally block above already saved the final
+        # checkpoint via the canary-free emergency path (4.1) — an interrupt
+        # can never lose work to a FAILing canary probe, even one that FAILs
+        # while the interrupt arrives (the emergency branch outranks
+        # abort_without_save, 4.2).  Report "interrupted" — never
+        # "complete" — and let main() exit 128+signum.
+        signum = int(interrupted["signum"] or signal.SIGINT)
         print(f"\n{'='*70}")
-        print("Training aborted.")
+        print(f"Training interrupted ({signal.Signals(signum).name}).")
         print(f"  Iterations reached: {final_iter}")
         print(f"  Gradient steps:     {gradient_steps_taken}")
         print(f"  Optimizer steps:    {optimizer_steps_taken}")
+        print(f"  Non-finite skips:   {nonfinite['total']}")
         print(f"  Wall-clock:         {elapsed_total:.1f}s")
         print(f"  Last checkpoint:    {last_checkpoint_written or '<none>'}")
         print(f"{'='*70}")
         return {
-            "status": "aborted",
+            "status": "interrupted",
+            "signal": signum,
             "final_iter": final_iter,
             "gradient_steps": gradient_steps_taken,
             "gradient_steps_taken": gradient_steps_taken,
             "optimizer_steps_taken": optimizer_steps_taken,
             "head_steps": head_steps,
+            "nonfinite_skips": nonfinite["total"],
+            "losses": losses,
+            "regret_buf": regret_buf,
+            "value_buf": value_buf,
+            "sizing_buf": sizing_buf,
+            "bot": bot,
+            "optimizer": optimizer,
+            "elapsed": elapsed_total,
+            "checkpoint_saved": last_checkpoint_written,
+        }
+
+    if abort_without_save or nonfinite_abort:
+        # Two distinct abort modes share the "aborted" status:
+        #   collapse_canary — policy collapsed; final checkpoint NOT saved.
+        #   nonfinite_loss  — too many consecutive non-finite losses; the
+        #                     parameters are finite (bad steps were skipped),
+        #                     so the finally block above did save a final
+        #                     checkpoint.
+        abort_reason = "collapse_canary" if abort_without_save else "nonfinite_loss"
+        print(f"\n{'='*70}")
+        print(f"Training aborted ({abort_reason}).")
+        print(f"  Iterations reached: {final_iter}")
+        print(f"  Gradient steps:     {gradient_steps_taken}")
+        print(f"  Optimizer steps:    {optimizer_steps_taken}")
+        print(f"  Non-finite skips:   {nonfinite['total']}")
+        print(f"  Wall-clock:         {elapsed_total:.1f}s")
+        print(f"  Last checkpoint:    {last_checkpoint_written or '<none>'}")
+        print(f"{'='*70}")
+        return {
+            "status": "aborted",
+            "abort_reason": abort_reason,
+            "final_iter": final_iter,
+            "gradient_steps": gradient_steps_taken,
+            "gradient_steps_taken": gradient_steps_taken,
+            "optimizer_steps_taken": optimizer_steps_taken,
+            "head_steps": head_steps,
+            "nonfinite_skips": nonfinite["total"],
             "losses": losses,
             "regret_buf": regret_buf,
             "value_buf": value_buf,
@@ -1003,6 +1332,7 @@ def run_training(args) -> dict:
     print(f"  Gradient steps:   {gradient_steps_taken}")
     print(f"  Optimizer steps:  {optimizer_steps_taken}")
     print(f"  Head steps:       regret={head_steps['regret']}, value={head_steps['value']}, sizing={head_steps['sizing']}")
+    print(f"  Non-finite skips: {nonfinite['total']}")
     print(f"  Buffer sizes:     regret={len(regret_buf)}, value={len(value_buf)}, sizing={len(sizing_buf)}")
     print(f"  Wall-clock:       {elapsed_total:.1f}s")
     print(f"  Checkpoint saved: {last_checkpoint_written or args.save_path}")
@@ -1015,6 +1345,7 @@ def run_training(args) -> dict:
         "gradient_steps_taken": gradient_steps_taken,
         "optimizer_steps_taken": optimizer_steps_taken,
         "head_steps": head_steps,
+        "nonfinite_skips": nonfinite["total"],
         "losses": losses,
         "regret_buf": regret_buf,
         "value_buf": value_buf,
@@ -1034,7 +1365,18 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Train Deep CFR Plus bot via external-sampling CFR traversals")
     parser.add_argument("--variant", choices=["small", "large"], required=True)
-    parser.add_argument("--iterations", type=int, default=100_000)
+    # Default raised from 100k (B4/I9): 100k sat BELOW the 150k all-in deploy
+    # gate, so a default run produced a checkpoint whose inference permanently
+    # masks all-in.  1M matches TRAINING_PLAN step 7.  Short runs still work —
+    # an under-gate FINAL checkpoint is loudly warned about and stamped
+    # "shadow_only" instead of being refused (smoke tests run ~100 iterations).
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1_000_000,
+        help="Training iterations (default 1,000,000; below "
+             f"--all-in-deploy-iteration the final model masks all-in)",
+    )
     parser.add_argument("--update-interval", type=int, default=100)
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -1078,7 +1420,13 @@ def main():
     args = parse_args()
     os.makedirs(os.path.dirname(args.save_path) or ".", exist_ok=True)
     result = run_training(args)
-    if result.get("status") != "complete":
+    status = result.get("status")
+    if status == "interrupted":
+        # Conventional shell exit code for death-by-signal: 128 + signum
+        # (130 = SIGINT, 143 = SIGTERM), so orchestrators can tell an
+        # interrupted run from a completed (0) or aborted (1) one.
+        raise SystemExit(128 + int(result.get("signal") or signal.SIGINT))
+    if status != "complete":
         raise SystemExit(1)
 
 

@@ -401,13 +401,19 @@ try:
         print("  [FAIL] — doc smoke emitted zero-step warning")
         PASS = False
 
+    # Oversized-batch short run: the regret buffer can never reach the batch
+    # size, so no regret gradient step ever happens and the zero-step warning
+    # must fire.  (This used the default --batch-size 256 before the Phase-4
+    # curriculum; deep-stack/heads-up curriculum states produce enough decision
+    # nodes per traversal that 256 now fills within 50 iterations, so the
+    # zero-step condition is forced with an explicitly unreachable batch size.)
     with redirect_stdout(io.StringIO()) as warn_out:
         warn_args = parse_args([
             "--variant", "small",
             "--iterations", "50",
             "--update-interval", "10",
             "--checkpoint-interval", "25",
-            "--batch-size", "256",
+            "--batch-size", "100000",
             "--aivat-sims", "50",
             "--save-path", warn_path,
             "--device", "cpu",
@@ -415,11 +421,11 @@ try:
         ])
         warn_result = run_training(warn_args)
     warn_text = warn_out.getvalue()
-    print(f"  Default-size short run gradient steps: {warn_result['gradient_steps_taken']}")
+    print(f"  Oversized-batch short run gradient steps: {warn_result['gradient_steps_taken']}")
     if warn_result["gradient_steps_taken"] == 0:
-        print("  [PASS] — default-size short run has 0 regret gradient steps")
+        print("  [PASS] — oversized-batch short run has 0 regret gradient steps")
     else:
-        print("  [FAIL] — default-size short run unexpectedly trained regret")
+        print("  [FAIL] — oversized-batch short run unexpectedly trained regret")
         PASS = False
     if "[WARN] Training completed with 0 gradient steps" in warn_text:
         print("  [PASS] — zero-step warning emitted")
