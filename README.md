@@ -142,7 +142,7 @@ python training/train_multi_deep_rl_bot.py --episodes 50000
 
 ### CFR Bot
 
-Game-theoretic bot using Monte Carlo Counterfactual Regret Minimization (MCCFR). Iteratively reduces regret across sampled game trajectories until its strategy converges toward a Nash equilibrium. Maintains a persistent regret table (not a neural network) that updates across hands.
+Game-theoretic bot using Monte Carlo Counterfactual Regret Minimization (MCCFR). Iteratively reduces regret across sampled game trajectories. (In this six-player, abstracted, decision-rooted setup that approximates — but does not provably converge to — equilibrium play; CFR's Nash guarantee applies to two-player zero-sum games without such approximations.) Maintains a persistent regret table (not a neural network) that updates across hands.
 
 Key design details:
 - **Card abstraction**: 10 preflop buckets (hand-strength tiers) and 10 postflop buckets (Monte Carlo equity percentiles from 20 rollouts).
