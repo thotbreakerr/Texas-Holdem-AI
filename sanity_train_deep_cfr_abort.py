@@ -1,78 +1,88 @@
 """
-Regression for the mid-run canary-abort signaling bug.
+Regressions for canary maturity and mid-run abort signaling.
 
-Bug (pre-fix): when the all-in collapse canary FAILed at a mid-run checkpoint,
-the handler set abort_without_save=True and did a bare `raise`.  The outer try
-only caught KeyboardInterrupt, so the RuntimeError propagated uncaught and the
-documented `return {"status": "aborted", ...}` path was unreachable for the
-mid-run case.
+Pre-deploy, every metric is diagnostic: the all-in row is intentionally
+untrained during shadow and must not kill the first checkpoint.  At/after the
+deploy boundary, the same forced FAIL must abort without saving.
 
-Fix: the handler `break`s instead, so the finally prints the ABORT footer and
-run_training returns status="aborted" (which main() maps to a nonzero exit).
-This test forces a mid-run canary FAIL and asserts run_training RETURNS the
-aborted dict rather than raising.
+The mature check also pins the older signaling fix: run_training returns the
+documented aborted dict rather than propagating RuntimeError.
 """
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/Users/jaroslavaupart/Desktop/Projects/Texas-Holdem-AI")
+REPO = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, REPO)
 
 import training.train_deep_cfr as tdc
 
 
 def run():
     PASS = True
-    tmp = tempfile.mkdtemp()
-    save_path = os.path.join(tmp, "deep_cfr_probe.pt")
-
-    # Force every canary probe to look like an all-in collapse → classify FAIL.
     orig_probe = tdc.quick_canary_probe
     tdc.quick_canary_probe = lambda *a, **k: {"raw_all_in": 0.99,
                                               "search_all_in": 0.99}
 
-    # checkpoint fires at t=2 (mid-run; iterations=4) and must trip the canary.
-    args = tdc.parse_args([
-        "--variant", "small",
-        "--iterations", "4",
-        "--checkpoint-interval", "2",
-        "--update-interval", "2",
-        "--batch-size", "8",
-        "--save-path", save_path,
-        "--device", "cpu",
-    ])
-
-    raised = None
-    result = None
     try:
-        result = tdc.run_training(args)
-    except Exception as e:  # noqa: BLE001 — we explicitly test for non-raising
-        raised = e
+        with tempfile.TemporaryDirectory() as tmp:
+            early_path = os.path.join(tmp, "early.pt")
+            early_args = tdc.parse_args([
+                "--variant", "small",
+                "--iterations", "4",
+                "--checkpoint-interval", "2",
+                "--update-interval", "2",
+                "--batch-size", "8",
+                "--save-path", early_path,
+                "--device", "cpu",
+            ])
+            early = tdc.run_training(early_args)
+            early_saved = os.path.exists(early_path)
+
+            mature_path = os.path.join(tmp, "mature.pt")
+            mature_args = tdc.parse_args([
+                "--variant", "small",
+                "--iterations", "4",
+                "--checkpoint-interval", "2",
+                "--update-interval", "2",
+                "--batch-size", "8",
+                "--all-in-deploy-iteration", "0",
+                "--save-path", mature_path,
+                "--device", "cpu",
+            ])
+            raised = None
+            mature = None
+            try:
+                mature = tdc.run_training(mature_args)
+            except Exception as exc:  # noqa: BLE001
+                raised = exc
+            mature_saved = os.path.exists(mature_path)
     finally:
         tdc.quick_canary_probe = orig_probe
 
+    if early.get("status") == "complete" and early_saved:
+        print("[CHECK 1] PASS — pre-deploy FAIL is diagnostic and checkpoint saved")
+    else:
+        PASS = False
+        print(f"[CHECK 1] FAIL — early status={early.get('status')!r}, "
+              f"checkpoint={early_saved}")
+
     if raised is not None:
         PASS = False
-        print(f"[CHECK 1] FAIL — run_training raised instead of returning: "
+        print(f"[CHECK 2] FAIL — mature run raised instead of returning: "
               f"{type(raised).__name__}: {raised}")
     else:
-        print("[CHECK 1] PASS — run_training returned without raising")
+        print("[CHECK 2] PASS — mature canary abort returned without raising")
 
-    if result is not None and result.get("status") == "aborted":
-        print(f"[CHECK 2] PASS — status='aborted' (final_iter={result.get('final_iter')})")
+    if (mature is not None and mature.get("status") == "aborted"
+            and mature.get("abort_reason") == "collapse_canary"
+            and mature.get("checkpoint_saved") is None
+            and not mature_saved):
+        print(f"[CHECK 3] PASS — mature FAIL aborted at iter "
+              f"{mature.get('final_iter')} without saving")
     else:
         PASS = False
-        got = result.get("status") if result else None
-        print(f"[CHECK 2] FAIL — status is {got!r}, expected 'aborted'")
-
-    # The aborted result must report the (lack of) last checkpoint so callers
-    # can recover; with a FAIL on the very first checkpoint, nothing was saved.
-    if result is not None and "checkpoint_saved" in result:
-        print(f"[CHECK 3] PASS — reports checkpoint_saved="
-              f"{result.get('checkpoint_saved')!r}")
-    else:
-        PASS = False
-        print("[CHECK 3] FAIL — aborted result missing checkpoint_saved")
+        print(f"[CHECK 3] FAIL — mature result={mature}, file={mature_saved}")
 
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")

@@ -885,7 +885,9 @@ def test_new_chip_accounting_and_training_failure_contracts() -> None:
         lr=1e-4,
         aivat_sims=1,
         all_in_warmup_iterations=ALL_IN_WARMUP_ITERATIONS,
-        all_in_deploy_iteration=150_000,
+        # Force canary maturity at iteration 0; pre-deploy metrics are
+        # intentionally diagnostic only.
+        all_in_deploy_iteration=0,
         all_in_full_release_iteration=ALL_IN_FULL_RELEASE_ITERATION,
         detox_all_in_on_resume=False,
         disable_collapse_canary=False,

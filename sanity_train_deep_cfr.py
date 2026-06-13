@@ -972,46 +972,49 @@ try:
         print("  [FAIL] — strong_continue fold-collapse classification wrong")
         PASS = False
 
-    # Deferred enforcement: the extra metrics (PFR/avg-raise/strong-all-in/
-    # strong-continue) must NOT change the status before iteration >=
-    # deploy_iteration, but MUST once the model is mature.  A clean all-in canary
-    # + a PFR-over-fail metric:
+    # Deferred enforcement: ALL metrics must remain diagnostic before
+    # iteration >= deploy_iteration, then become blocking once the model is
+    # mature.  The all-in output row is intentionally untrained during shadow,
+    # so a transiently dominant raw score must not kill the first checkpoint.
+    # A clean all-in canary + a PFR-over-fail metric:
     #   - early (iter < deploy)  -> PASS (reported only, no false abort)
     #   - mature (iter >= deploy)-> FAIL
-    # The always-enforced all-in canary is unaffected by the deploy boundary.
+    # A collapsed all-in signature follows the same maturity boundary.
     DEPLOY = 100
     clean_high_pfr = {"raw_all_in": 0.0, "search_all_in": 0.0, "preflop_pfr": 0.60}
     collapsed_allin = {"raw_all_in": 0.99, "search_all_in": 0.99, "preflop_pfr": 0.0}
     early = decide_canary_status(clean_high_pfr, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
     mature = decide_canary_status(clean_high_pfr, iteration=DEPLOY, deploy_iteration=DEPLOY)
     allin_early = decide_canary_status(collapsed_allin, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
+    allin_mature = decide_canary_status(
+        collapsed_allin, iteration=DEPLOY, deploy_iteration=DEPLOY)
     print(f"  deferral: PFR=60% early(status,enforced)=({early[0]},{early[5]}), "
-          f"mature=({mature[0]},{mature[5]}); all-in collapse early={allin_early[0]}")
+          f"mature=({mature[0]},{mature[5]}); all-in collapse "
+          f"early={allin_early[0]}, mature={allin_mature[0]}")
     if (early[0] == "PASS" and early[5] is False
             and mature[0] == "FAIL" and mature[5] is True
-            and allin_early[0] == "FAIL"):
-        print("  [PASS] — extra-metric enforcement deferred to iter >= deploy; "
-              "all-in canary still FAILs pre-deploy")
+            and allin_early[0] == "PASS"
+            and allin_mature[0] == "FAIL"):
+        print("  [PASS] — all canary metrics are diagnostic pre-deploy and "
+              "enforced once mature")
     else:
-        print("  [FAIL] — deferred extra-metric enforcement wrong")
+        print("  [FAIL] — maturity-aligned canary enforcement wrong")
         PASS = False
 
-    # The fold-collapse metric follows the SAME deferral, and an all-in collapse
-    # must still FAIL independently (proving the two signatures are separable in
-    # the live canary, not just the probe): a clean all-in canary + 0%
-    # strong_continue is reported-only (PASS) pre-deploy and FAIL once mature.
+    # Fold collapse follows the same deferral and still fails independently
+    # after maturity.
     fold_metrics = {"raw_all_in": 0.0, "search_all_in": 0.0, "strong_continue": 0.0}
     fold_early = decide_canary_status(fold_metrics, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
     fold_mature = decide_canary_status(fold_metrics, iteration=DEPLOY, deploy_iteration=DEPLOY)
     print(f"  fold deferral: strong_continue=0% "
           f"early(status,enforced)=({fold_early[0]},{fold_early[5]}), "
           f"mature=({fold_mature[0]},{fold_mature[5]}); "
-          f"all-in collapse early(independent)={allin_early[0]}")
+          f"all-in collapse mature(independent)={allin_mature[0]}")
     if (fold_early[0] == "PASS" and fold_early[5] is False
             and fold_mature[0] == "FAIL" and fold_mature[5] is True
-            and allin_early[0] == "FAIL"):
+            and allin_mature[0] == "FAIL"):
         print("  [PASS] — strong_continue enforcement deferred to iter >= deploy; "
-              "all-in collapse still FAILs independently")
+              "mature all-in collapse still FAILs independently")
     else:
         print("  [FAIL] — deferred strong_continue enforcement wrong")
         PASS = False

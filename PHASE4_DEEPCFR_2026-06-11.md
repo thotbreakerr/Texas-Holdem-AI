@@ -386,3 +386,28 @@ below), then fixed.
 | `sanity_action_history.py` | ALL PASS |
 | `py_compile` (trainer + signals gate) | OK |
 | `git diff --check` | clean |
+
+# Phase 4.3 addendum — shadow-phase canary maturity (2026-06-12)
+
+The first fresh Phase-4 curriculum run exposed a canary-policy mismatch at
+iteration 5,000: the run was still in the all-in shadow phase (all-in excluded
+from regret targets and masked at inference), but the raw/search all-in canary
+was already blocking. Shared-encoder updates can therefore make the
+intentionally untrained all-in row transiently dominate and abort a healthy
+run before the row becomes meaningful. Historical logs confirm the behavior
+was seed-dependent: one earlier run passed 25k and falsely aborted at 30k,
+while another seed survived the same shadow phase.
+
+**Change:** all canary metrics are diagnostic before
+`all_in_deploy_iteration` (150k by default), and the worst would-be status is
+printed. Periodic checkpoints continue to update the resumable primary/safe
+artifacts. At and after the deploy boundary, the complete canary is enforced
+unchanged: WARN writes only a side checkpoint and FAIL aborts without saving.
+Mid-run FAIL handling now also prints the full exception with exact metrics and
+threshold reasons instead of only the generic final footer.
+
+**Regression coverage:** `sanity_train_deep_cfr_abort.py` now proves both
+sides with a forced 99% all-in probe: pre-deploy completes and saves; mature
+training aborts without saving and returns the documented result. The signal
+race gate forces its canary to maturity so Phase 4.2's double-flag behavior
+remains covered.

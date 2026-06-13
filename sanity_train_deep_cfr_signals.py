@@ -294,9 +294,10 @@ def interrupt_during_failing_canary_check() -> bool:
             "--checkpoint-interval", str(CKPT_AT),  # periodic canary fires
             "--batch-size", "8",
             "--aivat-sims", "1",
+            "--all-in-deploy-iteration", str(CKPT_AT),
             "--save-path", save_path,
             "--device", "cpu",
-            # collapse canary deliberately ENABLED — it must actually FAIL
+            # Canary deliberately ENABLED and mature — it must actually FAIL.
         ])
         with redirect_stdout(io.StringIO()):
             result = tdc.run_training(args)
@@ -322,9 +323,9 @@ def interrupt_during_failing_canary_check() -> bool:
               f"{CKPT_AT} completed")
     if os.path.exists(save_path):
         ckpt = torch.load(save_path, map_location="cpu", weights_only=False)
-        if ckpt.get("iteration") == CKPT_AT and ckpt.get("shadow_only") is True:
+        if ckpt.get("iteration") == CKPT_AT and not ckpt.get("shadow_only", False):
             print("  [PASS] — emergency checkpoint saved despite the FAILing "
-                  "canary (correct iteration + shadow stamp)")
+                  "canary (correct mature iteration)")
         else:
             ok = False
             print(f"  [FAIL] — emergency checkpoint metadata wrong "

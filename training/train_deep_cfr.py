@@ -510,26 +510,26 @@ def decide_canary_status(canary: dict, iteration: int,
                          deploy_iteration: int) -> tuple:
     """Combine the all-in canary and the extra health metrics into one status.
 
-    The raw/search all-in canary (``classify_canary``) is enforced at EVERY
-    iteration — unchanged.  The extra metrics (PFR / avg-raise / strong-all-in)
-    are only ENFORCED once the model is mature enough to make them meaningful:
-    ``iteration >= deploy_iteration`` (the same boundary the all-in row uses to
-    leave the inference mask).  Before that they are computed and reported but
-    do NOT change the status — an undertrained net's PFR saturates at ~85-100%
-    (verified empirically) and would otherwise force false aborts at the first
-    checkpoint.
+    Every metric is only ENFORCED once the model is mature enough to make the
+    probe meaningful: ``iteration >= deploy_iteration`` (the same boundary the
+    all-in row uses to leave the inference mask).  Before that, metrics are
+    computed and reported but do NOT change the status.  In particular, the
+    all-in output row is intentionally excluded from regret targets during the
+    shadow phase, so shared-encoder updates can make its untrained raw score
+    transiently dominate.  Enforcing that score caused seed-dependent aborts
+    at the first checkpoint even though inference still masked all-in.
 
     Returns ``(status, base_status, extra_status, extra_failed, extra_warned,
-    extra_enforced)``.
+    metrics_enforced)``.
     """
     base_status = classify_canary(
         canary.get("raw_all_in", 0.0), canary.get("search_all_in", 0.0))
     extra_status, extra_failed, extra_warned = classify_extra_canary_metrics(canary)
-    extra_enforced = iteration >= deploy_iteration
-    status = (_worst_canary_status(base_status, extra_status)
-              if extra_enforced else base_status)
+    metrics_enforced = iteration >= deploy_iteration
+    diagnostic_status = _worst_canary_status(base_status, extra_status)
+    status = diagnostic_status if metrics_enforced else "PASS"
     return (status, base_status, extra_status, extra_failed, extra_warned,
-            extra_enforced)
+            metrics_enforced)
 
 
 def save_promoted_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
@@ -1012,14 +1012,12 @@ def run_training(args) -> dict:
         raw_all_in = canary["raw_all_in"]
         search_all_in = canary["search_all_in"]
 
-        # Overall status combines the original all-in canary with the added
-        # health metrics, but the extra metrics are only ENFORCED once the model
-        # is mature (iteration >= all_in_deploy_iteration); before that they are
-        # reported only.  decide_canary_status calls classify_canary by its
-        # module name so tests that monkeypatch it (sanity_review_findings) still
-        # force FAIL via the always-enforced all-in canary.
+        # All canary metrics are diagnostic until the model reaches the deploy
+        # boundary.  Before then, all-in is masked at inference and its output
+        # row is intentionally untrained during the shadow phase; treating that
+        # raw score as deploy-mature caused false aborts at early checkpoints.
         (status, base_status, extra_status, extra_failed, extra_warned,
-         extra_enforced) = decide_canary_status(
+         metrics_enforced) = decide_canary_status(
             canary, iteration, bot.all_in_deploy_iteration)
 
         phase = all_in_phase_for_iteration(
@@ -1028,10 +1026,10 @@ def run_training(args) -> dict:
             bot.all_in_full_release_iteration,
         )
         metrics_str = format_canary_metrics(canary)
-        defer_note = "" if extra_enforced else (
-            f" [PFR/avg-raise/strong-all-in/strong-continue reported only, "
-            f"enforced at iter >= {bot.all_in_deploy_iteration}; would be "
-            f"{extra_status}]")
+        diagnostic_status = _worst_canary_status(base_status, extra_status)
+        defer_note = "" if metrics_enforced else (
+            f" [all health metrics reported only; enforced at iter >= "
+            f"{bot.all_in_deploy_iteration}; would be {diagnostic_status}]")
         if status == "FAIL":
             reasons: list[str] = []
             if base_status == "FAIL":
@@ -1039,7 +1037,7 @@ def run_training(args) -> dict:
                     f"all-in (search={search_all_in:.1%} > "
                     f"{CANARY_FAIL_SEARCH_MIN:.0%} or raw={raw_all_in:.1%} > "
                     f"{CANARY_FAIL_RAW_MIN:.0%})")
-            if extra_enforced:
+            if metrics_enforced:
                 reasons.extend(extra_failed)
             # Header is generic ("collapse canary") so a fold-collapse abort
             # (strong_continue too low) is not mislabeled as an all-in collapse;
@@ -1052,7 +1050,7 @@ def run_training(args) -> dict:
             reasons = []
             if base_status == "WARN":
                 reasons.append("all-in freq")
-            if extra_enforced:
+            if metrics_enforced:
                 reasons.extend(extra_warned)
             print(
                 f"[WARN] iter {iteration}: phase={phase} {metrics_str}{defer_note} "
@@ -1168,12 +1166,13 @@ def run_training(args) -> dict:
                     _, last_checkpoint_written = checkpoint_with_canary(
                         t, final=(t >= args.iterations))
                     last_checkpoint_iter = t
-                except RuntimeError:
+                except RuntimeError as exc:
                     # All-in collapse canary tripped mid-run.  Break out of the
                     # loop rather than re-raising: the finally block prints the
                     # ABORT footer and the post-loop `abort_without_save` block
                     # returns status="aborted" (which main() maps to a nonzero
                     # exit).  Re-raising skipped that documented return path.
+                    print(f"[ABORT] {exc}", flush=True)
                     abort_without_save = True
                     break
 
