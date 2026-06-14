@@ -19,6 +19,7 @@ TournamentEvent = dict[str, Any]
 TournamentCallback = Callable[[TournamentEvent], None]
 CancelCheck = Callable[[], bool]
 PauseWait = Callable[[], None]
+AnteSchedule = Callable[[int, int, int], int]
 
 
 def _coerce_seats(seats: list[Seat | dict[str, Any]], chips: int | None) -> list[Seat]:
@@ -60,6 +61,8 @@ def run_tournament(
     dealer_index: int = 0,
     dealer_rotation: DealerRotation = "full_table",
     winner_resolution: WinnerResolution = "chip_count_on_max_hands",
+    ante: int = 0,
+    ante_schedule: AnteSchedule | None = None,
     rng: random.Random | None = None,
     table: Table | None = None,
     on_event: TournamentCallback | None = None,
@@ -84,6 +87,8 @@ def run_tournament(
         raise ValueError(f"unknown dealer_rotation: {dealer_rotation!r}")
     if winner_resolution not in ("finish_order", "chip_count_on_max_hands"):
         raise ValueError(f"unknown winner_resolution: {winner_resolution!r}")
+    if ante < 0:
+        raise ValueError("ante must be non-negative")
 
     table = table or (Table(rng=rng) if rng is not None else Table())
     dealer = dealer_index
@@ -133,11 +138,19 @@ def run_tournament(
             sb, bb = escalate_blinds(
                 hand_count, small_blind, big_blind, blind_increase_every
             )
+            hand_ante = (
+                int(ante_schedule(hand_count, sb, bb))
+                if ante_schedule is not None
+                else int(ante)
+            )
+            if hand_ante < 0:
+                raise ValueError("ante schedule returned a negative ante")
             _emit(on_event, {
                 "type": "hand_start",
                 "hand": hand_count,
                 "small_blind": sb,
                 "big_blind": bb,
+                "ante": hand_ante,
                 "seats": seats,
             })
 
@@ -162,6 +175,7 @@ def run_tournament(
                 bot_for=hand_bots,
                 on_event=None,
                 log_decisions=log_decisions,
+                ante=hand_ante,
             )
 
             if dealer_rotation == "full_table":
@@ -191,6 +205,7 @@ def run_tournament(
                 "hand": hand_count,
                 "small_blind": sb,
                 "big_blind": bb,
+                "ante": hand_ante,
                 "seats": seats,
                 "chip_history": chip_history,
                 "eliminations": eliminated_events,

@@ -331,7 +331,8 @@ class Table:
     def play_hand(self, seats: List[Seat | Dict[str, Any]], small_blind: int, big_blind: int,
                   dealer_index: int, bot_for: Dict[str, BotAdapter], on_event=None,
                   log_decisions: bool = False,
-                  logger: Optional[DecisionLogger] = None) -> Dict[str, int]:
+                  logger: Optional[DecisionLogger] = None,
+                  ante: int = 0) -> Dict[str, int]:
 
         # An externally provided logger spans multiple hands (one session
         # file per tournament — required for ML training memory features);
@@ -367,6 +368,23 @@ class Table:
         # Initialize per-player contributions (for current street)
         contrib = defaultdict(int, {s.player_id: 0 for s in seats if not s.is_sitting_out})
 
+        # Total pot accumulated from antes and completed streets.  Antes are
+        # not live bets, so they must not enter this street's ``contrib``.
+        pot_total = 0
+
+        # Track each player's total contribution across all streets (for side pots)
+        total_contrib = defaultdict(int)
+
+        if ante < 0:
+            raise ValueError("ante must be non-negative")
+        if ante:
+            for idx in ring:
+                seat = seats[idx]
+                amt = min(seat.chips, ante)
+                seat.chips -= amt
+                total_contrib[seat.player_id] += amt
+                pot_total += amt
+
         def post_blind(kind: str, seat_index: int, amount: int):
             seat = seats[seat_index]
             amt = min(seat.chips, amount)
@@ -401,12 +419,6 @@ class Table:
             ("turn",    self._deal_turn_then_bet,   {"start_idx": 1, "folded_pids": folded_pids}),
             ("river",   self._deal_river_then_bet,  {"start_idx": 1, "folded_pids": folded_pids}),
         ]
-
-        # Total pot accumulated from completed streets
-        pot_total = 0
-
-        # Track each player's total contribution across all streets (for side pots)
-        total_contrib = defaultdict(int)
 
         # --- main street loop ---
         for street_name, fn, extra_kwargs in streets:
@@ -918,7 +930,7 @@ class TournamentManager:
         self.table = table
 
     def run(self, seats, bot_for, small_blind, big_blind, dealer_index=0,
-            on_event=None, live_graph=True):
+            on_event=None, live_graph=True, ante=0):
         from core.tournament import run_tournament
 
         seats = [s if isinstance(s, Seat) else Seat(**s) for s in seats]
@@ -954,6 +966,7 @@ class TournamentManager:
             dealer_index=dealer_index,
             dealer_rotation="active_circle",
             winner_resolution="finish_order",
+            ante=ante,
             table=self.table,
             on_event=handle_tournament_event,
         )

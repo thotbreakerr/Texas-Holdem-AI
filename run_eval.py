@@ -47,6 +47,8 @@ class EvalConfig:
     output_csv: str | None = None
     parallel: int = 1
     promotion_opponent: str = "gto"
+    ante_mode: str = "off"
+    ante_fraction_of_bb: float = 0.0
 
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -188,22 +190,74 @@ def _make_bots(player_specs: list[tuple[str, str]]) -> dict[str, Any]:
     return bots
 
 
+def _ante_amount(big_blind: int, fraction: float) -> int:
+    return max(0, int(big_blind * fraction))
+
+
+def _ante_label(config: EvalConfig) -> str:
+    if config.ante_mode == "off":
+        return "off"
+    return f"{config.ante_mode}:{config.ante_fraction_of_bb:.6g}bb"
+
+
+def _ante_kwargs(config: EvalConfig) -> dict[str, Any]:
+    if config.ante_mode == "off":
+        return {"ante": 0}
+    if config.ante_mode == "fixed":
+        return {"ante": _ante_amount(config.bb, config.ante_fraction_of_bb)}
+    if config.ante_mode == "schedule":
+        return {
+            "ante_schedule": (
+                lambda _hand, _sb, bb: _ante_amount(bb, config.ante_fraction_of_bb)
+            )
+        }
+    raise ValueError(f"unknown ante_mode: {config.ante_mode!r}")
+
+
 def _run_one_tournament(task: tuple) -> dict[str, Any]:
-    (
-        player_specs,
-        chips,
-        base_sb,
-        base_bb,
-        blind_increase_every,
-        max_hands,
-        seed,
-    ) = task
+    if len(task) == 7:
+        (
+            player_specs,
+            chips,
+            base_sb,
+            base_bb,
+            blind_increase_every,
+            max_hands,
+            seed,
+        ) = task
+        ante_mode = "off"
+        ante_fraction_of_bb = 0.0
+    else:
+        (
+            player_specs,
+            chips,
+            base_sb,
+            base_bb,
+            blind_increase_every,
+            max_hands,
+            seed,
+            ante_mode,
+            ante_fraction_of_bb,
+        ) = task
 
     if seed is not None:
         random.seed(seed)
 
     bots = _make_bots(player_specs)
     seats = [Seat(player_id=pid, chips=chips) for pid, _ in player_specs]
+    ante_config = EvalConfig(
+        mode="curriculum",
+        path_a_profile="",
+        path_b_weights="",
+        chips=chips,
+        sb=base_sb,
+        bb=base_bb,
+        blind_increase_every=blind_increase_every,
+        max_hands=max_hands,
+        seed=seed,
+        ante_mode=ante_mode,
+        ante_fraction_of_bb=ante_fraction_of_bb,
+    )
     return run_tournament(
         seats,
         bots,
@@ -217,6 +271,7 @@ def _run_one_tournament(task: tuple) -> dict[str, Any]:
         rng=random.Random(seed) if seed is not None else random.Random(),
         suppress_output=True,
         log_decisions=False,
+        **_ante_kwargs(ante_config),
     )
 
 
@@ -235,6 +290,8 @@ def _run_all_tournaments(config: EvalConfig,
             config.blind_increase_every,
             config.max_hands,
             t_seed,
+            config.ante_mode,
+            config.ante_fraction_of_bb,
         ))
 
     if config.parallel > 1:
@@ -345,7 +402,9 @@ def print_report(config: EvalConfig, aggregated: dict[str, Any]) -> str:
     print(f"Tournaments: {config.tournaments}")
     print(f"Players: {', '.join(pids)}")
     print(f"Chips: {config.chips} | Blinds: {config.sb}/{config.bb} | "
-          f"Blind increase every: {config.blind_increase_every}")
+          f"Blind increase every: {config.blind_increase_every} | "
+          f"Ante: {_ante_label(config)}")
+    print("Selection metric: tournament first-place rate (win_rate)")
     if hand_counts:
         print(f"Hands/match: avg={sum(hand_counts)/len(hand_counts):.1f} "
               f"min={min(hand_counts)} max={max(hand_counts)}")
@@ -490,6 +549,11 @@ def run_evaluation(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
             )
         )
     aggregated["verdict"] = verdict
+    aggregated["ante"] = {
+        "mode": config.ante_mode,
+        "fraction_of_bb": config.ante_fraction_of_bb,
+        "label": _ante_label(config),
+    }
     return aggregated
 
 
@@ -534,6 +598,8 @@ def run_curriculum(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
         print(f"Tournaments per tier: {config.tournaments}")
         print(f"Weights: {config.path_b_weights}")
         print(f"Chips: {config.chips} | Blinds: {config.sb}/{config.bb}")
+        print(f"Ante: {_ante_label(config)}")
+        print("Selection metric: tournament first-place rate (win_rate)")
         print("=" * 80)
 
     for tier in _curriculum_tiers(config):
@@ -579,6 +645,11 @@ def run_curriculum(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
         "mode": "curriculum",
         "tiers": tier_results,
         "verdict": verdict,
+        "ante": {
+            "mode": config.ante_mode,
+            "fraction_of_bb": config.ante_fraction_of_bb,
+            "label": _ante_label(config),
+        },
     }
 
 
@@ -607,6 +678,18 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     parser.add_argument("--bb", type=int, default=10)
     parser.add_argument("--blind-increase-every", type=int, default=50)
     parser.add_argument("--max-hands", type=int, default=10000)
+    parser.add_argument(
+        "--ante-mode",
+        choices=("off", "fixed", "schedule"),
+        default="off",
+        help="Tournament ante mode; default off keeps eval in the training family",
+    )
+    parser.add_argument(
+        "--ante-fraction-of-bb",
+        type=float,
+        default=0.0,
+        help="Ante as a fraction of the big blind for fixed/schedule modes",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output-csv", default=None)
     parser.add_argument("--parallel", type=int, default=1)
@@ -614,6 +697,8 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     seed = ns.seed
     if ns.mode == "pilot" and seed is None:
         seed = 20260613
+    if ns.ante_fraction_of_bb < 0:
+        parser.error("--ante-fraction-of-bb must be non-negative")
     return EvalConfig(
         mode=ns.mode,
         path_a_profile=ns.path_a_profile,
@@ -629,6 +714,8 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
         output_csv=ns.output_csv,
         parallel=max(1, ns.parallel),
         promotion_opponent=ns.promotion_opponent,
+        ante_mode=ns.ante_mode,
+        ante_fraction_of_bb=ns.ante_fraction_of_bb,
     )
 
 
