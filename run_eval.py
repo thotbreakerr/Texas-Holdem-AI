@@ -18,7 +18,7 @@ from collections import defaultdict
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from multiprocessing import Pool
-from typing import Any
+from typing import Any, NamedTuple
 
 from core.engine import Seat
 from core.tournament import run_tournament
@@ -49,6 +49,18 @@ class EvalConfig:
     promotion_opponent: str = "gto"
     ante_mode: str = "off"
     ante_fraction_of_bb: float = 0.0
+
+
+class TournamentTask(NamedTuple):
+    player_specs: list[tuple[str, str]]
+    chips: int
+    base_sb: int
+    base_bb: int
+    blind_increase_every: int
+    max_hands: int
+    seed: int | None
+    ante_mode: str
+    ante_fraction_of_bb: float
 
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -200,98 +212,60 @@ def _ante_label(config: EvalConfig) -> str:
     return f"{config.ante_mode}:{config.ante_fraction_of_bb:.6g}bb"
 
 
-def _ante_kwargs(config: EvalConfig) -> dict[str, Any]:
-    if config.ante_mode == "off":
+def _ante_kwargs(ante_mode: str, fraction: float, base_bb: int) -> dict[str, Any]:
+    if ante_mode == "off":
         return {"ante": 0}
-    if config.ante_mode == "fixed":
-        return {"ante": _ante_amount(config.bb, config.ante_fraction_of_bb)}
-    if config.ante_mode == "schedule":
+    if ante_mode == "fixed":
+        return {"ante": _ante_amount(base_bb, fraction)}
+    if ante_mode == "schedule":
         return {
             "ante_schedule": (
-                lambda _hand, _sb, bb: _ante_amount(bb, config.ante_fraction_of_bb)
+                lambda _hand, _sb, bb: _ante_amount(bb, fraction)
             )
         }
-    raise ValueError(f"unknown ante_mode: {config.ante_mode!r}")
+    raise ValueError(f"unknown ante_mode: {ante_mode!r}")
 
 
-def _run_one_tournament(task: tuple) -> dict[str, Any]:
-    if len(task) == 7:
-        (
-            player_specs,
-            chips,
-            base_sb,
-            base_bb,
-            blind_increase_every,
-            max_hands,
-            seed,
-        ) = task
-        ante_mode = "off"
-        ante_fraction_of_bb = 0.0
-    else:
-        (
-            player_specs,
-            chips,
-            base_sb,
-            base_bb,
-            blind_increase_every,
-            max_hands,
-            seed,
-            ante_mode,
-            ante_fraction_of_bb,
-        ) = task
+def _run_one_tournament(task: TournamentTask) -> dict[str, Any]:
+    if task.seed is not None:
+        random.seed(task.seed)
 
-    if seed is not None:
-        random.seed(seed)
-
-    bots = _make_bots(player_specs)
-    seats = [Seat(player_id=pid, chips=chips) for pid, _ in player_specs]
-    ante_config = EvalConfig(
-        mode="curriculum",
-        path_a_profile="",
-        path_b_weights="",
-        chips=chips,
-        sb=base_sb,
-        bb=base_bb,
-        blind_increase_every=blind_increase_every,
-        max_hands=max_hands,
-        seed=seed,
-        ante_mode=ante_mode,
-        ante_fraction_of_bb=ante_fraction_of_bb,
-    )
+    bots = _make_bots(task.player_specs)
+    seats = [Seat(player_id=pid, chips=task.chips) for pid, _ in task.player_specs]
     return run_tournament(
         seats,
         bots,
-        small_blind=base_sb,
-        big_blind=base_bb,
-        blind_increase_every=blind_increase_every,
-        max_hands=max_hands,
+        small_blind=task.base_sb,
+        big_blind=task.base_bb,
+        blind_increase_every=task.blind_increase_every,
+        max_hands=task.max_hands,
         dealer_index=0,
         dealer_rotation="full_table",
         winner_resolution="chip_count_on_max_hands",
-        rng=random.Random(seed) if seed is not None else random.Random(),
+        rng=random.Random(task.seed) if task.seed is not None else random.Random(),
         suppress_output=True,
         log_decisions=False,
-        **_ante_kwargs(ante_config),
+        **_ante_kwargs(task.ante_mode, task.ante_fraction_of_bb, task.base_bb),
     )
 
 
 def _run_all_tournaments(config: EvalConfig,
                          player_specs: list[tuple[str, str]]) -> list[dict[str, Any]]:
-    tasks = []
+    tasks: list[TournamentTask] = []
     for i in range(config.tournaments):
         t_seed = config.seed + i if config.seed is not None else None
         rotation = i % len(player_specs)
         rotated_specs = player_specs[rotation:] + player_specs[:rotation]
-        tasks.append((
-            rotated_specs,
-            config.chips,
-            config.sb,
-            config.bb,
-            config.blind_increase_every,
-            config.max_hands,
-            t_seed,
-            config.ante_mode,
-            config.ante_fraction_of_bb,
+        tasks.append(TournamentTask(
+            player_specs=rotated_specs,
+            chips=config.chips,
+            base_sb=config.sb,
+            base_bb=config.bb,
+            blind_increase_every=config.blind_increase_every,
+            max_hands=config.max_hands,
+            seed=t_seed,
+            ante_mode=config.ante_mode,
+            ante_fraction_of_bb=config.ante_fraction_of_bb,
         ))
 
     if config.parallel > 1:

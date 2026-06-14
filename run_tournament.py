@@ -373,6 +373,8 @@ class TournamentUI:
             )
         except Exception as e:
             print(f"[tournament] error: {e}")
+            # Deliberately abort the UI tournament on a hand error and surface
+            # an unknown winner, rather than resolving surviving stacks.
             self._signal_finish("?", len(self.chip_history))
             return
 

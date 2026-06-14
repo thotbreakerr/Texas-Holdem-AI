@@ -39,7 +39,17 @@ def run():
                                                 for pid, _ in player_specs}
     try:
         # max_hands=1, no blind escalation, check-bots → both survive the cap.
-        task = (specs, 500, 5, 10, 10_000, 1, 123)
+        task = run_eval.TournamentTask(
+            player_specs=specs,
+            chips=500,
+            base_sb=5,
+            base_bb=10,
+            blind_increase_every=10_000,
+            max_hands=1,
+            seed=123,
+            ante_mode="off",
+            ante_fraction_of_bb=0.0,
+        )
         result = run_eval._run_one_tournament(task)
     finally:
         run_eval._make_bots = orig
@@ -79,15 +89,15 @@ def run():
     original_runner = run_eval._run_one_tournament
 
     def capture(task):
-        seen_first.append(task[0][0][0])
+        seen_first.append(task.player_specs[0][0])
         return {
-            "winner": task[0][0][0],
+            "winner": task.player_specs[0][0],
             "hand_count": 1,
             "finish_order": [
                 (pid, i + 1, 1, 0)
-                for i, (pid, _) in enumerate(task[0])
+                for i, (pid, _) in enumerate(task.player_specs)
             ],
-            "final_chips": {pid: 0 for pid, _ in task[0]},
+            "final_chips": {pid: 0 for pid, _ in task.player_specs},
             "chip_swing": None,
         }
 
