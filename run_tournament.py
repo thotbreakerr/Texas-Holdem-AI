@@ -45,6 +45,7 @@ DEFAULT_SMALLBLIND = 5
 DEFAULT_BIGBLIND   = 10
 DEFAULT_DELAY   = 0.05
 DEFAULT_BLIND_INCREASE_EVERY = 50
+DEFAULT_ANTE = 0
 
 COLOURS = ["#2196F3", "#F44336", "#4CAF50", "#FF9800",
            "#9C27B0", "#00BCD4", "#E91E63", "#8BC34A"]
@@ -56,7 +57,7 @@ SPEED_STEPS = [0.0, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.0]
 
 class TournamentUI:
     def __init__(self, players, starting_chips, base_sb, base_bb,
-                 hand_delay, blind_increase_every):
+                 hand_delay, blind_increase_every, ante=0):
         self.player_specs = players  # [(pid, btype, adapter), ...]
         self.player_ids   = [pid for pid, _, _ in players]
         self.bot_types    = {pid: btype for pid, btype, _ in players}
@@ -68,6 +69,7 @@ class TournamentUI:
         self.base_sb = base_sb
         self.base_bb = base_bb
         self.blind_increase_every = blind_increase_every
+        self.ante = ante
 
         self.hand_delay   = hand_delay
         self._speed_idx   = SPEED_STEPS.index(hand_delay) if hand_delay in SPEED_STEPS else 3
@@ -158,7 +160,7 @@ class TournamentUI:
         # Blinds label (top-right of chart area)
         self.blinds_text = self.ax.text(
             0.98, 0.97,
-            f"Blinds: {self.base_sb}/{self.base_bb}",
+            self._blind_label(self.base_sb, self.base_bb),
             transform=self.ax.transAxes,
             ha="right", va="top", fontsize=11,
             color="#ffcc00", fontweight="bold",
@@ -294,7 +296,7 @@ class TournamentUI:
         self.ax.set_ylim(0, self.starting_chips)
         self._last_ylim = self.starting_chips
         self.blinds_text.set_text(
-            f"Blinds: {self.base_sb}/{self.base_bb}")
+            self._blind_label(self.base_sb, self.base_bb))
         # Explicitly wipe the leaderboard axes so no stale artists remain,
         # then re-apply sidebar styling before the fresh draw
         self.lb_ax.clear()
@@ -363,6 +365,7 @@ class TournamentUI:
                 dealer_index=0,
                 dealer_rotation="active_circle",
                 winner_resolution="finish_order",
+                ante=self.ante,
                 on_event=on_tournament_event,
                 should_cancel=should_cancel,
                 wait_if_paused=wait_if_paused,
@@ -541,7 +544,7 @@ class TournamentUI:
 
         # Update blinds display
         sb, bb = self._current_blinds
-        self.blinds_text.set_text(f"Blinds: {sb}/{bb}")
+        self.blinds_text.set_text(self._blind_label(sb, bb))
 
         # ── Elimination markers ───────────────────────────────────────────────
         # Remove previous cycle's artists
@@ -843,6 +846,11 @@ class TournamentUI:
         if len(self._highlights) > 30:
             self._highlights = self._highlights[-30:]
 
+    def _blind_label(self, sb: int, bb: int) -> str:
+        if self.ante > 0:
+            return f"Blinds: {sb}/{bb}  Ante: {self.ante}"
+        return f"Blinds: {sb}/{bb}"
+
     def _draw_feed(self):
         """Redraw the highlights feed vertical sidebar."""
         ax = self.feed_ax
@@ -920,6 +928,8 @@ def main():
     parser.add_argument("--blind-increase-every", type=int,
                         default=DEFAULT_BLIND_INCREASE_EVERY,
                         help="Increase blinds 1.5x every N hands, 0 to disable (default: 50)")
+    parser.add_argument("--ante", type=int, default=DEFAULT_ANTE,
+                        help="Fixed per-player ante; default 0/off")
     parser.add_argument("--rl_model", type=str, default=None,
                         help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
                              "Rewrites any 'rl' entry in --players to use this model.")
@@ -936,7 +946,8 @@ def main():
 
     print(f"Players: {', '.join(f'{pid}={btype}' for pid, btype, _ in players)}")
     print(f"Chips: {args.chips}  |  Blinds: {args.sb}/{args.bb}  |  "
-          f"Escalation every {args.blind_increase_every} hands")
+          f"Escalation every {args.blind_increase_every} hands  |  "
+          f"Ante: {args.ante}")
 
     ui = TournamentUI(
         players=players,
@@ -945,6 +956,7 @@ def main():
         base_bb=args.bb,
         hand_delay=args.delay,
         blind_increase_every=args.blind_increase_every,
+        ante=max(0, args.ante),
     )
     ui.show()
 

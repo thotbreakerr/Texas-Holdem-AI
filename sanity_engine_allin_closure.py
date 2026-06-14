@@ -49,7 +49,7 @@ class RecordingCallBot:
         return {"type": legal[0]["type"]}
 
 
-def run_multiway():
+def run_multiway(ante=0, label=""):
     """3-handed: two all-ins at different stack depths, lone live caller.
 
     Exercises the new closure path together with multi-level side-pot
@@ -67,30 +67,30 @@ def run_multiway():
     }
     net = table.play_hand(
         seats=seats, small_blind=10, big_blind=20,
-        dealer_index=0, bot_for=bot_for,
+        dealer_index=0, bot_for=bot_for, ante=ante,
     )
 
     PASS = True
     faced = any(to_call > 0 and {"fold", "call"} <= types
                 for _street, to_call, types in c_bot.decisions)
     if faced:
-        print("[CHECK 4] PASS — lone live player C faced the all-in decision")
+        print(f"[CHECK 4{label}] PASS — lone live player C faced the all-in decision")
     else:
         PASS = False
-        print(f"[CHECK 4] FAIL — C never offered call/fold; {c_bot.decisions}")
+        print(f"[CHECK 4{label}] FAIL — C never offered call/fold; {c_bot.decisions}")
 
     if sum(net.values()) == 0:
-        print(f"[CHECK 5] PASS — chips conserved across side pots (net={net})")
+        print(f"[CHECK 5{label}] PASS — chips conserved across side pots (net={net})")
     else:
         PASS = False
-        print(f"[CHECK 5] FAIL — side-pot settlement not conserved: net={net}")
+        print(f"[CHECK 5{label}] FAIL — side-pot settlement not conserved: net={net}")
 
     chips_total = sum(s.chips for s in seats)
     if chips_total == 1700:
-        print(f"[CHECK 6] PASS — table chips intact ({chips_total})")
+        print(f"[CHECK 6{label}] PASS — table chips intact ({chips_total})")
     else:
         PASS = False
-        print(f"[CHECK 6] FAIL — table chips drifted: {chips_total}")
+        print(f"[CHECK 6{label}] FAIL — table chips drifted: {chips_total}")
     return PASS
 
 
@@ -143,6 +143,7 @@ def run():
         print(f"[CHECK 3] FAIL — table chips drifted: {chips_total}")
 
     PASS = run_multiway() and PASS
+    PASS = run_multiway(ante=5, label=" ante") and PASS
 
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
