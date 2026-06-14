@@ -441,7 +441,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Probe a Deep CFR checkpoint's action distribution."
     )
-    parser.add_argument("--weights", default="models/deep_cfr_v1.pt")
+    parser.add_argument("--weights", default="models/deep_cfr_v2.pt")
     parser.add_argument("--samples", type=int, default=200)
     parser.add_argument("--chips", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)

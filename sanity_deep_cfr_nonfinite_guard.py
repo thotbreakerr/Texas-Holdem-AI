@@ -61,6 +61,8 @@ def _make_regret_sample(bot, poison: bool):
     mask = torch.ones(NUM_ACTIONS)
     if poison:
         target[0] = float("nan")  # masked-in NaN → NaN loss
+    else:
+        target[0] = 1.0
     return (input_dict, target, mask, 1.0)
 
 
@@ -150,7 +152,10 @@ def run() -> bool:
     def skipping_train_step(*_a, **_k):
         nan = float("nan")
         return nan, 0.0, 0.0, {
-            "heads_trained": {"regret": False, "value": False, "sizing": False},
+            "strategy_loss": 0.0,
+            "heads_trained": {
+                "regret": False, "strategy": False,
+                "value": False, "sizing": False},
             "did_step": False,
             "nonfinite_skip": True,
         }
@@ -169,6 +174,7 @@ def run() -> bool:
         args = tdc.parse_args([
             "--variant", "small",
             "--iterations", str(threshold * 4),  # plenty past the threshold
+            "--round-size", "1",
             "--update-interval", "1",            # one train_step per iteration
             "--checkpoint-interval", "1000000",  # no periodic checkpoints
             "--batch-size", "8",
@@ -244,13 +250,18 @@ def run() -> bool:
         call_count["n"] += 1
         if call_count["n"] % 2 == 1:
             return float("nan"), 0.0, 0.0, {
-                "heads_trained": {"regret": False, "value": False,
-                                  "sizing": False},
+                "strategy_loss": 0.0,
+                "heads_trained": {
+                    "regret": False, "strategy": False,
+                    "value": False, "sizing": False},
                 "did_step": False,
                 "nonfinite_skip": True,
             }
         return 0.5, 0.1, 0.0, {
-            "heads_trained": {"regret": True, "value": True, "sizing": False},
+            "strategy_loss": 0.2,
+            "heads_trained": {
+                "regret": True, "strategy": True,
+                "value": True, "sizing": False},
             "did_step": True,
             "nonfinite_skip": False,
         }
@@ -263,6 +274,7 @@ def run() -> bool:
         args = tdc.parse_args([
             "--variant", "small",
             "--iterations", str(threshold * 6),
+            "--round-size", "1",
             "--update-interval", "1",
             "--checkpoint-interval", "1000000",
             "--batch-size", "8",
@@ -312,6 +324,7 @@ def run() -> bool:
         args = tdc.parse_args([
             "--variant", "small",
             "--iterations", str(threshold * 4),
+            "--round-size", "1",
             "--update-interval", "1",            # one train_step per iteration
             "--checkpoint-interval", "1000000",  # no periodic checkpoints
             "--batch-size", "8",

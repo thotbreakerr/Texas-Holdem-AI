@@ -84,7 +84,7 @@ def create_bot(btype: str) -> BotAdapter:
     if (btype in ("deep_cfr", "deepcfr", "deep_cfr_bot") or
             btype.startswith(("deep_cfr:", "deepcfr:", "deep_cfr_bot:"))):
         from bots.deep_cfr_bot import DeepCFRBot
-        weights_path = "models/deep_cfr_v1.pt"
+        weights_path = "models/deep_cfr_v2.pt"
         if ":" in raw_btype:
             weights_path = raw_btype.split(":", 1)[1]
         return _wrap(DeepCFRBot(weights_path=weights_path, inference_mode=True))

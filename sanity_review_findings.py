@@ -50,12 +50,6 @@ from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_in
 from bots.icm_bot import icm_equity, icm_ev_of_call
 import run_eval
 import training.train_deep_cfr as train_deep_cfr
-from training.train_deep_cfr import (
-    ALL_IN_FULL_RELEASE_ITERATION,
-    ALL_IN_WARMUP_ITERATIONS,
-    allow_all_in_for_iteration,
-    all_in_policy_probability_for_iteration,
-)
 
 
 FAILURES: list[str] = []
@@ -233,7 +227,6 @@ def test_deep_cfr_cost_units() -> None:
         regret_buf=regret_buf,
         value_buf=value_buf,
         sizing_buf=sizing_buf,
-        allow_all_in=True,
     )
 
     call_idx = DEEP_ABSTRACT_ACTIONS.index("check_call")
@@ -482,32 +475,31 @@ def test_deep_cfr_search_root_preserves_bet_root() -> None:
 
 
 def test_deep_cfr_all_in_warmup_boundary() -> None:
-    section("Section 9: Deep CFR all-in warmup boundary")
+    section("Section 9: Deep CFR schema-v2 full action exposure")
 
+    state = _DeepCFRGameState(
+        pot=15,
+        stacks=[100, 90],
+        committed_per_seat=[0, 10],
+        alive=[True, True],
+        street="preflop",
+        board=[],
+        hole_cards={},
+        seat_order=[0],
+        action_idx=0,
+        history_events=[],
+        deck_remaining=[],
+        big_blind=10,
+        ring_order=[0, 1],
+    )
+    labels = {
+        DEEP_ABSTRACT_ACTIONS[idx]
+        for idx in state.legal_abstract_actions()
+    }
     check(
-        "default warmup boundary starts staged all-in exposure",
-        allow_all_in_for_iteration(
-            ALL_IN_WARMUP_ITERATIONS, ALL_IN_WARMUP_ITERATIONS
-        ),
-        (
-            f"iteration={ALL_IN_WARMUP_ITERATIONS} "
-            f"warmup={ALL_IN_WARMUP_ITERATIONS}"
-        ),
-    )
-    boundary_prob = all_in_policy_probability_for_iteration(
-        ALL_IN_WARMUP_ITERATIONS,
-        ALL_IN_WARMUP_ITERATIONS,
-        ALL_IN_FULL_RELEASE_ITERATION,
-    )
-    mid_prob = all_in_policy_probability_for_iteration(
-        (ALL_IN_WARMUP_ITERATIONS + ALL_IN_FULL_RELEASE_ITERATION) // 2,
-        ALL_IN_WARMUP_ITERATIONS,
-        ALL_IN_FULL_RELEASE_ITERATION,
-    )
-    check(
-        "all-in self-play ramps gradually instead of hard unlocking",
-        boundary_prob == 0.0 and 0.0 < mid_prob < 1.0,
-        f"boundary={boundary_prob:.3f} mid={mid_prob:.3f}",
+        "all-in is present in the legal traversal action set",
+        "all_in" in labels,
+        f"legal={sorted(labels)}",
     )
 
 
@@ -767,7 +759,7 @@ def test_new_cfr_profile_and_stats_contracts() -> None:
 
 
 def test_new_deep_cfr_history_features_and_mask() -> None:
-    section("Section 12: Deep CFR history, features, and all-in mask")
+    section("Section 12: Deep CFR history and features")
 
     bad_history_view = PlayerView(
         me="P0",
@@ -799,14 +791,6 @@ def test_new_deep_cfr_history_features_and_mask() -> None:
         and float(batch["opp_features"][0, 0, 3]) == 1.0,
         f"features={batch['opp_features'][0, 0].tolist()}",
     )
-
-    all_in_idx = DEEP_ABSTRACT_ACTIONS.index("all_in")
-    check(
-        "Deep CFR all-in mask never empties the legal mask",
-        DeepCFRBot._mask_all_in([all_in_idx]) == [all_in_idx],
-        "all-in-only legal mask was removed",
-    )
-
 
 def test_new_chip_accounting_and_training_failure_contracts() -> None:
     section("Section 13: chip accounting and failure signaling")
@@ -879,17 +863,15 @@ def test_new_chip_accounting_and_training_failure_contracts() -> None:
     args = SimpleNamespace(
         variant="small",
         iterations=0,
+        round_size=25_000,
         update_interval=1,
         checkpoint_interval=100,
         batch_size=999,
         lr=1e-4,
         aivat_sims=1,
-        all_in_warmup_iterations=ALL_IN_WARMUP_ITERATIONS,
-        # Force canary maturity at iteration 0; pre-deploy metrics are
-        # intentionally diagnostic only.
-        all_in_deploy_iteration=0,
-        all_in_full_release_iteration=ALL_IN_FULL_RELEASE_ITERATION,
-        detox_all_in_on_resume=False,
+        curriculum_profile="sixmax",
+        canary_enforce_iteration=0,
+        canary_fail_patience=1,
         disable_collapse_canary=False,
         save_path=save_path,
         device="cpu",

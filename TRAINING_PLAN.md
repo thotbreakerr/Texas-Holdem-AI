@@ -245,17 +245,31 @@ We're building two variants of "max CFR" simultaneously and comparing them after
 
 **Path A — Tabular external-sampling MCCFR fully bolted.** Real tree CFR, equity-shaped value function, opponent-stat bucket in info-set key, finer card buckets, real-time search at decision time. The sampler is **vanilla external-sampling MCCFR** (Lanctot et al. 2009): standard regret matching, unweighted regret updates, average strategy accumulated at opponent nodes plus the decision-rooted traversal root (Phase 3.1 — hero reach is exactly 1 there; without it, first-to-act infosets collect regret but no deployable average) — *not* MCCFR+. (Phase 3, 2026-06-10: the earlier "MCCFR+ with linear weighting + positive-regret-only matching" claim never matched the code. CFR+ techniques have weaker guarantees under sampling, so the docs were corrected rather than the algorithm changed; MCCFR+ can be revisited later behind a flag and A/B'd against this baseline.) **No Nash-convergence claim:** six players + abstraction + decision-rooted traversals sit outside CFR's two-player zero-sum guarantee; treat the result as a strong regret-minimising approximation validated empirically by eval, not by theory. Saves to `models/cfr_regret_deep_v2.pkl`. CPU-bound — trained second using all 18 M5 cores.
 
-**Path B — Deep CFR Plus + continuous bet sizing (neural, juiced).** Regret network + value network sharing a state encoder (card embeddings, action-history GRU, opponent embeddings). Real tree CFR with **Deep CFR Plus** sample weighting (linear iteration weighting, ~10-30% better convergence than vanilla Deep CFR). **Continuous bet-sizing head** in addition to the discrete action-type head — the network emits a fractional bet size in [0.0, 2.0] when raising, finer resolution than Path A's discrete sizings. Real-time search at decision time. Saves to `models/deep_cfr_v1.pt`. GPU/RAM-bound — trained first using the M5 Max's 40-core GPU + 64GB unified memory.
+**Path B — schema-v2 multiway Deep CFR-inspired.** Independent advantage,
+average-strategy, value, and sizing networks consume the same feature schema
+without sharing parameters. Training uses frozen-policy rounds of 25,000
+external-sampling traversals: every traverser action is expanded, one opponent
+action is sampled, and the advantage network is reinitialized/refit after each
+round. The average-strategy network is trained from its own iteration-weighted
+reservoir and is the only policy used for deployment. Linear iteration weighting
+is retained as an empirical choice; no Nash-convergence claim is made for the
+multiway 2-6 player setting. Saves to `models/deep_cfr_v2.pt`; v1 checkpoints
+are postmortem-only.
 
-**Path B Phase-4 retrain-readiness notes (2026-06-11, see `PHASE4_DEEPCFR_2026-06-11.md`):**
-- **Training-state curriculum (I6).** Each training state now randomizes the player count (uniform 2-6) and stack depths (10-200 BB log-uniform; 50% one shared depth, 50% independent per-seat depths) at fixed 5/10 blinds, with the original hero-seat rotation. Heads-up follows engine conventions (button posts SB, acts first preflop; BB first postflop) — verified event-by-event against real engine hands for n=2..6.
+**Path B schema-v2 retrain notes (2026-06-13):**
+- **Six-player curriculum.** Player counts are sampled at fixed weights: 6=50%, 5=15%, 4=12.5%, 3=10%, 2=12.5%. Stack depths remain 10-200 BB with traverser rotation across occupied seats.
+- **Player-count schema.** Separate five-value one-hots encode players seated at hand start and players still active.
+- **Full action exposure.** Every legal action, including all-in, is trained from traversal one. The v1 shadow/staged/release phases, masking, caps, and detox path are removed.
+- **Canary.** Average-policy probabilities are measured directly; current advantage-policy all-in probability is diagnostic. Enforcement starts at 100k and aborts after three consecutive failures.
+- **Checkpoint schema.** Networks, optimizers, curriculum metadata, canary streak, RNG states, and all four reservoir snapshots are required for resume.
 - **Blind-invariant features.** All chip features (scalars, opponent stacks, history amounts/pots) are rescaled to a 10-chip reference big blind before normalization (`core.action_history.REF_BIG_BLIND`), so blind level is a pure scale factor: training depth variation at 5/10 covers eval blind escalation. Encodings at 5/10 are byte-identical to pre-change checkpoints' inputs.
 - **History parity (I3/B1).** The tree no longer emits `all_in` ActionEvents — a shove is recorded as the underlying bet/raise, exactly like the engine — so the history GRU trains on the channels real play activates. `"all_in"` stays in the vocabulary (shapes/old checkpoints unchanged; channel unused).
-- **Trainer robustness.** Non-finite losses skip the optimizer step (and abort nonzero after 50 consecutive skips; counter persisted in checkpoint metadata). SIGINT/SIGTERM both save a checkpoint and exit 130/143 with status "interrupted". `--iterations` defaults to 1,000,000; a FINAL checkpoint below the 150k all-in deploy gate is loudly warned about and stamped `"shadow_only": true` (still saved — smoke runs stay short). Phase 4.1: interrupt/abort final saves are canary-free and unconditional — the collapse canary still gates every PROMOTED checkpoint (and a mature mid-run probe FAIL still aborts without saving), but it can never lose interrupted work — and all reports/checkpoint metadata count only FULLY completed iterations, so `--resume` continues exactly where the run stopped. Phase 4.2: emergency exits outrank a canary abort — a signal landing WHILE a periodic canary probe runs (where the probe then FAILs) still saves the emergency checkpoint to `--save-path` with the true interrupt status/iteration count; the FAILed probe still blocks `.safe`/`.warn` promotion, and a mature canary FAIL with no emergency active still aborts without saving. Phase 4.3: all canary metrics are diagnostic before the 150k deploy boundary because the all-in output is intentionally untrained during shadow and can transiently dominate; checkpoints remain resumable during that phase. At/after 150k the complete canary is enforced, and abort logs include the exact failing metrics.
+- **Trainer robustness.** Non-finite losses skip their optimizer step and abort after 50 consecutive failures. SIGINT/SIGTERM save complete resumable schema-v2 snapshots and exit 130/143.
 
 **Note on apples-to-oranges in eval:** Path B has a richer action space (continuous sizing) than Path A (discrete). Head-to-head comparison still works since both play the same engine, but a Path B win partly reflects "richer outputs" not just "neural beats tabular."
 
-**Path B network sizing (~15M params total):** Targets the BigModel sweet spot per `HARDWARE_BENCHMARK.md` (~17M params → 7.66x MPS speedup, vs 1.4x at ~72K params). Breakdown: shared state encoder ~5-8M (card embeddings + card pooling + action-history GRU + opponent-embedding aggregator with mean pooling for variable opponent count + MLP body), regret network ~3-4M, value network ~3-4M, continuous bet-sizing head ~500K. Working memory ~8-15GB during training, fits in unified memory with room to spare. Build the architecture parametrized so a ~5M smoke variant can validate the pipeline before the full 15M training run.
+**Path B network sizing:** schema v2 has about 1.47M parameters in the small
+variant and 5.36M in the large variant across four independent subnetworks.
 
 #### Build phase — COMPLETE (closed 2026-04-27)
 
@@ -288,9 +302,12 @@ how to enable them. `--full` adds them — note it is expensive for `--path both
 because `sanity_eval.py` re-runs the training gates internally. Only kick off a real
 overnight training run (steps 7/8 below) after the appropriate ladder is green.
 
-5. [DONE] **Gate 3B — Path B training pipeline** (`training/train_deep_cfr.py`). External-sampling Deep CFR Plus traversal with target collection (CFR+ linear weighting on regrets), SmoothL1 loss + averaging + lr=1e-4 (replaced naïve MSE that produced ~17K losses; now ~50–70 range), AIVAT n_sims=500 default. Atomic checkpoints, SIGINT handler. Sanity gate runs 100 iter @ depth=4 in <10 min.
+5. [DONE] **Gate 3B — Path B schema-v2 pipeline** (`training/train_deep_cfr.py`). Multiway Deep CFR-inspired frozen-policy rounds, independent objectives, explicit average strategy, sixmax curriculum, schema-v2 resume gate, and collapse patience.
 6. [DONE] **Gate 3A — Path A training pipeline** (`training/train_cfr_bot_multiway.py` audit + polish). Verified `_run_iterations` wraps `_cfr_recurse` correctly (no fallback to deprecated `_estimate_action_value` heuristic — sanity Section 6 anti-substitution test confirms). Default profile path moved to `cfr_regret_deep_v2.pkl`. Per-episode Table RNG via optional `--seed`. `sanity_train_cfr.py` is a slow ~5–8 min pre-overnight gate.
-7. [TODO] **User-driven: train Path B overnight on M5 Max GPU.** Estimated 8–24 hours for `--iterations 1000000 --variant large`.
+7. [TODO] **User-driven Path B rollout.** Run the 10k smoke, fresh 150k pilot, 500 fixed-seed seat-rotated tournaments, then the one-million-traversal run only after the health and baseline gates pass.
+   Use `run_eval.py --mode pilot` for the six-player `1/6` baseline gate and
+   `--mode promotion --promotion-opponent <bot>` for the final 1,000-tournament
+   canary-clean confidence-interval check.
 8. [TODO] **User-driven: train Path A overnight on M5 Max CPU after Path B finishes.** Estimated 2–4 hours for `--tournaments 5000 --iterations 10`. Never concurrent with Path B (unified memory contention).
 
 #### Eval and pocket bots — HARNESS COMPLETE, EVAL USER-DRIVEN

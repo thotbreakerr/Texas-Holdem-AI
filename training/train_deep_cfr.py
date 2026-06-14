@@ -1,15 +1,16 @@
 """
-training/train_deep_cfr.py — Deep CFR Plus training loop
----------------------------------------------------------
-Wraps _cfr_recurse with target collection, periodic gradient steps,
-and atomic checkpoint save/load.
+training/train_deep_cfr.py — multiway Deep CFR-inspired schema-v2 trainer
+-------------------------------------------------------------------------
+Collects external-sampling traversals under a frozen advantage policy, then
+reinitializes/refits the advantage network at round boundaries. Deployment
+uses a separately trained reach-weighted average-strategy network.
 
 Usage:
     python training/train_deep_cfr.py --variant small --iterations 50 \
         --update-interval 10 --checkpoint-interval 25 --batch-size 32 \
         --aivat-sims 50 --save-path /tmp/deep_cfr_smoke.pt
     python training/train_deep_cfr.py --variant large --iterations 1000000 \\
-        --save-path models/deep_cfr_v1.pt
+        --curriculum-profile sixmax --save-path models/deep_cfr_v2.pt
 """
 from __future__ import annotations
 
@@ -31,6 +32,8 @@ import torch.nn as nn
 from bots.deep_cfr_bot import (
     DeepCFRBot, DeepCFRConfig, DeepCFRNetwork,
     ReservoirBuffer, _DeepCFRGameState, _FULL_DECK,
+    ABSTRACT_ACTIONS, NUM_ACTIONS, DEEP_CFR_SCHEMA_VERSION,
+    _abstract_to_concrete, _is_effective_all_in, _infer_big_blind,
 )
 from core.action_history import ActionEvent
 from core.bot_api import PlayerView
@@ -53,16 +56,26 @@ SMALL_BLIND = 5
 # blind level a pure scale factor — varying chip depth at fixed blinds covers
 # escalated blinds at fixed chips too.
 CURRICULUM_PLAYER_COUNTS = (2, 3, 4, 5, 6)
+CURRICULUM_PROFILES = {
+    "sixmax": {
+        2: 0.125,
+        3: 0.10,
+        4: 0.125,
+        5: 0.15,
+        6: 0.50,
+    },
+}
 CURRICULUM_MIN_DEPTH_BB = 10     # shortest stack: 10 big blinds
 CURRICULUM_MAX_DEPTH_BB = 200    # deepest stack: 200 big blinds
 CURRICULUM_SHARED_DEPTH_PROB = 0.5  # 50% one depth for all seats, 50% per-seat
-ALL_IN_WARMUP_ITERATIONS = 100_000
-ALL_IN_DEPLOY_ITERATION = 150_000
-ALL_IN_FULL_RELEASE_ITERATION = 350_000
-CANARY_PASS_SEARCH_MAX = 0.15
-CANARY_PASS_RAW_MAX = 0.30
-CANARY_FAIL_SEARCH_MIN = 0.35
-CANARY_FAIL_RAW_MIN = 0.60
+DEFAULT_ROUND_SIZE = 25_000
+DEFAULT_CANARY_ENFORCE_ITERATION = 100_000
+DEFAULT_CANARY_FAIL_PATIENCE = 3
+PILOT_GATE_ITERATIONS = (100_000, 150_000)
+CANARY_WARN_SEARCH_MIN = 0.10
+CANARY_WARN_RAW_MIN = 0.10
+CANARY_FAIL_SEARCH_MIN = 0.25
+CANARY_FAIL_RAW_MIN = 0.25
 # Additional health-metric canary bounds, layered ON TOP of the raw/search
 # all-in canary above (mirrors probe_deep_cfr.py --fail-on-unhealthy).  A metric
 # WARNs at its *_WARN level (side checkpoint only) and FAILs/aborts at its *_FAIL
@@ -90,47 +103,28 @@ CANARY_STRONG_CONTINUE_FAIL = 0.60  # continue < this -> FAIL (fold collapse)
 NONFINITE_SKIPS_ABORT_THRESHOLD = 50
 
 
+def pilot_health_failures(metrics: dict) -> list[str]:
+    """Return rollout-gate failures for the 100k and 150k pilot probes."""
+    checks = [
+        ("raw_all_in", metrics.get("raw_all_in", 1.0), 0.10, "high"),
+        ("search_all_in", metrics.get("search_all_in", 1.0), 0.15, "high"),
+        ("strong_continue", metrics.get("strong_continue", 0.0), 0.80, "low"),
+        ("normal_action_mass", metrics.get("normal_action_mass", 0.0), 0.30, "low"),
+    ]
+    failures = []
+    for name, value, threshold, direction in checks:
+        failed = value >= threshold if direction == "high" else value < threshold
+        if failed:
+            comparator = ">=" if direction == "high" else "<"
+            failures.append(
+                f"{name}={value:.1%} ({comparator} {threshold:.0%})")
+    return failures
+
+
 def epsilon_for_iteration(t: int, total: int) -> float:
     """Anneal training-time opponent exploration from 0.30 to 0.05."""
     progress = min(1.0, t / max(total, 1))
     return 0.30 - 0.25 * progress
-
-
-def allow_all_in_for_iteration(t: int, warmup_iterations: int) -> bool:
-    """Return whether iteration ``t`` may expose all-in to self-play."""
-    return t >= max(0, int(warmup_iterations))
-
-
-def all_in_policy_probability_for_iteration(
-    t: int,
-    warmup_iterations: int,
-    full_release_iteration: int,
-) -> float:
-    """Staged all-in self-play exposure probability for iteration ``t``."""
-    warmup = max(0, int(warmup_iterations))
-    full = max(warmup + 1, int(full_release_iteration))
-    if t < warmup:
-        return 0.0
-    if t >= full:
-        return 1.0
-    return max(0.0, min(1.0, (t - warmup) / (full - warmup)))
-
-
-def all_in_phase_for_iteration(
-    t: int,
-    warmup_iterations: int,
-    full_release_iteration: int,
-) -> str:
-    """Human-readable all-in curriculum phase."""
-    if t < max(0, int(warmup_iterations)):
-        return "shadow"
-    if all_in_policy_probability_for_iteration(
-        t,
-        warmup_iterations,
-        full_release_iteration,
-    ) < 1.0:
-        return "staged"
-    return "full"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -246,15 +240,21 @@ def sample_curriculum_stacks(n_seats: int, rng=random) -> list:
     return [sample_stack_depth_chips(rng) for _ in range(n_seats)]
 
 
-def sample_curriculum_state(iteration: int, rng=random):
-    """Random training state matching the eval distribution (I6).
-
-    Returns ``(state, hero_seat)``.  Player count is uniform over 2..6,
-    stacks are 10-200 BB log-uniform (shared or per-seat), blinds stay 5/10
-    (the features are BB-relative, so blind level is a pure scale factor),
-    and the hero seat keeps rotating with the iteration index.
-    """
-    n_seats = rng.choice(CURRICULUM_PLAYER_COUNTS)
+def sample_curriculum_state(
+    iteration: int,
+    rng=random,
+    profile: str = "sixmax",
+):
+    """Sample a six-player-heavy tournament state."""
+    weights = CURRICULUM_PROFILES[profile]
+    roll = rng.random()
+    cumulative = 0.0
+    n_seats = CURRICULUM_PLAYER_COUNTS[-1]
+    for count in CURRICULUM_PLAYER_COUNTS:
+        cumulative += weights[count]
+        if roll < cumulative:
+            n_seats = count
+            break
     hero_seat = (iteration - 1) % n_seats   # same rotation rule as before
     stacks = sample_curriculum_stacks(n_seats, rng)
     state = build_initial_state(n_seats=n_seats, hero_seat=hero_seat,
@@ -277,108 +277,104 @@ def _stack_input_dicts(samples_inputs: list, device: torch.device) -> dict:
 
 def train_step(
     network: DeepCFRNetwork,
-    optimizer: torch.optim.Optimizer,
+    optimizers,
     regret_buf: ReservoirBuffer,
     value_buf: ReservoirBuffer,
     sizing_buf: ReservoirBuffer,
     batch_size: int,
     device: torch.device,
+    strategy_buf: ReservoirBuffer | None = None,
 ) -> tuple:
-    """One gradient step on ready heads.
-
-    Returns (r_loss, v_loss, s_loss, info), where info records which buffers
-    contributed to the optimizer step.
-    """
+    """Run one independent optimizer step per ready schema-v2 objective."""
     network.train()
+    if not isinstance(optimizers, dict):
+        optimizers = {
+            "advantage": optimizers,
+            "strategy": optimizers,
+            "value": optimizers,
+            "sizing": optimizers,
+        }
+    if strategy_buf is None:
+        strategy_buf = ReservoirBuffer(capacity=1)
+    losses = {"regret": 0.0, "strategy": 0.0, "value": 0.0, "sizing": 0.0}
+    heads_trained = {
+        "regret": False,
+        "strategy": False,
+        "value": False,
+        "sizing": False,
+    }
+    any_step = False
+    nonfinite_skip = False
 
-    r_loss_val = 0.0
-    v_loss_val = 0.0
-    s_loss_val = 0.0
-    heads_trained = {"regret": False, "value": False, "sizing": False}
+    def _step(name: str, module: nn.Module, loss: torch.Tensor) -> None:
+        nonlocal any_step, nonfinite_skip
+        losses[name] = float(loss.detach().item())
+        heads_trained[name] = True
+        if not bool(torch.isfinite(loss).item()):
+            nonfinite_skip = True
+            return
+        optimizer_key = "advantage" if name == "regret" else name
+        optimizer = optimizers[optimizer_key]
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(module.parameters(), max_norm=10.0)
+        optimizer.step()
+        any_step = True
 
-    # ── Regret loss ──
     if len(regret_buf) >= batch_size:
         samples = regret_buf.sample(batch_size)
-        inputs = [s[0] for s in samples]
+        batch = _stack_input_dicts([s[0] for s in samples], device)
         targets = torch.stack([s[1] for s in samples]).to(device)
         masks = torch.stack([s[2] for s in samples]).to(device)
-        weights = torch.tensor([s[3] for s in samples], dtype=torch.float32, device=device)
-        # Normalize weights
+        weights = torch.tensor(
+            [s[3] for s in samples], dtype=torch.float32, device=device)
         weights = weights / (weights.sum() + 1e-8)
-
-        batch = _stack_input_dicts(inputs, device)
-        out = network(batch)
-        preds = out["regret"] * masks
-        targets = targets * masks
-        # SmoothL1 only on legal actions, averaged per sample, then CFR+
-        # weighted across samples. This keeps large initial regret targets
-        # from dominating the optimizer with quadratic gradients.
+        preds = network.advantage_forward(batch)
         elementwise = nn.functional.smooth_l1_loss(
-            preds, targets, reduction="none")
-        elementwise = elementwise * masks
-        n_legal = masks.sum(dim=1).clamp(min=1.0)
-        per_sample = elementwise.sum(dim=1) / n_legal
-        r_loss = (per_sample * weights).sum()
-        r_loss_val = r_loss.item()
-        heads_trained["regret"] = True
-    else:
-        r_loss = torch.tensor(0.0, device=device)
+            preds * masks, targets * masks, reduction="none") * masks
+        per_sample = elementwise.sum(dim=1) / masks.sum(dim=1).clamp(min=1.0)
+        _step("regret", network.advantage, (per_sample * weights).sum())
 
-    # ── Value loss ──
+    if len(strategy_buf) >= batch_size:
+        samples = strategy_buf.sample(batch_size)
+        batch = _stack_input_dicts([s[0] for s in samples], device)
+        targets = torch.stack([s[1] for s in samples]).to(device)
+        masks = torch.stack([s[2] for s in samples]).to(device)
+        weights = torch.tensor(
+            [s[3] for s in samples], dtype=torch.float32, device=device)
+        weights = weights / (weights.sum() + 1e-8)
+        logits = network.strategy_forward(batch).masked_fill(masks <= 0, -1e9)
+        log_probs = nn.functional.log_softmax(logits, dim=1)
+        per_sample = -(targets * log_probs * masks).sum(dim=1)
+        _step("strategy", network.strategy, (per_sample * weights).sum())
+
     if len(value_buf) >= batch_size:
         samples = value_buf.sample(batch_size)
-        inputs = [s[0] for s in samples]
-        targets = torch.tensor([s[1] for s in samples], dtype=torch.float32, device=device)
+        batch = _stack_input_dicts([s[0] for s in samples], device)
+        targets = torch.tensor(
+            [s[1] for s in samples], dtype=torch.float32, device=device)
+        _step(
+            "value",
+            network.value,
+            nn.functional.smooth_l1_loss(network.value_forward(batch), targets),
+        )
 
-        batch = _stack_input_dicts(inputs, device)
-        out = network(batch)
-        pred = out["value"]
-        v_loss = nn.functional.smooth_l1_loss(pred, targets)
-        v_loss_val = v_loss.item()
-        heads_trained["value"] = True
-    else:
-        v_loss = torch.tensor(0.0, device=device)
+    sizing_batch = min(batch_size, len(sizing_buf))
+    if sizing_batch >= min(batch_size, 16):
+        samples = sizing_buf.sample(sizing_batch)
+        batch = _stack_input_dicts([s[0] for s in samples], device)
+        targets = torch.tensor(
+            [s[1] for s in samples], dtype=torch.float32, device=device)
+        _step(
+            "sizing",
+            network.sizing,
+            nn.functional.mse_loss(network.sizing_forward(batch), targets),
+        )
 
-    # ── Sizing loss ──
-    if len(sizing_buf) >= min(batch_size, 16):
-        n = min(batch_size, len(sizing_buf))
-        samples = sizing_buf.sample(n)
-        inputs = [s[0] for s in samples]
-        targets = torch.tensor([s[1] for s in samples], dtype=torch.float32, device=device)
-
-        batch = _stack_input_dicts(inputs, device)
-        out = network(batch)
-        pred = out["sizing"]
-        s_loss = nn.functional.mse_loss(pred, targets)
-        s_loss_val = s_loss.item()
-        heads_trained["sizing"] = True
-    else:
-        s_loss = torch.tensor(0.0, device=device)
-
-    # ── Combined backward ──
-    total_loss = r_loss + v_loss + s_loss
-    optimizer.zero_grad()
-    did_step = bool(total_loss.requires_grad)
-
-    # Finiteness guard (B2/I5): clip_grad_norm_ does NOT protect against NaN —
-    # one NaN gradient makes the total norm NaN, the clip coefficient NaN, and
-    # then optimizer.step() writes NaN into EVERY parameter, silently
-    # corrupting all later checkpoints.  On a non-finite loss we skip the
-    # optimizer step entirely (parameters stay untouched) and report the skip
-    # so the training loop can count and, past a threshold, abort.
-    nonfinite_skip = False
-    if did_step and not bool(torch.isfinite(total_loss).item()):
-        nonfinite_skip = True
-        did_step = False
-
-    if did_step:
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=10.0)
-        optimizer.step()
-
-    return r_loss_val, v_loss_val, s_loss_val, {
+    return losses["regret"], losses["value"], losses["sizing"], {
+        "strategy_loss": losses["strategy"],
         "heads_trained": heads_trained,
-        "did_step": did_step,
+        "did_step": any_step,
         "nonfinite_skip": nonfinite_skip,
     }
 
@@ -388,35 +384,57 @@ def train_step(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
-                    optimizer: torch.optim.Optimizer, losses: dict,
+                    optimizer, losses: dict,
                     *, nonfinite_skips: int = 0,
-                    shadow_only: bool | None = None):
-    """Atomic save of training state.
-
-    ``nonfinite_skips`` is the cumulative count of optimizer steps skipped by
-    the finiteness guard (B2/I5) — persisted so an operator inspecting a
-    checkpoint can see whether the run hit numerical trouble.
-
-    ``shadow_only`` is stamped (as ``True``) only on FINAL checkpoints whose
-    ``iteration`` is below the all-in deploy gate — inference will permanently
-    mask all-in for such a model (B4/I9).  ``None`` omits the key (mid-run
-    checkpoints, where being below the gate is normal and transient).
-    """
+                    buffers: dict | None = None,
+                    canary_fail_streak: int = 0,
+                    round_index: int = 0,
+                    last_fit_iteration: int = 0,
+                    pilot_gates_completed=(),
+                    canary_status: str = "UNKNOWN",
+                    last_canary_metrics: dict | None = None,
+                    curriculum_profile: str = "sixmax"):
+    """Atomically save a complete, resumable schema-v2 training snapshot."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp_path = path + ".tmp"
+    if not isinstance(optimizer, dict):
+        optimizer = {"legacy": optimizer}
+    if buffers is None:
+        buffers = {
+            "regret": bot.regret_buffer,
+            "strategy": bot.strategy_buffer,
+            "value": bot.value_buffer,
+            "sizing": bot.sizing_buffer,
+        }
     payload = {
+        "schema_version": DEEP_CFR_SCHEMA_VERSION,
+        "algorithm": "multiway_deep_cfr_inspired",
         "iteration": iteration,
         "config": bot.config,
         "network_state_dict": bot.network.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "all_in_warmup_iterations": bot.all_in_warmup_iterations,
-        "all_in_deploy_iteration": bot.all_in_deploy_iteration,
-        "all_in_full_release_iteration": bot.all_in_full_release_iteration,
+        "optimizer_state_dicts": {
+            name: opt.state_dict() for name, opt in optimizer.items()
+        },
+        "reservoirs": {
+            name: buffer.state_dict() for name, buffer in buffers.items()
+        },
+        "curriculum_profile": curriculum_profile,
+        "curriculum_weights": CURRICULUM_PROFILES[curriculum_profile],
+        "round_index": int(round_index),
+        "last_fit_iteration": int(last_fit_iteration),
+        "pilot_gates_completed": sorted(
+            int(item) for item in pilot_gates_completed),
+        "canary_status": str(canary_status),
+        "last_canary_metrics": dict(last_canary_metrics or {}),
+        "canary_fail_streak": int(canary_fail_streak),
+        "python_random_state": random.getstate(),
+        "bot_random_state": bot._rng.getstate(),
+        "torch_random_state": torch.random.get_rng_state(),
         "losses": {k: v[-100:] for k, v in losses.items()},  # last 100 only
         "nonfinite_skips": int(nonfinite_skips),
     }
-    if shadow_only is not None:
-        payload["shadow_only"] = bool(shadow_only)
+    if torch.cuda.is_available():
+        payload["torch_cuda_random_state_all"] = torch.cuda.get_rng_state_all()
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)
 
@@ -434,12 +452,11 @@ def warn_checkpoint_path(path: str, iteration: int) -> str:
 
 
 def classify_canary(raw_all_in: float, search_all_in: float) -> str:
-    """Classify checkpoint health from all-in canary frequencies."""
-    if search_all_in > CANARY_FAIL_SEARCH_MIN or raw_all_in > CANARY_FAIL_RAW_MIN:
+    if search_all_in >= CANARY_FAIL_SEARCH_MIN or raw_all_in >= CANARY_FAIL_RAW_MIN:
         return "FAIL"
-    if search_all_in <= CANARY_PASS_SEARCH_MAX and raw_all_in <= CANARY_PASS_RAW_MAX:
-        return "PASS"
-    return "WARN"
+    if search_all_in >= CANARY_WARN_SEARCH_MIN or raw_all_in >= CANARY_WARN_RAW_MIN:
+        return "WARN"
+    return "PASS"
 
 
 _CANARY_STATUS_RANK = {"PASS": 0, "WARN": 1, "FAIL": 2}
@@ -508,20 +525,7 @@ def classify_extra_canary_metrics(metrics: dict) -> tuple[str, list[str], list[s
 
 def decide_canary_status(canary: dict, iteration: int,
                          deploy_iteration: int) -> tuple:
-    """Combine the all-in canary and the extra health metrics into one status.
-
-    Every metric is only ENFORCED once the model is mature enough to make the
-    probe meaningful: ``iteration >= deploy_iteration`` (the same boundary the
-    all-in row uses to leave the inference mask).  Before that, metrics are
-    computed and reported but do NOT change the status.  In particular, the
-    all-in output row is intentionally excluded from regret targets during the
-    shadow phase, so shared-encoder updates can make its untrained raw score
-    transiently dominate.  Enforcing that score caused seed-dependent aborts
-    at the first checkpoint even though inference still masked all-in.
-
-    Returns ``(status, base_status, extra_status, extra_failed, extra_warned,
-    metrics_enforced)``.
-    """
+    """Combine health metrics and defer enforcement until model maturity."""
     base_status = classify_canary(
         canary.get("raw_all_in", 0.0), canary.get("search_all_in", 0.0))
     extra_status, extra_failed, extra_warned = classify_extra_canary_metrics(canary)
@@ -533,11 +537,14 @@ def decide_canary_status(canary: dict, iteration: int,
 
 
 def save_promoted_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
-                             optimizer: torch.optim.Optimizer, losses: dict,
+                             optimizer, losses: dict,
                              status: str, *, nonfinite_skips: int = 0,
-                             shadow_only: bool | None = None) -> str:
+                             **checkpoint_meta) -> str:
     """Save according to canary promotion rules and return the written path."""
-    extra = {"nonfinite_skips": nonfinite_skips, "shadow_only": shadow_only}
+    extra = {
+        "nonfinite_skips": nonfinite_skips,
+        **checkpoint_meta,
+    }
     if status == "PASS":
         save_checkpoint(path, iteration, bot, optimizer, losses, **extra)
         save_checkpoint(safe_checkpoint_path(path), iteration, bot, optimizer,
@@ -551,68 +558,68 @@ def save_promoted_checkpoint(path: str, iteration: int, bot: DeepCFRBot,
 
 
 def load_checkpoint(path: str, bot: DeepCFRBot,
-                    optimizer: torch.optim.Optimizer,
-                    meta_out: dict | None = None) -> int:
-    """Restore training state. Returns iteration number.
-
-    When ``meta_out`` is given, run-level metadata that does not belong on the
-    bot (currently the cumulative ``nonfinite_skips`` counter) is copied into
-    it so a resumed run can keep counting where the prior run stopped.
-    """
+                    optimizer,
+                    meta_out: dict | None = None,
+                    buffers: dict | None = None) -> int:
+    """Restore a complete schema-v2 training snapshot."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if ckpt.get("schema_version") != DEEP_CFR_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"Cannot resume {path!r}: expected Deep CFR schema "
+            f"{DEEP_CFR_SCHEMA_VERSION}, found {ckpt.get('schema_version', 1)}. "
+            "Legacy v1 checkpoints are postmortem-only."
+        )
+    if "reservoirs" not in ckpt:
+        raise RuntimeError("schema-v2 resume requires persisted reservoirs")
+    if not isinstance(optimizer, dict):
+        optimizer = {"legacy": optimizer}
+    optimizer_states = ckpt.get("optimizer_state_dicts", {})
+    missing_optimizers = sorted(set(optimizer) - set(optimizer_states))
+    if missing_optimizers:
+        raise RuntimeError(
+            f"checkpoint is missing optimizer states: {missing_optimizers}")
+    if buffers is None:
+        buffers = {
+            "regret": bot.regret_buffer,
+            "strategy": bot.strategy_buffer,
+            "value": bot.value_buffer,
+            "sizing": bot.sizing_buffer,
+        }
+    missing_buffers = sorted(set(buffers) - set(ckpt["reservoirs"]))
+    if missing_buffers:
+        raise RuntimeError(
+            f"checkpoint is missing reservoir snapshots: {missing_buffers}")
     if meta_out is not None:
         meta_out["nonfinite_skips"] = int(ckpt.get("nonfinite_skips", 0) or 0)
+        meta_out["canary_fail_streak"] = int(
+            ckpt.get("canary_fail_streak", 0) or 0)
+        meta_out["round_index"] = int(ckpt.get("round_index", 0) or 0)
+        meta_out["last_fit_iteration"] = int(
+            ckpt.get("last_fit_iteration", ckpt.get("iteration", 0)) or 0)
+        meta_out["pilot_gates_completed"] = set(
+            int(item) for item in ckpt.get("pilot_gates_completed", []))
+        meta_out["curriculum_profile"] = ckpt.get(
+            "curriculum_profile", "sixmax")
     bot.network.load_state_dict(ckpt["network_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    bot.all_in_warmup_iterations = int(
-        ckpt.get("all_in_warmup_iterations", bot.all_in_warmup_iterations)
-    )
-    bot.all_in_deploy_iteration = int(
-        ckpt.get("all_in_deploy_iteration", bot.all_in_deploy_iteration)
-    )
-    bot.all_in_full_release_iteration = int(
-        ckpt.get(
-            "all_in_full_release_iteration",
-            bot.all_in_full_release_iteration,
-        )
-    )
+    for name, opt in optimizer.items():
+        opt.load_state_dict(optimizer_states[name])
+    for name, buffer in buffers.items():
+        buffer.load_state_dict(ckpt["reservoirs"][name])
+    if "python_random_state" in ckpt:
+        random.setstate(ckpt["python_random_state"])
+    if "bot_random_state" in ckpt:
+        bot._rng.setstate(ckpt["bot_random_state"])
+    if "torch_random_state" in ckpt:
+        torch.random.set_rng_state(ckpt["torch_random_state"])
+    if "torch_cuda_random_state_all" in ckpt and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(ckpt["torch_cuda_random_state_all"])
     iteration = ckpt["iteration"]
     print(f"[train_deep_cfr] Resumed from {path} at iteration {iteration}")
     print(
-        f"[Resume] Loaded checkpoint from iteration {iteration}.\n"
-        f"  Note: replay buffers (regret/value/sizing) are NOT persisted in\n"
-        f"  checkpoints. Buffers will refill from scratch over the next ~1000\n"
-        f"  iterations before gradient steps resume at full batch size."
+        f"[Resume] Loaded schema-v2 networks, optimizers, four reservoirs, "
+        f"and RNG state from iteration {iteration}."
     )
     return iteration
-
-
-def clear_all_in_optimizer_state(
-    optimizer: torch.optim.Optimizer,
-    bot: DeepCFRBot,
-    all_in_idx: int,
-) -> None:
-    """Clear Adam momentum for the detoxed all-in regret output row."""
-    final_linear = None
-    for module in bot.network.regret_head.mlp.modules():
-        if isinstance(module, nn.Linear):
-            final_linear = module
-    if final_linear is None:
-        return
-
-    for param, row_mode in (
-        (final_linear.weight, True),
-        (final_linear.bias, False),
-    ):
-        if param is None or param not in optimizer.state:
-            continue
-        for value in optimizer.state[param].values():
-            if not torch.is_tensor(value):
-                continue
-            if row_mode and value.dim() >= 2 and value.shape[0] > all_in_idx:
-                value[all_in_idx].zero_()
-            elif not row_mode and value.dim() >= 1 and value.shape[0] > all_in_idx:
-                value[all_in_idx].zero_()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -693,78 +700,63 @@ def _canary_collect_stats(
     views: list[PlayerView],
     *,
     search_depth: int,
-    seed: int,
     current_iteration: int,
+    use_advantage: bool = False,
 ) -> dict:
-    """Run the bot over ``views`` under deterministic inference settings.
-
-    Returns ``{"total", "all_in", "pfr", "continue", "sizes"}``.  All bot inference flags,
-    the opponent tracker, the module RNG AND the bot's per-instance RNG
-    (``bot._rng``, which drives action sampling) are saved and restored, so
-    calling this never perturbs the surrounding training loop.  Both RNGs are
-    also seeded from ``seed`` so the probe is fully reproducible for a given
-    network — without seeding bot._rng, the sampled actions would still depend
-    on the training loop's RNG state at checkpoint time.  ``pfr`` counts any
-    bet/raise/all-in (matching probe_deep_cfr); ``continue`` counts any non-fold
-    action (check/call/bet/raise/all_in — the fold-collapse complement); ``sizes``
-    collects bet/raise amounts as a fraction of pot (matching probe_deep_cfr's
-    avg-size).
-    """
-    old_training = bot.network.training
-    old_inference_mode = bot.inference_mode
-    old_weights_loaded = bot._weights_loaded
-    old_search_depth = bot.search_depth
-    old_training_iteration = bot.training_iteration
-    old_guardrails_disabled = bot._all_in_guardrails_disabled
-    old_opp_stats = bot._opp_stats
-    old_history_len = bot._last_history_len
-    old_history_snapshot = bot._last_history_snapshot
-    old_last_hand_id = bot._last_hand_id
-    old_random_state = random.getstate()
-    old_bot_rng_state = bot._rng.getstate()
-
-    stats = {"total": 0, "all_in": 0, "pfr": 0, "continue": 0, "sizes": []}
-    try:
-        random.seed(seed)
-        bot._rng.seed(seed)
+    """Aggregate expected behavior directly from policy probabilities."""
+    _ = current_iteration
+    stats = {
+        "total": 0,
+        "all_in": 0.0,
+        "pfr": 0.0,
+        "continue": 0.0,
+        "normal_action_mass": 0.0,
+        "size_numerator": 0.0,
+        "size_weight": 0.0,
+    }
+    if hasattr(bot, "network"):
         bot.network.eval()
-        bot.inference_mode = True
-        bot._weights_loaded = True
-        bot.search_depth = search_depth
-        bot.training_iteration = current_iteration
-        bot._all_in_guardrails_disabled = True
-        bot._opp_stats = None
-        bot._last_history_len = 0
-        bot._last_history_snapshot = []
-
-        for view in views:
-            action = bot.act(view)
-            stats["total"] += 1
-            if _canary_is_all_in(action, view):
-                stats["all_in"] += 1
-            if action.type in ("bet", "raise", "all_in"):
-                stats["pfr"] += 1
-            if action.type != "fold":
-                stats["continue"] += 1
-            if action.type in ("bet", "raise") and action.amount is not None:
-                stats["sizes"].append(action.amount / max(view.pot, 1))
-    finally:
-        random.setstate(old_random_state)
-        bot._rng.setstate(old_bot_rng_state)
-        bot.inference_mode = old_inference_mode
-        bot._weights_loaded = old_weights_loaded
-        bot.search_depth = old_search_depth
-        bot.training_iteration = old_training_iteration
-        bot._all_in_guardrails_disabled = old_guardrails_disabled
-        bot._opp_stats = old_opp_stats
-        bot._last_history_len = old_history_len
-        bot._last_history_snapshot = old_history_snapshot
-        bot._last_hand_id = old_last_hand_id
-        if old_training:
-            bot.network.train()
-        else:
-            bot.network.eval()
-
+    for view in views:
+        strategy, legal_mask, sizing = bot.policy_probabilities(
+            view,
+            search_depth=search_depth,
+            use_advantage=use_advantage,
+        )
+        stats["total"] += 1
+        fold_idx = ABSTRACT_ACTIONS.index("fold")
+        stats["continue"] += 1.0 - (
+            strategy[fold_idx] if fold_idx in legal_mask else 0.0)
+        for action_idx in legal_mask:
+            probability = float(strategy[action_idx])
+            label = ABSTRACT_ACTIONS[action_idx]
+            action = _abstract_to_concrete(
+                action_idx,
+                view.legal_actions,
+                view.pot,
+                sizing_frac=sizing,
+                street=view.street,
+                big_blind=_infer_big_blind(view),
+            )
+            effective_all_in = _is_effective_all_in(
+                action, view.legal_actions)
+            if effective_all_in:
+                stats["all_in"] += probability
+            if label in {
+                "bet_33", "bet_50", "bet_67", "bet_75", "bet_100", "all_in",
+            }:
+                stats["pfr"] += probability
+            if label == "check_call" or (
+                label.startswith("bet_") and not effective_all_in
+            ):
+                stats["normal_action_mass"] += probability
+            if (
+                label.startswith("bet_")
+                and not effective_all_in
+                and action.amount is not None
+            ):
+                stats["size_numerator"] += (
+                    probability * action.amount / max(view.pot, 1))
+                stats["size_weight"] += probability
     return stats
 
 
@@ -782,20 +774,22 @@ def quick_canary_probe(bot: DeepCFRBot, device: torch.device,
     _ = device  # kept for call-site/API clarity; bot.act handles device moves.
     views = _canary_views(n, seed)
     raw = _canary_collect_stats(
-        bot, views, search_depth=0, seed=seed + 1,
-        current_iteration=current_iteration,
-    )
+        bot, views, search_depth=0, current_iteration=current_iteration)
     search = _canary_collect_stats(
-        bot, views, search_depth=bot.search_depth, seed=seed + 2,
-        current_iteration=current_iteration,
-    )
+        bot, views, search_depth=bot.search_depth,
+        current_iteration=current_iteration)
     strong = _canary_collect_stats(
-        bot, _canary_strong_views(n, seed), search_depth=0, seed=seed + 3,
-        current_iteration=current_iteration,
-    )
+        bot, _canary_strong_views(n, seed), search_depth=0,
+        current_iteration=current_iteration)
+    advantage = _canary_collect_stats(
+        bot, views, search_depth=0, current_iteration=current_iteration,
+        use_advantage=True)
     n_raw = max(raw["total"], 1)
     n_strong = max(strong["total"], 1)
-    avg_raise = sum(raw["sizes"]) / len(raw["sizes"]) if raw["sizes"] else 0.0
+    avg_raise = (
+        raw["size_numerator"] / raw["size_weight"]
+        if raw["size_weight"] > 0 else 0.0
+    )
     return {
         "raw_all_in": raw["all_in"] / n_raw,
         "search_all_in": search["all_in"] / max(search["total"], 1),
@@ -803,6 +797,8 @@ def quick_canary_probe(bot: DeepCFRBot, device: torch.device,
         "preflop_avg_raise": avg_raise,
         "strong_all_in": strong["all_in"] / n_strong,
         "strong_continue": strong["continue"] / n_strong,
+        "normal_action_mass": raw["normal_action_mass"] / n_raw,
+        "advantage_raw_all_in": advantage["all_in"] / n_raw,
     }
 
 
@@ -821,7 +817,9 @@ def format_canary_metrics(canary: dict) -> str:
         f"PFR={canary.get('preflop_pfr', 0.0):.1%}, "
         f"avg_raise={canary.get('preflop_avg_raise', 0.0):.1f}x, "
         f"strong_all_in={canary.get('strong_all_in', 0.0):.1%}, "
-        f"strong_continue={canary.get('strong_continue', 1.0):.1%}"
+        f"strong_continue={canary.get('strong_continue', 1.0):.1%}, "
+        f"normal_mass={canary.get('normal_action_mass', 0.0):.1%}, "
+        f"adv_raw={canary.get('advantage_raw_all_in', 0.0):.1%}"
     )
 
 
@@ -829,16 +827,18 @@ def format_canary_metrics(canary: dict) -> str:
 #  Progress printing
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def print_progress(t: int, regret_buf, value_buf, sizing_buf, losses,
+def print_progress(t: int, regret_buf, strategy_buf, value_buf, sizing_buf, losses,
                    elapsed: float = 0.0):
     r = losses["regret"][-1] if losses["regret"] else 0.0
+    p = losses["strategy"][-1] if losses["strategy"] else 0.0
     v = losses["value"][-1] if losses["value"] else 0.0
     s = losses["sizing"][-1] if losses["sizing"] else 0.0
     rate = t / elapsed if elapsed > 0 else 0
     print(
         f"  iter={t:>7}  "
-        f"bufs=({len(regret_buf)},{len(value_buf)},{len(sizing_buf)})  "
-        f"loss=(r={r:.4f}, v={v:.4f}, s={s:.4f})  "
+        f"bufs=({len(regret_buf)},{len(strategy_buf)},"
+        f"{len(value_buf)},{len(sizing_buf)})  "
+        f"loss=(a={r:.4f}, p={p:.4f}, v={v:.4f}, s={s:.4f})  "
         f"rate={rate:.1f} it/s",
         flush=True,
     )
@@ -849,64 +849,81 @@ def print_progress(t: int, regret_buf, value_buf, sizing_buf, losses,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def run_training(args) -> dict:
-    """Core training loop. Returns dict with final state info."""
+    """Collect frozen-policy rounds and fit independent schema-v2 networks."""
     device = pick_device(args.device)
-    config = DeepCFRConfig.small() if args.variant == "small" else DeepCFRConfig.large()
-
-    bot = DeepCFRBot(config=config, inference_mode=False,
-                     aivat_sims=args.aivat_sims)
-    bot.all_in_warmup_iterations = args.all_in_warmup_iterations
-    bot.all_in_deploy_iteration = args.all_in_deploy_iteration
-    bot.all_in_full_release_iteration = args.all_in_full_release_iteration
+    config = (
+        DeepCFRConfig.small()
+        if args.variant == "small"
+        else DeepCFRConfig.large()
+    )
+    bot = DeepCFRBot(
+        config=config, inference_mode=False, aivat_sims=args.aivat_sims)
     bot.network.to(device)
-    bot.network.train()
 
-    optimizer = torch.optim.Adam(bot.network.parameters(), lr=args.lr)
+    def make_optimizers():
+        return {
+            "advantage": torch.optim.Adam(
+                bot.network.advantage.parameters(), lr=args.lr),
+            "strategy": torch.optim.Adam(
+                bot.network.strategy.parameters(), lr=args.lr),
+            "value": torch.optim.Adam(
+                bot.network.value.parameters(), lr=args.lr),
+            "sizing": torch.optim.Adam(
+                bot.network.sizing.parameters(), lr=args.lr),
+        }
 
-    regret_buf = ReservoirBuffer(capacity=1_000_000)
-    value_buf = ReservoirBuffer(capacity=1_000_000)
-    sizing_buf = ReservoirBuffer(capacity=1_000_000)
+    optimizers = make_optimizers()
+    buffers = {
+        "regret": ReservoirBuffer(capacity=1_000_000),
+        "strategy": ReservoirBuffer(capacity=1_000_000),
+        "value": ReservoirBuffer(capacity=1_000_000),
+        "sizing": ReservoirBuffer(capacity=1_000_000),
+    }
+    bot.regret_buffer = buffers["regret"]
+    bot.strategy_buffer = buffers["strategy"]
+    bot.value_buffer = buffers["value"]
+    bot.sizing_buffer = buffers["sizing"]
 
-    # Cumulative + consecutive counters for the finiteness guard (B2/I5).
-    # "total" persists across resumes via checkpoint metadata; "consecutive"
-    # resets on any successful finite optimizer step.
+    losses = {"regret": [], "strategy": [], "value": [], "sizing": []}
+    head_steps = {
+        "regret": 0, "strategy": 0, "value": 0, "sizing": 0}
     nonfinite = {"total": 0, "consecutive": 0}
-
+    canary_fail_streak = 0
+    round_index = 0
+    last_fit_iteration = 0
+    pilot_gates_completed: set[int] = set()
     start_iter = 0
-    if args.resume and os.path.exists(args.resume):
+
+    if args.resume:
+        if not os.path.exists(args.resume):
+            raise RuntimeError(f"resume checkpoint not found: {args.resume}")
         resume_meta: dict = {}
-        start_iter = load_checkpoint(args.resume, bot, optimizer,
-                                     meta_out=resume_meta)
-        nonfinite["total"] = int(resume_meta.get("nonfinite_skips", 0))
-        bot.all_in_warmup_iterations = args.all_in_warmup_iterations
-        bot.all_in_deploy_iteration = args.all_in_deploy_iteration
-        bot.all_in_full_release_iteration = args.all_in_full_release_iteration
-        if args.detox_all_in_on_resume:
-            layer_name, all_in_idx = bot.detox_all_in_regret_output()
-            clear_all_in_optimizer_state(optimizer, bot, all_in_idx)
-            print(
-                f"[Detox] Reset all-in regret output at {layer_name}[{all_in_idx}] "
-                "and cleared optimizer momentum for that row."
-            )
+        start_iter = load_checkpoint(
+            args.resume,
+            bot,
+            optimizers,
+            meta_out=resume_meta,
+            buffers=buffers,
+        )
+        if resume_meta.get("curriculum_profile") != args.curriculum_profile:
+            raise RuntimeError(
+                "resume curriculum profile does not match command line")
+        nonfinite["total"] = resume_meta["nonfinite_skips"]
+        canary_fail_streak = resume_meta["canary_fail_streak"]
+        round_index = resume_meta["round_index"]
+        last_fit_iteration = resume_meta["last_fit_iteration"]
+        pilot_gates_completed = resume_meta["pilot_gates_completed"]
 
-    losses = {"regret": [], "value": [], "sizing": []}
-    gradient_steps_taken = 0
-    optimizer_steps_taken = 0
-    head_steps = {"regret": 0, "value": 0, "sizing": 0}
-
-    # Signal handling (B5/M4): SIGINT *and* SIGTERM both request a graceful
-    # stop — finish the current traversal, save a final checkpoint, and report
-    # status="interrupted" so main() can exit 128+signum (130/143).  Pre-fix,
-    # SIGINT exited 0 with status "complete" (an orchestrator keying on the
-    # exit code would treat an under-trained model as finished) and SIGTERM
-    # was untrapped (an OS kill lost the in-flight checkpoint).
     interrupted = {"flag": False, "signum": None}
 
-    def _signal_handler(signum, frame):
+    def _signal_handler(signum, _frame):
         interrupted["flag"] = True
         interrupted["signum"] = signum
-        print(f"\n[train_deep_cfr] {signal.Signals(signum).name} received — "
-              f"saving checkpoint …", flush=True)
+        print(
+            f"\n[train_deep_cfr] {signal.Signals(signum).name} received; "
+            "saving a resumable schema-v2 checkpoint...",
+            flush=True,
+        )
 
     original_sigint = signal.getsignal(signal.SIGINT)
     original_sigterm = signal.getsignal(signal.SIGTERM)
@@ -914,446 +931,353 @@ def run_training(args) -> dict:
     signal.signal(signal.SIGTERM, _signal_handler)
 
     print("=" * 70)
-    print("TRAINING DEEP CFR PLUS")
+    print("TRAINING MULTIWAY DEEP CFR-INSPIRED V2")
     print("=" * 70)
-    print(f"  Variant:            {args.variant}")
-    print(f"  Iterations:         {args.iterations}")
-    print(f"  Update interval:    {args.update_interval}")
-    print(f"  Checkpoint interval:{args.checkpoint_interval}")
-    print(f"  Batch size:         {args.batch_size}")
-    print(f"  Learning rate:      {args.lr}")
-    print(f"  AIVAT sims:         {args.aivat_sims}")
-    print(f"  Curriculum:         players {CURRICULUM_PLAYER_COUNTS[0]}-"
-          f"{CURRICULUM_PLAYER_COUNTS[-1]}, "
-          f"{CURRICULUM_MIN_DEPTH_BB}-{CURRICULUM_MAX_DEPTH_BB} BB "
-          f"log-uniform (50% shared / 50% per-seat depths)")
-    print(f"  Exploration eps:    0.30 → 0.05")
-    print(f"  All-in shadow:      before iteration {args.all_in_warmup_iterations}")
-    print(f"  All-in deploy gate: before iteration {args.all_in_deploy_iteration}")
-    print(f"  All-in full release:{args.all_in_full_release_iteration}")
-    print(f"  All-in detox:       {'enabled' if args.detox_all_in_on_resume else 'disabled'}")
-    print(f"  Collapse canary:    {'disabled' if args.disable_collapse_canary else 'enabled'}")
-    print(f"  Device:             {device}")
-    print(f"  Save path:          {args.save_path}")
-    total_params = sum(p.numel() for p in bot.network.parameters())
-    print(f"  Network params:     {total_params:,}")
+    print(f"  Variant:             {args.variant}")
+    print(f"  Traversals:          {args.iterations}")
+    print(f"  Frozen round size:   {args.round_size}")
+    print(f"  Fit-step divisor:    {args.update_interval}")
+    print(f"  Checkpoint interval: {args.checkpoint_interval}")
+    print(f"  Curriculum:          {args.curriculum_profile} "
+          f"{CURRICULUM_PROFILES[args.curriculum_profile]}")
+    print(f"  Canary enforcement:  iter >= {args.canary_enforce_iteration}")
+    print(f"  Canary patience:     {args.canary_fail_patience}")
+    print(f"  Device:              {device}")
+    print(f"  Save path:           {args.save_path}")
+    print(f"  Parameters:          "
+          f"{sum(p.numel() for p in bot.network.parameters()):,}")
     print("=" * 70)
-    print()
 
     t0 = _time.monotonic()
-    abort_without_save = False
-    nonfinite_abort = False
+    completed_iter = start_iter
+    gradient_steps_taken = 0
+    optimizer_steps_taken = 0
     last_checkpoint_iter = None
     last_checkpoint_written = None
-    # Iteration accounting (4.1): the number of FULLY completed iterations.
-    # The loop variable cannot be trusted for this — a signal breaks at the
-    # TOP of iteration t+1, where the loop variable already reads t+1 even
-    # though only t iterations ran (and it does not exist at all if the
-    # signal lands before the first iteration).  Every report and checkpoint
-    # stamp below uses this counter, so --resume continues exactly where the
-    # run stopped instead of silently skipping one iteration.
-    completed_iter = start_iter
+    abort_without_save = False
+    nonfinite_abort = False
 
-    def final_shadow_stamp(iteration: int) -> bool | None:
-        """Shadow-only stamp decision for a FINAL checkpoint (B4/I9).
-
-        A final checkpoint below the all-in deploy gate yields a model whose
-        inference permanently masks all-in.  Warn loudly and stamp the
-        checkpoint metadata, but still save — smoke runs are intentionally
-        short and must keep working (warn-and-stamp, NOT refuse).  Returns
-        True (stamp) or None (omit the key entirely).
-        """
-        if iteration >= bot.all_in_deploy_iteration:
-            return None
-        print(
-            f"\n[WARN] FINAL checkpoint at iteration {iteration} is below "
-            f"the all-in deploy gate ({bot.all_in_deploy_iteration}).\n"
-            f"       Inference for this model will PERMANENTLY mask the "
-            f"all-in action — it is a SHADOW-ONLY artifact, not a "
-            f"deployable bot.\n"
-            f"       Stamping checkpoint metadata \"shadow_only\": true. "
-            f"Train with --iterations >= "
-            f"{bot.all_in_deploy_iteration} (TRAINING_PLAN step 7 uses "
-            f"1,000,000) for a deployable model.\n",
-            flush=True,
-        )
-        return True
+    def checkpoint_kwargs():
+        return {
+            "buffers": buffers,
+            "canary_fail_streak": canary_fail_streak,
+            "round_index": round_index,
+            "last_fit_iteration": last_fit_iteration,
+            "pilot_gates_completed": pilot_gates_completed,
+            "curriculum_profile": args.curriculum_profile,
+        }
 
     def save_emergency_checkpoint(iteration: int, reason: str) -> str:
-        """Final save for an interrupted/aborted run — NEVER runs the canary.
-
-        SIGINT/SIGTERM and the non-finite-loss abort must always preserve
-        work for --resume and post-mortem.  Routing them through
-        checkpoint_with_canary would (a) lose the checkpoint outright on a
-        FAIL verdict and (b) spend ~150 bot.act() probe calls inside a
-        SIGTERM grace window where a supervisor may escalate to SIGKILL.
-        The canary still gates every PROMOTED checkpoint: the deploy-grade
-        artifacts remain the canary-vetted save/safe pair, and this save
-        only refreshes args.save_path (it never touches the .safe copy).
-        """
-        shadow_only = final_shadow_stamp(iteration)  # the run ends here
-        save_checkpoint(args.save_path, iteration, bot, optimizer, losses,
-                        nonfinite_skips=nonfinite["total"],
-                        shadow_only=shadow_only)
-        print(f"[train_deep_cfr] Emergency checkpoint ({reason}) saved to "
-              f"{args.save_path} — collapse canary skipped.", flush=True)
+        save_checkpoint(
+            args.save_path,
+            iteration,
+            bot,
+            optimizers,
+            losses,
+            nonfinite_skips=nonfinite["total"],
+            canary_status="EMERGENCY",
+            **checkpoint_kwargs(),
+        )
+        print(
+            f"[train_deep_cfr] Emergency checkpoint ({reason}) saved to "
+            f"{args.save_path}; canary skipped.",
+            flush=True,
+        )
         return args.save_path
 
-    def checkpoint_with_canary(iteration: int, *,
-                               final: bool = False) -> tuple[str, str]:
-        shadow_only = final_shadow_stamp(iteration) if final else None
+    def checkpoint_with_canary(iteration: int) -> tuple[str, str]:
+        nonlocal canary_fail_streak
         if args.disable_collapse_canary:
-            save_checkpoint(args.save_path, iteration, bot, optimizer, losses,
-                            nonfinite_skips=nonfinite["total"],
-                            shadow_only=shadow_only)
+            save_checkpoint(
+                args.save_path,
+                iteration,
+                bot,
+                optimizers,
+                losses,
+                nonfinite_skips=nonfinite["total"],
+                canary_status="DISABLED",
+                **checkpoint_kwargs(),
+            )
             return "DISABLED", args.save_path
 
-        canary = quick_canary_probe(bot, device, current_iteration=iteration)
-        raw_all_in = canary["raw_all_in"]
-        search_all_in = canary["search_all_in"]
-
-        # All canary metrics are diagnostic until the model reaches the deploy
-        # boundary.  Before then, all-in is masked at inference and its output
-        # row is intentionally untrained during the shadow phase; treating that
-        # raw score as deploy-mature caused false aborts at early checkpoints.
-        (status, base_status, extra_status, extra_failed, extra_warned,
-         metrics_enforced) = decide_canary_status(
-            canary, iteration, bot.all_in_deploy_iteration)
-
-        phase = all_in_phase_for_iteration(
-            iteration,
-            bot.all_in_warmup_iterations,
-            bot.all_in_full_release_iteration,
-        )
-        metrics_str = format_canary_metrics(canary)
-        diagnostic_status = _worst_canary_status(base_status, extra_status)
-        defer_note = "" if metrics_enforced else (
-            f" [all health metrics reported only; enforced at iter >= "
-            f"{bot.all_in_deploy_iteration}; would be {diagnostic_status}]")
-        if status == "FAIL":
-            reasons: list[str] = []
-            if base_status == "FAIL":
-                reasons.append(
-                    f"all-in (search={search_all_in:.1%} > "
-                    f"{CANARY_FAIL_SEARCH_MIN:.0%} or raw={raw_all_in:.1%} > "
-                    f"{CANARY_FAIL_RAW_MIN:.0%})")
-            if metrics_enforced:
-                reasons.extend(extra_failed)
-            # Header is generic ("collapse canary") so a fold-collapse abort
-            # (strong_continue too low) is not mislabeled as an all-in collapse;
-            # the reason list names the specific tripping metric(s).
+        canary = quick_canary_probe(
+            bot, device, current_iteration=iteration)
+        pending_pilot_gates = [
+            gate for gate in PILOT_GATE_ITERATIONS
+            if gate <= iteration and gate not in pilot_gates_completed
+        ]
+        pilot_failures = (
+            pilot_health_failures(canary) if pending_pilot_gates else [])
+        if pilot_failures:
             raise RuntimeError(
-                f"Collapse canary FAILED at iter {iteration}: phase={phase} "
-                f"{metrics_str} -- FAILED: {'; '.join(reasons)}"
-            )
-        if status == "WARN":
-            reasons = []
-            if base_status == "WARN":
-                reasons.append("all-in freq")
-            if metrics_enforced:
-                reasons.extend(extra_warned)
+                f"Pilot health gate {pending_pilot_gates} failed at "
+                f"checkpoint iter {iteration}: "
+                f"{format_canary_metrics(canary)}; "
+                f"FAILED: {'; '.join(pilot_failures)}")
+        pilot_gates_completed.update(pending_pilot_gates)
+        (
+            status,
+            base_status,
+            _extra_status,
+            extra_failed,
+            extra_warned,
+            metrics_enforced,
+        ) = decide_canary_status(
+            canary, iteration, args.canary_enforce_iteration)
+        diagnostic_status = _worst_canary_status(
+            base_status, classify_extra_canary_metrics(canary)[0])
+        if metrics_enforced and diagnostic_status == "FAIL":
+            canary_fail_streak += 1
+        elif metrics_enforced:
+            canary_fail_streak = 0
+
+        metrics_str = format_canary_metrics(canary)
+        defer_note = "" if metrics_enforced else (
+            f" [reported only; enforced at iter >= "
+            f"{args.canary_enforce_iteration}; would be {diagnostic_status}]")
+        if (
+            metrics_enforced
+            and diagnostic_status == "FAIL"
+            and canary_fail_streak >= args.canary_fail_patience
+        ):
+            reasons = list(extra_failed)
+            if base_status == "FAIL":
+                reasons.insert(0, "raw/search all-in probability")
+            raise RuntimeError(
+                f"Collapse canary failed {canary_fail_streak} consecutive "
+                f"checkpoints at iter {iteration}: {metrics_str}; "
+                f"FAILED: {'; '.join(reasons)}")
+
+        save_status = status
+        if metrics_enforced and diagnostic_status == "FAIL":
+            save_status = "WARN"
+        if save_status == "WARN":
+            reasons = list(extra_warned)
+            if diagnostic_status == "FAIL":
+                reasons = list(extra_failed) or ["raw/search all-in"]
             print(
-                f"[WARN] iter {iteration}: phase={phase} {metrics_str}{defer_note} "
-                f"-- side checkpoint only ({'; '.join(reasons)})",
+                f"[WARN] iter {iteration}: {metrics_str}{defer_note}; "
+                f"failure_streak={canary_fail_streak}/"
+                f"{args.canary_fail_patience}; side checkpoint only "
+                f"({'; '.join(reasons)})",
                 flush=True,
             )
         else:
             print(
-                f"[CANARY] iter {iteration}: phase={phase} {metrics_str}{defer_note}",
+                f"[CANARY] iter {iteration}: {metrics_str}{defer_note}",
                 flush=True,
             )
         written = save_promoted_checkpoint(
             args.save_path,
             iteration,
             bot,
-            optimizer,
+            optimizers,
             losses,
-            status,
+            save_status,
             nonfinite_skips=nonfinite["total"],
-            shadow_only=shadow_only,
+            canary_status=(
+                save_status
+                if metrics_enforced
+                else f"DIAGNOSTIC_{diagnostic_status}"
+            ),
+            last_canary_metrics=canary,
+            **checkpoint_kwargs(),
         )
-        return status, written
+        return save_status, written
+
+    def fit_round(round_end: int, round_span: int) -> bool:
+        nonlocal optimizers, round_index, last_fit_iteration
+        nonlocal gradient_steps_taken, optimizer_steps_taken, nonfinite_abort
+        bot.network.reinitialize_advantage()
+        optimizers["advantage"] = torch.optim.Adam(
+            bot.network.advantage.parameters(), lr=args.lr)
+        fit_steps = max(1, math.ceil(round_span / max(1, args.update_interval)))
+        print(
+            f"[ROUND] fitting round {round_index + 1} at iter {round_end}: "
+            f"{fit_steps} steps from cumulative reservoirs",
+            flush=True,
+        )
+        for _ in range(fit_steps):
+            r_loss, v_loss, s_loss, info = train_step(
+                bot.network,
+                optimizers,
+                buffers["regret"],
+                buffers["value"],
+                buffers["sizing"],
+                args.batch_size,
+                device,
+                strategy_buf=buffers["strategy"],
+            )
+            if info["nonfinite_skip"]:
+                nonfinite["total"] += 1
+                nonfinite["consecutive"] += 1
+                print(
+                    f"[WARN] iter {round_end}: non-finite training loss; "
+                    f"optimizer step skipped "
+                    f"(a={r_loss}, p={info.get('strategy_loss', 0.0)}, "
+                    f"v={v_loss}, s={s_loss}; "
+                    f"consecutive={nonfinite['consecutive']})",
+                    flush=True,
+                )
+                if (
+                    nonfinite["consecutive"]
+                    >= NONFINITE_SKIPS_ABORT_THRESHOLD
+                ):
+                    print(
+                        f"[ABORT] {nonfinite['consecutive']} consecutive "
+                        "non-finite training losses.",
+                        flush=True,
+                    )
+                    nonfinite_abort = True
+                    return False
+                continue
+            nonfinite["consecutive"] = 0
+            losses["regret"].append(r_loss)
+            losses["strategy"].append(info.get("strategy_loss", 0.0))
+            losses["value"].append(v_loss)
+            losses["sizing"].append(s_loss)
+            if info["did_step"]:
+                optimizer_steps_taken += 1
+            for head, trained in info["heads_trained"].items():
+                if trained:
+                    head_steps[head] += 1
+            if info["heads_trained"].get("regret", False):
+                gradient_steps_taken += 1
+        round_index += 1
+        last_fit_iteration = round_end
+        bot.network.eval()
+        return True
 
     try:
         for t in range(start_iter + 1, args.iterations + 1):
             if interrupted["flag"]:
                 break
-
-            # Curriculum sampling (Fix 5 / I6): random player count 2-6 and
-            # 10-200 BB stack depths so heads-up / short-stack endgames are
-            # in-distribution, with the original hero-seat rotation.
-            state, hero_seat = sample_curriculum_state(t)
-
+            state, hero_seat = sample_curriculum_state(
+                t, profile=args.curriculum_profile)
             bot.network.eval()
-            eps = epsilon_for_iteration(t, args.iterations)
-            allow_all_in = allow_all_in_for_iteration(
-                t, bot.all_in_warmup_iterations)
-            all_in_policy_probability = all_in_policy_probability_for_iteration(
-                t,
-                bot.all_in_warmup_iterations,
-                bot.all_in_full_release_iteration,
-            )
             bot._cfr_recurse(
-                state, hero_seat, depth=bot._MAX_CFR_DEPTH,
+                state,
+                hero_seat,
+                depth=bot._MAX_CFR_DEPTH,
                 iteration=t,
-                regret_buf=regret_buf,
-                value_buf=value_buf,
-                sizing_buf=sizing_buf,
-                exploration_epsilon=eps,
-                allow_all_in=allow_all_in,
-                all_in_policy_probability=all_in_policy_probability,
+                regret_buf=buffers["regret"],
+                strategy_buf=buffers["strategy"],
+                value_buf=buffers["value"],
+                sizing_buf=buffers["sizing"],
+                exploration_epsilon=epsilon_for_iteration(t, args.iterations),
             )
-            # Iteration t's traversal is done — count it.  The gradient step
-            # and checkpoint below are interval-based aggregates over the
-            # buffers, not part of "did iteration t run", so an abort inside
-            # them still reports t completed iterations.
             completed_iter = t
 
-            # Periodic gradient steps
-            if t % args.update_interval == 0:
-                bot.network.train()
-                r_loss, v_loss, s_loss, step_info = train_step(
-                    bot.network, optimizer,
-                    regret_buf, value_buf, sizing_buf,
-                    args.batch_size, device,
-                )
-                if step_info.get("nonfinite_skip"):
-                    # Finiteness guard tripped (B2/I5): parameters were left
-                    # untouched.  Log the three component losses so the bad
-                    # head is identifiable, and keep the NaN out of the loss
-                    # history (checkpoints store that history).
-                    nonfinite["total"] += 1
-                    nonfinite["consecutive"] += 1
-                    print(
-                        f"[WARN] iter {t}: non-finite loss — optimizer step "
-                        f"SKIPPED (r={r_loss}, v={v_loss}, s={s_loss}; "
-                        f"consecutive={nonfinite['consecutive']}, "
-                        f"total={nonfinite['total']})",
-                        flush=True,
-                    )
-                    if nonfinite["consecutive"] >= NONFINITE_SKIPS_ABORT_THRESHOLD:
-                        print(
-                            f"[ABORT] {nonfinite['consecutive']} consecutive "
-                            f"non-finite losses (threshold "
-                            f"{NONFINITE_SKIPS_ABORT_THRESHOLD}) — training "
-                            f"signal is broken, aborting. Parameters are "
-                            f"finite (every bad step was skipped); the final "
-                            f"checkpoint is still saved.",
-                            flush=True,
-                        )
-                        nonfinite_abort = True
-                        break
-                else:
-                    losses["regret"].append(r_loss)
-                    losses["value"].append(v_loss)
-                    losses["sizing"].append(s_loss)
-                    if step_info["did_step"]:
-                        optimizer_steps_taken += 1
-                        # A successful finite step ends any non-finite streak.
-                        nonfinite["consecutive"] = 0
-                    for head, trained in step_info["heads_trained"].items():
-                        if trained:
-                            head_steps[head] += 1
-                    if step_info["heads_trained"]["regret"]:
-                        gradient_steps_taken += 1
+            at_round_end = t - last_fit_iteration >= args.round_size
+            at_final = t == args.iterations
+            if at_round_end or at_final:
+                span = max(1, t - last_fit_iteration)
+                if not fit_round(t, span):
+                    break
 
-            # Checkpoint.  A periodic save landing exactly on the last
-            # iteration IS the run's final checkpoint — mark it as such so
-            # the shadow-only stamp/warning (B4/I9) cannot be skipped just
-            # because --iterations is a multiple of --checkpoint-interval.
             if t % args.checkpoint_interval == 0:
                 try:
-                    _, last_checkpoint_written = checkpoint_with_canary(
-                        t, final=(t >= args.iterations))
+                    _, last_checkpoint_written = checkpoint_with_canary(t)
                     last_checkpoint_iter = t
                 except RuntimeError as exc:
-                    # All-in collapse canary tripped mid-run.  Break out of the
-                    # loop rather than re-raising: the finally block prints the
-                    # ABORT footer and the post-loop `abort_without_save` block
-                    # returns status="aborted" (which main() maps to a nonzero
-                    # exit).  Re-raising skipped that documented return path.
                     print(f"[ABORT] {exc}", flush=True)
                     abort_without_save = True
                     break
 
-            # Progress
             if t % max(1, args.update_interval) == 0:
-                elapsed = _time.monotonic() - t0
-                print_progress(t, regret_buf, value_buf, sizing_buf, losses,
-                               elapsed)
-
+                print_progress(
+                    t,
+                    buffers["regret"],
+                    buffers["strategy"],
+                    buffers["value"],
+                    buffers["sizing"],
+                    losses,
+                    _time.monotonic() - t0,
+                )
     except KeyboardInterrupt:
-        # Belt-and-braces: our handler replaces the default SIGINT behavior,
-        # so this only triggers for a KeyboardInterrupt raised by other means.
         interrupted["flag"] = True
         interrupted["signum"] = interrupted["signum"] or signal.SIGINT
-        print("\n[train_deep_cfr] KeyboardInterrupt — saving checkpoint …")
     finally:
-        # Final save.  completed_iter — NOT the loop variable — is the number
-        # of fully completed iterations (see its definition above), so the
-        # report and checkpoint metadata never claim an iteration that only
-        # started.
         final_iter = completed_iter
         if interrupted["flag"] or nonfinite_abort:
-            # Emergency save (4.1): unconditional and canary-free.  This may
-            # re-save an iteration a periodic checkpoint already covered —
-            # cheap, and it guarantees args.save_path holds the latest state
-            # with the correct final shadow_only stamp for --resume.
-            #
-            # Checked BEFORE abort_without_save on purpose (4.2): a signal
-            # can land while a periodic canary probe is mid-flight, and when
-            # that probe then FAILs, both flags are set at once.  The run is
-            # still an interrupt — the result tail below reports
-            # status="interrupted" — so the save policy must match (pre-4.2
-            # the abort branch won and the "interrupted" run saved nothing).
-            # The FAILed canary still did its job: it kept this network out
-            # of the promoted save/.safe pair; this save only refreshes
-            # args.save_path.
-            reason = ("nonfinite_abort" if nonfinite_abort else
-                      signal.Signals(int(interrupted["signum"]
-                                         or signal.SIGINT)).name)
+            reason = (
+                "nonfinite_abort"
+                if nonfinite_abort
+                else signal.Signals(
+                    int(interrupted["signum"] or signal.SIGINT)).name
+            )
             last_checkpoint_written = save_emergency_checkpoint(
                 final_iter, reason)
-            if abort_without_save:
-                # Post-mortem breadcrumb for the double-flag case above.
-                print("[train_deep_cfr] NOTE: a periodic collapse-canary "
-                      "FAIL was also observed this run — the emergency "
-                      "checkpoint is for --resume/post-mortem only; the "
-                      ".safe copy remains the last canary-vetted artifact.",
-                      flush=True)
         elif abort_without_save:
-            # An actual canary probe FAILED on this exact network at a
-            # periodic checkpoint, and NO emergency (signal / non-finite
-            # abort) is active: the policy is collapsed, so refusing to
-            # save it (and stopping) IS the intended behavior.
             print(
-                "[ABORT] Final checkpoint not saved because the all-in "
-                "collapse canary tripped.",
+                "[ABORT] Final checkpoint not saved because the collapse "
+                "canary exhausted its failure patience.",
                 flush=True,
             )
         elif final_iter != last_checkpoint_iter:
             try:
-                _, last_checkpoint_written = checkpoint_with_canary(
-                    final_iter, final=True)
+                _, last_checkpoint_written = checkpoint_with_canary(final_iter)
             except RuntimeError as exc:
                 print(f"[ABORT] Final checkpoint not saved: {exc}", flush=True)
                 abort_without_save = True
-        else:
-            _ = last_checkpoint_written
         signal.signal(signal.SIGINT, original_sigint)
         signal.signal(signal.SIGTERM, original_sigterm)
 
     elapsed_total = _time.monotonic() - t0
-    if gradient_steps_taken == 0:
-        print(
-            f"[WARN] Training completed with 0 gradient steps. "
-            f"Buffer sizes at end: regret={len(regret_buf)}, "
-            f"value={len(value_buf)}, sizing={len(sizing_buf)}. "
-            f"Likely cause: --batch-size {args.batch_size} too large for "
-            f"--iterations {args.iterations}. Try --batch-size 32 for short runs."
-        )
-
+    status = "complete"
+    abort_reason = None
     if interrupted["flag"]:
-        # SIGINT/SIGTERM: the finally block above already saved the final
-        # checkpoint via the canary-free emergency path (4.1) — an interrupt
-        # can never lose work to a FAILing canary probe, even one that FAILs
-        # while the interrupt arrives (the emergency branch outranks
-        # abort_without_save, 4.2).  Report "interrupted" — never
-        # "complete" — and let main() exit 128+signum.
-        signum = int(interrupted["signum"] or signal.SIGINT)
-        print(f"\n{'='*70}")
-        print(f"Training interrupted ({signal.Signals(signum).name}).")
-        print(f"  Iterations reached: {final_iter}")
-        print(f"  Gradient steps:     {gradient_steps_taken}")
-        print(f"  Optimizer steps:    {optimizer_steps_taken}")
-        print(f"  Non-finite skips:   {nonfinite['total']}")
-        print(f"  Wall-clock:         {elapsed_total:.1f}s")
-        print(f"  Last checkpoint:    {last_checkpoint_written or '<none>'}")
-        print(f"{'='*70}")
-        return {
-            "status": "interrupted",
-            "signal": signum,
-            "final_iter": final_iter,
-            "gradient_steps": gradient_steps_taken,
-            "gradient_steps_taken": gradient_steps_taken,
-            "optimizer_steps_taken": optimizer_steps_taken,
-            "head_steps": head_steps,
-            "nonfinite_skips": nonfinite["total"],
-            "losses": losses,
-            "regret_buf": regret_buf,
-            "value_buf": value_buf,
-            "sizing_buf": sizing_buf,
-            "bot": bot,
-            "optimizer": optimizer,
-            "elapsed": elapsed_total,
-            "checkpoint_saved": last_checkpoint_written,
-        }
-
-    if abort_without_save or nonfinite_abort:
-        # Two distinct abort modes share the "aborted" status:
-        #   collapse_canary — policy collapsed; final checkpoint NOT saved.
-        #   nonfinite_loss  — too many consecutive non-finite losses; the
-        #                     parameters are finite (bad steps were skipped),
-        #                     so the finally block above did save a final
-        #                     checkpoint.
-        abort_reason = "collapse_canary" if abort_without_save else "nonfinite_loss"
-        print(f"\n{'='*70}")
-        print(f"Training aborted ({abort_reason}).")
-        print(f"  Iterations reached: {final_iter}")
-        print(f"  Gradient steps:     {gradient_steps_taken}")
-        print(f"  Optimizer steps:    {optimizer_steps_taken}")
-        print(f"  Non-finite skips:   {nonfinite['total']}")
-        print(f"  Wall-clock:         {elapsed_total:.1f}s")
-        print(f"  Last checkpoint:    {last_checkpoint_written or '<none>'}")
-        print(f"{'='*70}")
-        return {
-            "status": "aborted",
-            "abort_reason": abort_reason,
-            "final_iter": final_iter,
-            "gradient_steps": gradient_steps_taken,
-            "gradient_steps_taken": gradient_steps_taken,
-            "optimizer_steps_taken": optimizer_steps_taken,
-            "head_steps": head_steps,
-            "nonfinite_skips": nonfinite["total"],
-            "losses": losses,
-            "regret_buf": regret_buf,
-            "value_buf": value_buf,
-            "sizing_buf": sizing_buf,
-            "bot": bot,
-            "optimizer": optimizer,
-            "elapsed": elapsed_total,
-            "checkpoint_saved": last_checkpoint_written,
-        }
+        status = "interrupted"
+    elif nonfinite_abort:
+        status = "aborted"
+        abort_reason = "nonfinite_loss"
+    elif abort_without_save:
+        status = "aborted"
+        abort_reason = "collapse_canary"
 
     print(f"\n{'='*70}")
-    print(f"Training complete.")
-    print(f"  Iterations:       {final_iter}")
-    print(f"  Gradient steps:   {gradient_steps_taken}")
-    print(f"  Optimizer steps:  {optimizer_steps_taken}")
-    print(f"  Head steps:       regret={head_steps['regret']}, value={head_steps['value']}, sizing={head_steps['sizing']}")
-    print(f"  Non-finite skips: {nonfinite['total']}")
-    print(f"  Buffer sizes:     regret={len(regret_buf)}, value={len(value_buf)}, sizing={len(sizing_buf)}")
-    print(f"  Wall-clock:       {elapsed_total:.1f}s")
-    print(f"  Checkpoint saved: {last_checkpoint_written or args.save_path}")
+    if status == "interrupted":
+        signum = int(interrupted["signum"] or signal.SIGINT)
+        print(f"Training interrupted ({signal.Signals(signum).name}).")
+    elif status == "aborted":
+        print(f"Training aborted ({abort_reason}).")
+    else:
+        print("Training complete.")
+    print(f"  Traversals reached: {final_iter}")
+    print(f"  Frozen rounds fit:  {round_index}")
+    print(f"  Advantage steps:    {gradient_steps_taken}")
+    print(f"  Optimizer batches:  {optimizer_steps_taken}")
+    print(f"  Canary fail streak: {canary_fail_streak}")
+    print(f"  Wall-clock:         {elapsed_total:.1f}s")
+    print(f"  Last checkpoint:    {last_checkpoint_written or '<none>'}")
     print(f"{'='*70}")
 
-    return {
-        "status": "complete",
+    result = {
+        "status": status,
         "final_iter": final_iter,
+        "round_index": round_index,
         "gradient_steps": gradient_steps_taken,
         "gradient_steps_taken": gradient_steps_taken,
         "optimizer_steps_taken": optimizer_steps_taken,
         "head_steps": head_steps,
         "nonfinite_skips": nonfinite["total"],
+        "canary_fail_streak": canary_fail_streak,
         "losses": losses,
-        "regret_buf": regret_buf,
-        "value_buf": value_buf,
-        "sizing_buf": sizing_buf,
+        "regret_buf": buffers["regret"],
+        "strategy_buf": buffers["strategy"],
+        "value_buf": buffers["value"],
+        "sizing_buf": buffers["sizing"],
         "bot": bot,
-        "optimizer": optimizer,
+        "optimizer": optimizers,
+        "optimizers": optimizers,
         "elapsed": elapsed_total,
-        "checkpoint_saved": last_checkpoint_written or args.save_path,
+        "checkpoint_saved": last_checkpoint_written,
     }
+    if interrupted["flag"]:
+        result["signal"] = int(interrupted["signum"] or signal.SIGINT)
+    if abort_reason:
+        result["abort_reason"] = abort_reason
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1362,57 +1286,73 @@ def run_training(args) -> dict:
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Train Deep CFR Plus bot via external-sampling CFR traversals")
+        description=(
+            "Train the schema-v2 multiway Deep CFR-inspired bot with "
+            "frozen-policy external-sampling rounds"
+        ))
     parser.add_argument("--variant", choices=["small", "large"], required=True)
-    # Default raised from 100k (B4/I9): 100k sat BELOW the 150k all-in deploy
-    # gate, so a default run produced a checkpoint whose inference permanently
-    # masks all-in.  1M matches TRAINING_PLAN step 7.  Short runs still work —
-    # an under-gate FINAL checkpoint is loudly warned about and stamped
-    # "shadow_only" instead of being refused (smoke tests run ~100 iterations).
     parser.add_argument(
         "--iterations",
         type=int,
         default=1_000_000,
-        help="Training iterations (default 1,000,000; below "
-             f"--all-in-deploy-iteration the final model masks all-in)",
+        help="External-sampling traversals (default: 1,000,000)",
     )
-    parser.add_argument("--update-interval", type=int, default=100)
+    parser.add_argument(
+        "--round-size",
+        type=int,
+        default=DEFAULT_ROUND_SIZE,
+        help="Traversals collected under each frozen policy (default: 25,000)",
+    )
+    parser.add_argument(
+        "--update-interval",
+        type=int,
+        default=100,
+        help="Traversals per refit optimizer batch at each round boundary",
+    )
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--aivat-sims", type=int, default=500)
     parser.add_argument(
-        "--all-in-warmup-iterations",
-        type=int,
-        default=ALL_IN_WARMUP_ITERATIONS,
-        help="Shadow-train all-in before this iteration; staged exposure starts here",
+        "--curriculum-profile",
+        choices=sorted(CURRICULUM_PROFILES),
+        default="sixmax",
+        help="Player-count curriculum profile",
     )
     parser.add_argument(
-        "--all-in-deploy-iteration",
+        "--canary-enforce-iteration",
         type=int,
-        default=ALL_IN_DEPLOY_ITERATION,
-        help="Tournament inference masks all-in before this checkpoint iteration",
+        default=DEFAULT_CANARY_ENFORCE_ITERATION,
+        help="First traversal where collapse failures count (default: 100,000)",
     )
     parser.add_argument(
-        "--all-in-full-release-iteration",
+        "--canary-fail-patience",
         type=int,
-        default=ALL_IN_FULL_RELEASE_ITERATION,
-        help="Iteration where staged all-in self-play and inference caps end",
-    )
-    parser.add_argument(
-        "--detox-all-in-on-resume",
-        action="store_true",
-        help="On resume, reset only the all-in regret output row before continuing",
+        default=DEFAULT_CANARY_FAIL_PATIENCE,
+        help="Consecutive failing checkpoints before abort (default: 3)",
     )
     parser.add_argument(
         "--disable-collapse-canary",
         action="store_true",
         help="Skip checkpoint all-in collapse probes; intended only for smoke tests",
     )
-    parser.add_argument("--save-path", type=str, default="models/deep_cfr_v1.pt")
+    parser.add_argument("--save-path", type=str, default="models/deep_cfr_v2.pt")
     parser.add_argument("--device", choices=["auto", "cpu", "mps", "cuda"], default="auto")
     parser.add_argument("--resume", type=str, default=None)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    for name in (
+        "iterations",
+        "round_size",
+        "update_interval",
+        "checkpoint_interval",
+        "batch_size",
+        "canary_fail_patience",
+    ):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.canary_enforce_iteration < 0:
+        parser.error("--canary-enforce-iteration must be non-negative")
+    return args
 
 
 def main():

@@ -1,13 +1,8 @@
-"""
-bots/deep_cfr_bot.py — Path B Deep CFR Plus bot
--------------------------------------------------
-Neural network approximation of CFR with:
-  - Shared state encoder (card embeddings + action-history GRU + opponent pooling + scalars)
-  - Three heads: regret, value, sizing
-  - Real-time depth-limited subgame search at inference
-  - ReservoirBuffer for Gate 3 training data collection
+"""Schema-v2 multiway Deep CFR-inspired poker bot.
 
-This module is read-only for Antigravity-A. Only Antigravity-B edits it.
+Advantage, average-strategy, value, and sizing objectives use independent
+encoders. Traversals use the advantage policy; deployment and opponent search
+use the reach-weighted average-strategy policy.
 """
 from __future__ import annotations
 
@@ -40,6 +35,7 @@ ABSTRACT_ACTIONS: List[str] = [
     "bet_67", "bet_75", "bet_100", "all_in",
 ]
 NUM_ACTIONS = len(ABSTRACT_ACTIONS)
+DEEP_CFR_SCHEMA_VERSION = 2
 
 _POSITION_MAP = {
     "BTN": 2, "CO": 2, "HJ": 2,
@@ -50,7 +46,10 @@ _POSITION_MAP = {
 _STREET_MAP = {"preflop": 0, "flop": 1, "turn": 2, "river": 3}
 _MAX_OPPONENTS = 5
 _OPP_FEAT_DIM = 6  # stack, committed, can_act, all_in, reserved, reserved
-_SCALAR_DIM = 3 + 4 + 3 + 4  # pot/call/stack + position(4) + spr(3) + street(4) = 14
+_PLAYER_COUNT_DIM = 5  # one-hot for counts 2..6
+_SCALAR_DIM = (
+    3 + 4 + 3 + 4 + _PLAYER_COUNT_DIM + _PLAYER_COUNT_DIM
+)  # chips + position + SPR + street + seated count + active count = 24
 _HISTORY_MAX_LEN = 64
 
 
@@ -115,7 +114,7 @@ def _seat_position_label(seat: int, n_seats: int) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class StateEncoder(nn.Module):
-    """Shared front-end producing a (batch, state_dim) vector."""
+    """State encoder used independently by each schema-v2 subnetwork."""
 
     def __init__(self, config: DeepCFRConfig):
         super().__init__()
@@ -219,6 +218,15 @@ class RegretHead(nn.Module):
         return self.mlp(state)
 
 
+class StrategyHead(nn.Module):
+    def __init__(self, c: DeepCFRConfig):
+        super().__init__()
+        self.mlp = _build_mlp(c.state_dim, c.head_hidden, c.head_layers, NUM_ACTIONS)
+
+    def forward(self, state):
+        return self.mlp(state)
+
+
 class ValueHead(nn.Module):
     def __init__(self, c: DeepCFRConfig):
         super().__init__()
@@ -246,24 +254,39 @@ class SizingHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DeepCFRNetwork
+#  Deep CFR schema-v2 subnetworks
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class DeepCFRNetwork(nn.Module):
-    def __init__(self, config: DeepCFRConfig):
+class _EncodedHeadNetwork(nn.Module):
+    """Independent encoder/head pair used by one training objective."""
+
+    def __init__(self, config: DeepCFRConfig, head: nn.Module):
         super().__init__()
         self.config = config
         self.encoder = StateEncoder(config)
-        self.regret_head = RegretHead(config)
-        self.value_head = ValueHead(config)
-        self.sizing_head = SizingHead(config)
+        self.head = head
+        self.apply(DeepCFRNetwork._init_weights)
 
-        # Kaiming init for all linear layers; small noise on output biases
-        # so that initial outputs are varied (not constant).
-        self.apply(self._init_weights)
+    def forward(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self.encoder(batch)
+        return self.head(state), state
+
+
+class DeepCFRNetwork(nn.Module):
+    """Independent advantage, strategy, value, and sizing subnetworks."""
+
+    def __init__(self, config: DeepCFRConfig):
+        super().__init__()
+        self.config = config
+        self.advantage = _EncodedHeadNetwork(config, RegretHead(config))
+        self.strategy = _EncodedHeadNetwork(config, StrategyHead(config))
+        self.value = _EncodedHeadNetwork(config, ValueHead(config))
+        self.sizing = _EncodedHeadNetwork(config, SizingHead(config))
+        self.zero_advantage_output()
+        self.zero_strategy_output()
 
         total = sum(p.numel() for p in self.parameters())
-        print(f"[DeepCFRNetwork] config={config}, params={total:,}")
+        print(f"[DeepCFRNetwork:v2] config={config}, params={total:,}")
 
     @staticmethod
     def _init_weights(module):
@@ -274,13 +297,77 @@ class DeepCFRNetwork(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.1)
 
+    @staticmethod
+    def _zero_output(head: nn.Module) -> None:
+        final_linear = None
+        for module in head.modules():
+            if isinstance(module, nn.Linear):
+                final_linear = module
+        if final_linear is None:
+            raise RuntimeError("network head has no Linear output layer")
+        with torch.no_grad():
+            final_linear.weight.zero_()
+            if final_linear.bias is not None:
+                final_linear.bias.zero_()
+
+    def zero_advantage_output(self) -> None:
+        self._zero_output(self.advantage.head)
+
+    def zero_strategy_output(self) -> None:
+        self._zero_output(self.strategy.head)
+
+    def reinitialize_advantage(self) -> None:
+        device = next(self.advantage.parameters()).device
+        self.advantage = _EncodedHeadNetwork(
+            self.config, RegretHead(self.config)).to(device)
+        self.zero_advantage_output()
+
+    @property
+    def encoder(self):
+        return self.advantage.encoder
+
+    @property
+    def regret_head(self):
+        return self.advantage.head
+
+    @property
+    def strategy_head(self):
+        return self.strategy.head
+
+    @property
+    def value_head(self):
+        return self.value.head
+
+    @property
+    def sizing_head(self):
+        return self.sizing.head
+
+    def advantage_forward(self, batch: dict) -> torch.Tensor:
+        return self.advantage(batch)[0]
+
+    def strategy_forward(self, batch: dict) -> torch.Tensor:
+        return self.strategy(batch)[0]
+
+    def value_forward(self, batch: dict) -> torch.Tensor:
+        return self.value(batch)[0].squeeze(-1)
+
+    def sizing_forward(self, batch: dict) -> torch.Tensor:
+        return self.sizing(batch)[0].squeeze(-1)
+
     def forward(self, batch: dict) -> dict:
-        state = self.encoder(batch)
+        regret, advantage_state = self.advantage(batch)
+        strategy_logits, strategy_state = self.strategy(batch)
+        value, value_state = self.value(batch)
+        sizing, sizing_state = self.sizing(batch)
         return {
-            "regret": self.regret_head(state),
-            "value": self.value_head(state).squeeze(-1),
-            "sizing": self.sizing_head(state).squeeze(-1),
-            "state": state,
+            "regret": regret,
+            "strategy_logits": strategy_logits,
+            "value": value.squeeze(-1),
+            "sizing": sizing.squeeze(-1),
+            "state": advantage_state,
+            "strategy_state": strategy_state,
+            "value_state": value_state,
+            "sizing_state": sizing_state,
         }
 
 
@@ -298,8 +385,23 @@ def _build_card_ids(hole_cards, board) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 
-def _build_scalars(pot, to_call, hero_stack, position, street, n_opp,
-                   opp_stacks, big_blind: int = REF_BIG_BLIND) -> torch.Tensor:
+def _count_one_hot(count: int) -> list[float]:
+    values = [0.0] * _PLAYER_COUNT_DIM
+    values[max(2, min(6, int(count))) - 2] = 1.0
+    return values
+
+
+def _build_scalars(
+    pot,
+    to_call,
+    hero_stack,
+    position,
+    street,
+    seated_players,
+    active_players,
+    opp_stacks,
+    big_blind: int = REF_BIG_BLIND,
+) -> torch.Tensor:
     """Return (_SCALAR_DIM,) float tensor.
 
     Chip quantities are rescaled to the 10-chip reference big blind
@@ -333,7 +435,12 @@ def _build_scalars(pot, to_call, hero_stack, position, street, n_opp,
     street_oh[_STREET_MAP.get(street, 0)] = 1.0
 
     return torch.tensor(
-        [pot_n, call_n, stack_n] + pos_oh + spr_oh + street_oh,
+        [pot_n, call_n, stack_n]
+        + pos_oh
+        + spr_oh
+        + street_oh
+        + _count_one_hot(seated_players)
+        + _count_one_hot(active_players),
         dtype=torch.float32,
     )
 
@@ -429,7 +536,6 @@ def build_network_input(view: PlayerView, opp_tracker=None) -> dict:
     hero_stack = int(view.stacks.get(view.me, 0))
     opp_pids = view.opponents or []
     acting_pids = acting_opponents_for(view)
-    n_opp = max(1, len(acting_pids))
     opp_stacks = [
         int(view.stacks.get(o, 0))
         for o in acting_pids
@@ -476,7 +582,11 @@ def build_network_input(view: PlayerView, opp_tracker=None) -> dict:
 
     scalars = _build_scalars(
         view.pot, view.to_call, hero_stack, view.position,
-        view.street, n_opp, opp_stacks, big_blind=big_blind,
+        view.street,
+        seated_players=len(pids),
+        active_players=1 + len(opp_pids),
+        opp_stacks=opp_stacks,
+        big_blind=big_blind,
     ).unsqueeze(0)
 
     return {
@@ -532,6 +642,22 @@ class ReservoirBuffer:
 
     def sample(self, n: int) -> list:
         return random.sample(self.buffer, min(n, len(self.buffer)))
+
+    def state_dict(self) -> dict:
+        return {
+            "capacity": int(self.capacity),
+            "count": int(self._count),
+            "buffer": self.buffer,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if not isinstance(state, dict) or "buffer" not in state:
+            raise ValueError("invalid reservoir snapshot")
+        self.capacity = int(state.get("capacity", self.capacity))
+        self._count = int(state.get("count", len(state["buffer"])))
+        self.buffer = list(state["buffer"])
+        if len(self.buffer) > self.capacity:
+            raise ValueError("reservoir snapshot exceeds capacity")
 
     def __len__(self):
         return len(self.buffer)
@@ -1117,8 +1243,9 @@ class _DeepCFRGameState:
             self.stacks[hero_seat] if 0 <= hero_seat < len(self.stacks) else 0,
             _seat_position_label(hero_seat, len(self.stacks)),
             self.street,
-            max(1, len(opp_seats)),
-            opp_stacks,
+            seated_players=len(self.stacks),
+            active_players=sum(1 for ok in self.alive if ok),
+            opp_stacks=opp_stacks,
             big_blind=big_blind,
         ).unsqueeze(0)
 
@@ -1172,16 +1299,10 @@ class DeepCFRTrace:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class DeepCFRBot:
-    """Path B Deep CFR Plus bot. Implements core.bot_api.BotAdapter."""
+    """Multiway Deep CFR-inspired schema-v2 bot."""
 
     _DEFAULT_SEARCH_DEPTH = 4
     _MAX_CFR_DEPTH = 8
-    _ALL_IN_WARMUP_ITERATIONS = 100_000
-    _ALL_IN_DEPLOY_ITERATION = 150_000
-    _ALL_IN_FULL_RELEASE_ITERATION = 350_000
-    _ALL_IN_DEEP_STACK_SPR = 4.0
-    _ALL_IN_STAGED_CAP_START = 0.05
-    _ALL_IN_STAGED_CAP_END = 0.15
     _SEARCH_TEMPERATURE = 20.0
     _SEARCH_ADVANTAGE_CLIP = 2.0
     _SEARCH_BLEND = 0.25
@@ -1194,9 +1315,6 @@ class DeepCFRBot:
         loaded_state = None
         loaded_config = None
         loaded_iteration = 0
-        loaded_all_in_warmup = self._ALL_IN_WARMUP_ITERATIONS
-        loaded_all_in_deploy = self._ALL_IN_DEPLOY_ITERATION
-        loaded_all_in_full_release = self._ALL_IN_FULL_RELEASE_ITERATION
         if weights_path:
             if not os.path.exists(weights_path):
                 raise RuntimeError(
@@ -1206,28 +1324,20 @@ class DeepCFRBot:
                     "existing checkpoint."
                 )
             loaded = torch.load(weights_path, map_location="cpu", weights_only=False)
-            if isinstance(loaded, dict) and "network_state_dict" in loaded:
+            if (
+                isinstance(loaded, dict)
+                and loaded.get("schema_version") == DEEP_CFR_SCHEMA_VERSION
+                and "network_state_dict" in loaded
+            ):
                 loaded_state = loaded["network_state_dict"]
                 loaded_config = loaded.get("config")
                 loaded_iteration = int(loaded.get("iteration", 0) or 0)
-                loaded_all_in_warmup = int(
-                    loaded.get("all_in_warmup_iterations", loaded_all_in_warmup)
-                    or loaded_all_in_warmup
-                )
-                loaded_all_in_deploy = int(
-                    loaded.get("all_in_deploy_iteration", loaded_all_in_deploy)
-                    or loaded_all_in_deploy
-                )
-                loaded_all_in_full_release = int(
-                    loaded.get(
-                        "all_in_full_release_iteration",
-                        loaded_all_in_full_release,
-                    )
-                    or loaded_all_in_full_release
-                )
             else:
-                loaded_state = loaded
-                loaded_config = self._infer_config_from_state_dict(loaded_state)
+                raise RuntimeError(
+                    f"[DeepCFRBot] {weights_path!r} is not a schema-v2 "
+                    "checkpoint. Legacy v1 checkpoints are postmortem-only "
+                    "and cannot be deployed or resumed."
+                )
 
         self.config = loaded_config or config or DeepCFRConfig.large()
         self.aivat_sims = int(aivat_sims)
@@ -1245,11 +1355,7 @@ class DeepCFRBot:
         self.search_depth = search_depth or self._DEFAULT_SEARCH_DEPTH
         self.inference_mode = inference_mode
         self.training_iteration = loaded_iteration
-        self.all_in_warmup_iterations = loaded_all_in_warmup
-        self.all_in_deploy_iteration = loaded_all_in_deploy
-        self.all_in_full_release_iteration = loaded_all_in_full_release
         self._weights_loaded = False
-        self._all_in_guardrails_disabled = False
 
         if loaded_state is not None:
             self.network.load_state_dict(loaded_state)
@@ -1274,123 +1380,11 @@ class DeepCFRBot:
         # (vs. all coupling through the module-level random state).
         self._rng = random.Random(random.getrandbits(64))
 
-        # Gate 3 buffers
+        # Schema-v2 training reservoirs
         self.regret_buffer = ReservoirBuffer()
+        self.strategy_buffer = ReservoirBuffer()
         self.value_buffer = ReservoirBuffer()
         self.sizing_buffer = ReservoirBuffer()
-
-    def _warmup_all_in_mask_active(self) -> bool:
-        """Whether loaded checkpoint inference should hide untrained all-in."""
-        return self._inference_all_in_mask_active()
-
-    def _inference_all_in_mask_active(self) -> bool:
-        """Whether tournament inference should hide all-in for early checkpoints."""
-        return (
-            not self._all_in_guardrails_disabled and
-            self._weights_loaded and
-            self.training_iteration < self.all_in_deploy_iteration
-        )
-
-    @staticmethod
-    def _mask_all_in(legal_mask: List[int]) -> List[int]:
-        all_in_idx = ABSTRACT_ACTIONS.index("all_in")
-        masked = [a for a in legal_mask if a != all_in_idx]
-        return masked or legal_mask
-
-    def _training_policy_legal_mask(
-        self,
-        legal_mask: List[int],
-        all_in_policy_probability: float,
-    ) -> List[int]:
-        """Stochastically expose all-in to self-play while keeping targets raw."""
-        all_in_idx = ABSTRACT_ACTIONS.index("all_in")
-        if all_in_idx not in legal_mask:
-            return legal_mask
-        prob = max(0.0, min(1.0, float(all_in_policy_probability)))
-        if prob >= 1.0:
-            return legal_mask
-        if prob <= 0.0 or self._rng.random() >= prob:
-            return self._mask_all_in(legal_mask)
-        return legal_mask
-
-    def _all_in_release_progress(self) -> float:
-        start = max(0, int(self.all_in_deploy_iteration))
-        end = max(start + 1, int(self.all_in_full_release_iteration))
-        return max(0.0, min(1.0, (self.training_iteration - start) / (end - start)))
-
-    def _deep_stack_all_in_cap(self, state: PlayerView) -> float | None:
-        """Return the staged inference all-in cap for deep-stack spots."""
-        if self._all_in_guardrails_disabled:
-            return None
-        if not (self._weights_loaded and self.training_iteration < self.all_in_full_release_iteration):
-            return None
-        hero_stack = int((state.stacks or {}).get(state.me, 0) or 0)
-        spr = hero_stack / max(int(state.pot or 0), 1)
-        if spr < self._ALL_IN_DEEP_STACK_SPR:
-            return None
-        progress = self._all_in_release_progress()
-        return (
-            self._ALL_IN_STAGED_CAP_START +
-            (self._ALL_IN_STAGED_CAP_END - self._ALL_IN_STAGED_CAP_START) * progress
-        )
-
-    @staticmethod
-    def _renormalize_strategy(strategy: List[float], legal_mask: List[int]) -> List[float]:
-        total = sum(max(strategy[a], 0.0) for a in legal_mask)
-        if total > 0:
-            for a in legal_mask:
-                strategy[a] = max(strategy[a], 0.0) / total
-        else:
-            n = max(1, len(legal_mask))
-            for a in legal_mask:
-                strategy[a] = 1.0 / n
-        return strategy
-
-    def _cap_all_in_probability(
-        self,
-        strategy: List[float],
-        legal_mask: List[int],
-        state: PlayerView,
-    ) -> List[float]:
-        """Cap all-in probability during staged deployment and redistribute excess."""
-        all_in_idx = ABSTRACT_ACTIONS.index("all_in")
-        if all_in_idx not in legal_mask:
-            return strategy
-        cap = self._deep_stack_all_in_cap(state)
-        if cap is None or strategy[all_in_idx] <= cap:
-            return strategy
-
-        capped = list(strategy)
-        excess = max(0.0, capped[all_in_idx] - cap)
-        capped[all_in_idx] = cap
-        others = [a for a in legal_mask if a != all_in_idx]
-        other_total = sum(max(capped[a], 0.0) for a in others)
-        if others:
-            if other_total > 0:
-                for a in others:
-                    capped[a] += excess * (max(capped[a], 0.0) / other_total)
-            else:
-                share = excess / len(others)
-                for a in others:
-                    capped[a] += share
-        return self._renormalize_strategy(capped, legal_mask)
-
-    def detox_all_in_regret_output(self, bias: float = -2.0) -> tuple[str, int]:
-        """Reset only the all-in output row of the regret head."""
-        all_in_idx = ABSTRACT_ACTIONS.index("all_in")
-        final_linear = None
-        final_name = ""
-        for name, module in self.network.regret_head.mlp.named_modules():
-            if isinstance(module, nn.Linear):
-                final_linear = module
-                final_name = name
-        if final_linear is None:
-            raise RuntimeError("regret head has no Linear output layer")
-        with torch.no_grad():
-            final_linear.weight[all_in_idx].zero_()
-            if final_linear.bias is not None:
-                final_linear.bias[all_in_idx] = float(bias)
-        return f"regret_head.mlp.{final_name}", all_in_idx
 
     @staticmethod
     def _infer_config_from_state_dict(state_dict) -> DeepCFRConfig | None:
@@ -1398,12 +1392,18 @@ class DeepCFRBot:
         if not isinstance(state_dict, dict):
             return None
         try:
-            card_embed_dim = int(state_dict["encoder.card_embed.weight"].shape[1])
-            gru_hidden = int(state_dict["encoder.history_gru.weight_hh_l0"].shape[1])
-            opp_embed_dim = int(state_dict["encoder.opp_proj.0.weight"].shape[0])
-            state_dim = int(state_dict["encoder.fuse.0.weight"].shape[0])
-            head_hidden = int(state_dict["regret_head.mlp.0.weight"].shape[0])
-            head_layers = 3 if "regret_head.mlp.6.weight" in state_dict else 2
+            card_embed_dim = int(
+                state_dict["advantage.encoder.card_embed.weight"].shape[1])
+            gru_hidden = int(
+                state_dict["advantage.encoder.history_gru.weight_hh_l0"].shape[1])
+            opp_embed_dim = int(
+                state_dict["advantage.encoder.opp_proj.0.weight"].shape[0])
+            state_dim = int(
+                state_dict["advantage.encoder.fuse.0.weight"].shape[0])
+            head_hidden = int(
+                state_dict["advantage.head.mlp.0.weight"].shape[0])
+            head_layers = (
+                3 if "advantage.head.mlp.6.weight" in state_dict else 2)
             return DeepCFRConfig(
                 card_embed_dim=card_embed_dim,
                 gru_hidden=gru_hidden,
@@ -1447,6 +1447,34 @@ class DeepCFRBot:
         and still returns only an ``Action``.
         """
         return self._decide(state, collect_trace=True)
+
+    def policy_probabilities(
+        self,
+        state: PlayerView,
+        *,
+        search_depth: int = 0,
+        use_advantage: bool = False,
+    ) -> tuple[List[float], List[int], float]:
+        """Return a deterministic policy distribution without sampling."""
+        batch = build_network_input(state, None)
+        legal_mask = _legal_abstract_actions(
+            state.legal_actions,
+            state.pot,
+            street=state.street,
+            big_blind=_infer_big_blind(state),
+        )
+        with torch.no_grad():
+            if use_advantage:
+                logits = self.network.advantage_forward(batch)[0].cpu()
+                strategy = self._regret_match(logits, legal_mask)
+            else:
+                logits = self.network.strategy_forward(batch)[0].cpu()
+                strategy = self._strategy_from_logits(logits, legal_mask)
+            sizing = float(self.network.sizing_forward(batch)[0].item())
+        if search_depth > 0:
+            strategy = self._subgame_search(
+                state, strategy, legal_mask, depth=search_depth)
+        return strategy, legal_mask, sizing
 
     def _decide(
         self, state: PlayerView, *, collect_trace: bool = False
@@ -1526,6 +1554,7 @@ class DeepCFRBot:
             out = self.network(batch)
 
         regret_logits = out["regret"][0].cpu()
+        strategy_logits = out["strategy_logits"][0].cpu()
         sizing_val = out["sizing"].item() if out["sizing"].dim() == 0 else out["sizing"][0].item()
 
         big_blind = _infer_big_blind(state)
@@ -1537,12 +1566,10 @@ class DeepCFRBot:
             street=state.street,
             big_blind=big_blind,
         )
-        all_in_masked = self._inference_all_in_mask_active()
-        if all_in_masked:
-            legal_mask = self._mask_all_in(legal_mask)
+        all_in_masked = False
 
-        # Regret matching
-        strategy = self._regret_match(regret_logits, legal_mask)
+        # Deployment uses the reach-weighted average-strategy network.
+        strategy = self._strategy_from_logits(strategy_logits, legal_mask)
         probs_before_search = (
             {a: float(strategy[a]) for a in legal_mask} if collect_trace else None
         )
@@ -1567,7 +1594,6 @@ class DeepCFRBot:
             if (collect_trace and search_enabled) else None
         )
 
-        strategy = self._cap_all_in_probability(strategy, legal_mask, state)
         probs_after_cap = (
             {a: float(strategy[a]) for a in legal_mask} if collect_trace else None
         )
@@ -1628,6 +1654,30 @@ class DeepCFRBot:
             n = len(legal_mask)
             for a in legal_mask:
                 strategy[a] = 1.0 / n
+        return strategy
+
+    @staticmethod
+    def _strategy_from_logits(
+        logits: torch.Tensor,
+        legal_mask: List[int],
+    ) -> List[float]:
+        strategy = [0.0] * NUM_ACTIONS
+        if not legal_mask:
+            return strategy
+        values = [
+            float(logits[a].item() if hasattr(logits[a], "item") else logits[a])
+            for a in legal_mask
+        ]
+        max_value = max(values)
+        weights = [math.exp(max(-50.0, min(50.0, v - max_value))) for v in values]
+        total = sum(weights)
+        if total <= 0 or not math.isfinite(total):
+            share = 1.0 / len(legal_mask)
+            for action in legal_mask:
+                strategy[action] = share
+            return strategy
+        for action, weight in zip(legal_mask, weights):
+            strategy[action] = weight / total
         return strategy
 
     def _sample_action(self, strategy: List[float],
@@ -1757,9 +1807,6 @@ class DeepCFRBot:
         if depth <= 0 or not legal_mask:
             return prior
 
-        if self._inference_all_in_mask_active():
-            legal_mask = self._mask_all_in(legal_mask)
-
         self._search_leaf_calls = 0
         game_state, hero_seat = self._build_search_game_state(state)
         values = {}
@@ -1813,25 +1860,23 @@ class DeepCFRBot:
         if state.is_terminal() or depth <= 0:
             batch = state.to_network_input(hero_seat)
             with torch.no_grad():
-                out = self.network(batch)
+                value = self.network.value_forward(batch)
             self._search_leaf_calls += 1
-            return out["value"].item()
+            return value.item()
 
         if state.is_chance_node():
             return self._search_subtree(state.advance_street(), hero_seat, depth - 1)
 
         seat = state.seat_to_act()
         legal_mask = state.legal_abstract_actions()
-        if self._inference_all_in_mask_active():
-            legal_mask = self._mask_all_in(legal_mask)
         if not legal_mask:
             return self._search_subtree(state.advance_street(), hero_seat, depth - 1)
 
         if seat != hero_seat:
             batch = state.to_network_input(seat)
             with torch.no_grad():
-                out = self.network(batch)
-            strategy = self._regret_match(out["regret"][0].cpu(), legal_mask)
+                logits = self.network.strategy_forward(batch)[0].cpu()
+            strategy = self._strategy_from_logits(logits, legal_mask)
             total = 0.0
             for a in legal_mask:
                 if strategy[a] <= 1e-9:
@@ -1853,7 +1898,7 @@ class DeepCFRBot:
             best = max(best, val)
         return best if math.isfinite(best) else 0.0
 
-    # ── Tree CFR with target collection (Gate 3B) ──────────────────────────
+    # ── Tree CFR with schema-v2 target collection ──────────────────────────
 
     def _cfr_recurse(
         self,
@@ -1863,19 +1908,18 @@ class DeepCFRBot:
         *,
         iteration: int = 0,
         regret_buf: Optional[ReservoirBuffer] = None,
+        strategy_buf: Optional[ReservoirBuffer] = None,
         value_buf: Optional[ReservoirBuffer] = None,
         sizing_buf: Optional[ReservoirBuffer] = None,
         exploration_epsilon: float = 0.0,
-        allow_all_in: bool = True,
-        all_in_policy_probability: float | None = None,
     ) -> float:
         """Recursive external-sampling CFR traversal.
 
         When regret_buf/value_buf/sizing_buf are provided, this is a Deep CFR
         training traversal: at each hero decision node, target regrets are
         appended; at leaves, target values are appended; at bet/raise hero
-        nodes, target sizings are appended.  ``iteration`` is the outer loop
-        index used for CFR+ linear weighting.
+        nodes, target sizings are appended. ``iteration`` is the outer loop
+        index used for empirical linear sample weighting.
 
         When buffers are None, this is the Gate 2B inference-time / sanity
         traversal — return value only, no side effects.
@@ -1901,45 +1945,43 @@ class DeepCFRBot:
             return self._cfr_recurse(
                 state.advance_street(), hero_seat, depth - 1,
                 iteration=iteration,
-                regret_buf=regret_buf, value_buf=value_buf,
+                regret_buf=regret_buf, strategy_buf=strategy_buf,
+                value_buf=value_buf,
                 sizing_buf=sizing_buf,
                 exploration_epsilon=exploration_epsilon,
-                allow_all_in=allow_all_in,
-                all_in_policy_probability=all_in_policy_probability,
             )
 
         seat = state.seat_to_act()
-        target_legal_mask = state.legal_abstract_actions()
-        if collecting:
-            if all_in_policy_probability is None:
-                policy_prob = 1.0 if allow_all_in else 0.0
-            else:
-                policy_prob = all_in_policy_probability
-            policy_legal_mask = self._training_policy_legal_mask(
-                target_legal_mask,
-                policy_prob,
-            )
-        else:
-            policy_legal_mask = target_legal_mask
+        policy_legal_mask = state.legal_abstract_actions()
         if not policy_legal_mask:
             return self._cfr_recurse(
                 state.advance_street(), hero_seat, depth - 1,
                 iteration=iteration,
-                regret_buf=regret_buf, value_buf=value_buf,
+                regret_buf=regret_buf, strategy_buf=strategy_buf,
+                value_buf=value_buf,
                 sizing_buf=sizing_buf,
                 exploration_epsilon=exploration_epsilon,
-                allow_all_in=allow_all_in,
-                all_in_policy_probability=all_in_policy_probability,
             )
 
         # Strategy from network
         batch = state.to_network_input(seat)
         with torch.no_grad():
-            out = self.network(batch)
-        strategy = self._regret_match(out["regret"][0].cpu(), policy_legal_mask)
+            logits = self.network.advantage_forward(batch)[0].cpu()
+        strategy = self._regret_match(logits, policy_legal_mask)
 
         # ── Opponent node: external sampling ──
         if seat != hero_seat:
+            if collecting and strategy_buf is not None:
+                strategy_target = torch.tensor(strategy, dtype=torch.float32)
+                legal_mask_vec = torch.zeros(NUM_ACTIONS)
+                for action_idx in policy_legal_mask:
+                    legal_mask_vec[action_idx] = 1.0
+                strategy_buf.add((
+                    batch,
+                    strategy_target,
+                    legal_mask_vec,
+                    float(max(1, iteration)),
+                ))
             if collecting and self._rng.random() < exploration_epsilon:
                 action = self._rng.choice(policy_legal_mask)
             else:
@@ -1948,32 +1990,13 @@ class DeepCFRBot:
             return self._cfr_recurse(
                 next_state, hero_seat, depth - 1,
                 iteration=iteration,
-                regret_buf=regret_buf, value_buf=value_buf,
+                regret_buf=regret_buf, strategy_buf=strategy_buf,
+                value_buf=value_buf,
                 sizing_buf=sizing_buf,
                 exploration_epsilon=exploration_epsilon,
-                allow_all_in=allow_all_in,
-                all_in_policy_probability=all_in_policy_probability,
             )
 
-        # ── Hero node: full expansion ──
-        # Key Change #2: the hero expands and collects regret targets over
-        # EXACTLY the policy legal mask, never the raw target mask.  This keeps
-        # the abstract `all_in` row out of the regret targets unless that node's
-        # policy actually exposed all-in, preventing all-in regret-row poisoning
-        # before the model has enough self-play exposure to correct it:
-        #   • Shadow phase (all_in_policy_probability <= 0): policy_legal_mask is
-        #     _mask_all_in(target), so all-in is excluded whenever any non-all-in
-        #     action is legal (kept only if it is the sole legal action).
-        #   • Staged phase (0 < prob < 1): expansion/regret mask == the per-node
-        #     stochastic policy_legal_mask (the simpler/safer option the spec
-        #     prefers), so all-in is trained only on nodes where the same policy
-        #     draw exposed it.
-        #   • Full phase (prob >= 1): policy_legal_mask == target_legal_mask, so
-        #     every legal action is expanded/trained — original behavior.
-        # In the non-collecting (inference/sanity) path policy_legal_mask is
-        # already target_legal_mask, so that path is byte-identical to before.
-        # EV (below) sums over policy_legal_mask, so it now matches the expansion
-        # and regret target mask exactly.
+        # ── Traverser node: expand every legal action, including all-in ──
         action_values = {}
         expansion_legal_mask = policy_legal_mask
         for a in expansion_legal_mask:
@@ -1984,11 +2007,10 @@ class DeepCFRBot:
             action_values[a] = self._cfr_recurse(
                 next_state, hero_seat, depth - 1,
                 iteration=iteration,
-                regret_buf=regret_buf, value_buf=value_buf,
+                regret_buf=regret_buf, strategy_buf=strategy_buf,
+                value_buf=value_buf,
                 sizing_buf=sizing_buf,
                 exploration_epsilon=exploration_epsilon,
-                allow_all_in=allow_all_in,
-                all_in_policy_probability=all_in_policy_probability,
             ) - added_cost_units
 
         ev = sum(strategy[a] * action_values[a] for a in policy_legal_mask)
@@ -1997,13 +2019,13 @@ class DeepCFRBot:
         if collecting:
             input_dict = state.to_network_input(hero_seat)
 
-            # Regret target: action_value[a] - EV, with CFR+ linear weight
+            # Regret target: action_value[a] - EV, with linear iteration weight
             regret_vec = torch.zeros(NUM_ACTIONS)
             legal_mask_vec = torch.zeros(NUM_ACTIONS)
             for a in expansion_legal_mask:
                 regret_vec[a] = action_values[a] - ev
                 legal_mask_vec[a] = 1.0
-            weight = float(max(1, iteration))  # CFR+ linear weighting
+            weight = float(max(1, iteration))
             regret_buf.add((input_dict, regret_vec, legal_mask_vec, weight))
 
             # Value target at hero decision node

@@ -443,10 +443,10 @@ def run_checks(variant: str):
     print()
 
     # ═══════════════════════════════════════════════════════════════════════
-    #  SECTION 7 — Regret head distribution
+    #  SECTION 7 — Zero-initialized advantage output
     # ═══════════════════════════════════════════════════════════════════════
     print("=" * 60)
-    print("Section 7: Regret head distribution")
+    print("Section 7: Zero-initialized advantage output")
     print("=" * 60)
 
     with redirect_stdout(io.StringIO()):
@@ -465,22 +465,20 @@ def run_checks(variant: str):
         print("  [FAIL] — NaN/Inf in regret outputs")
         PASS = False
 
-    nonzero_count = (regrets.abs() > 1e-8).any(dim=1).sum().item()
-    nonzero_pct = nonzero_count / 200.0
-    print(f"  States with nonzero regrets: {nonzero_count}/200 ({nonzero_pct*100:.0f}%)")
-    if nonzero_pct >= 0.80:
-        print("  [PASS] — >= 80% have nonzero")
+    all_zero = bool((regrets == 0).all().item())
+    print(f"  All 200 initial advantage rows are zero: {all_zero}")
+    if all_zero:
+        print("  [PASS] — initial regret matching is uniform")
     else:
-        print(f"  [FAIL] — only {nonzero_pct*100:.0f}%")
+        print("  [FAIL] — random output logits leaked into initial policy")
         PASS = False
 
-    per_state_var = regrets.var(dim=1)
-    low_var = (per_state_var < 0.001).sum().item()
-    print(f"  States with var < 0.001: {low_var}/200")
-    if low_var < 200 * 0.5:
-        print("  [PASS] — not all constant")
+    strategy_logits = out_r["strategy_logits"]
+    strategy_zero = bool((strategy_logits == 0).all().item())
+    if strategy_zero:
+        print("  [PASS] — initial average strategy is uniform too")
     else:
-        print("  [FAIL] — too many constant-output states")
+        print("  [FAIL] — random strategy logits leaked into deployment")
         PASS = False
 
     del reg_net

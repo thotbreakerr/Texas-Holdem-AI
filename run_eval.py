@@ -29,6 +29,7 @@ from run_tournament_stats import finalize_finish_order
 PATH_A = "PATH_A"
 PATH_B = "PATH_B"
 DEFAULT_POOL = "smart,mc200,gto,icm,exploitative,opponentmodel"
+PILOT_BASELINE = 1.0 / 6.0
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,7 @@ class EvalConfig:
     seed: int | None = None
     output_csv: str | None = None
     parallel: int = 1
+    promotion_opponent: str = "gto"
 
 
 def wilson_ci(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -97,6 +99,37 @@ def production_verdict(summary: dict[str, dict[str, Any]]) -> str:
     return "Production CFR: PATH_B"
 
 
+def pilot_verdict(summary: dict[str, dict[str, Any]]) -> str:
+    """Pass unless Path B's 95% interval is wholly below random-seat 1/6."""
+    deep = summary.get(PATH_B)
+    if not deep:
+        return "FAIL: PATH_B result missing"
+    if deep["win_ci"][1] < PILOT_BASELINE:
+        return "FAIL: PATH_B is statistically worse than the 1/6 baseline"
+    return "PASS: PATH_B is not statistically worse than the 1/6 baseline"
+
+
+def promotion_verdict(summary: dict[str, dict[str, Any]]) -> str:
+    """Pass unless Path B's 95% interval is wholly below 50% head-to-head."""
+    deep = summary.get(PATH_B)
+    if not deep:
+        return "FAIL: PATH_B result missing"
+    if deep["win_ci"][1] < 0.5:
+        return "FAIL: PATH_B is statistically worse than the promotion opponent"
+    return "PASS: PATH_B confidence interval shows no promotion regression"
+
+
+def _require_canary_clean_checkpoint(path: str) -> None:
+    import torch
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if (payload.get("schema_version") != 2
+            or payload.get("canary_status") != "PASS"):
+        raise RuntimeError(
+            "promotion mode requires a schema-v2 checkpoint stamped "
+            "canary_status=PASS")
+
+
 def _pool_specs(pool: str) -> list[tuple[str, str]]:
     """Return unique (pid, bot_spec) entries for the comma-separated pool."""
     specs = []
@@ -121,6 +154,20 @@ def build_player_specs(config: EvalConfig) -> list[tuple[str, str]]:
             (PATH_A, f"cfr:{config.path_a_profile}"),
             (PATH_B, f"deep_cfr:{config.path_b_weights}"),
             *_pool_specs(config.pool),
+        ]
+    if config.mode == "pilot":
+        pool = _pool_specs(config.pool)
+        if len(pool) < 5:
+            raise ValueError("pilot mode requires at least five pool opponents")
+        return [
+            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            *pool[:5],
+        ]
+    if config.mode == "promotion":
+        _require_canary_clean_checkpoint(config.path_b_weights)
+        return [
+            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            ("PROMOTION_OPPONENT", config.promotion_opponent),
         ]
     if config.mode == "curriculum":
         return [(PATH_B, f"deep_cfr:{config.path_b_weights}")]
@@ -235,8 +282,10 @@ def _run_all_tournaments(config: EvalConfig,
     tasks = []
     for i in range(config.tournaments):
         t_seed = config.seed + i if config.seed is not None else None
+        rotation = i % len(player_specs)
+        rotated_specs = player_specs[rotation:] + player_specs[:rotation]
         tasks.append((
-            player_specs,
+            rotated_specs,
             config.chips,
             config.sb,
             config.bb,
@@ -359,7 +408,20 @@ def print_report(config: EvalConfig, aggregated: dict[str, Any]) -> str:
               f"min={min(hand_counts)} max={max(hand_counts)}")
     print()
 
-    if config.mode == "head_to_head":
+    if config.mode in {"head_to_head", "promotion"}:
+        if config.mode == "promotion":
+            deep = summary[PATH_B]
+            opponent = summary["PROMOTION_OPPONENT"]
+            for pid, row in ((PATH_B, deep), ("PROMOTION_OPPONENT", opponent)):
+                print(
+                    f"  {pid}: wins={row['wins']}/{config.tournaments} "
+                    f"win_rate={row['win_rate']:.3f} "
+                    f"Wilson95={_fmt_ci(row['win_ci'])}"
+                )
+            verdict = promotion_verdict(summary)
+            print(f"Verdict: {verdict}")
+            print("=" * 80)
+            return verdict
         a = summary[PATH_A]
         b = summary[PATH_B]
         print("HEAD-TO-HEAD")
@@ -421,7 +483,11 @@ def print_report(config: EvalConfig, aggregated: dict[str, Any]) -> str:
             print(f"{cell:>{col_w}}", end="")
         print()
 
-    verdict = production_verdict(summary)
+    verdict = (
+        pilot_verdict(summary)
+        if config.mode == "pilot"
+        else production_verdict(summary)
+    )
     print()
     print(verdict)
     print("=" * 80)
@@ -470,7 +536,15 @@ def run_evaluation(config: EvalConfig, emit: bool = True) -> dict[str, Any]:
                 aggregated["summary"][PATH_B]["win_ci"],
             )
             if config.mode == "head_to_head"
-            else production_verdict(aggregated["summary"])
+            else (
+                promotion_verdict(aggregated["summary"])
+                if config.mode == "promotion"
+                else (
+                    pilot_verdict(aggregated["summary"])
+                    if config.mode == "pilot"
+                    else production_verdict(aggregated["summary"])
+                )
+            )
         )
     aggregated["verdict"] = verdict
     return aggregated
@@ -569,15 +643,22 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     parser = argparse.ArgumentParser(
         description="Evaluate Path A vs Path B with tournament-aware metrics."
     )
-    parser.add_argument("--mode", choices=("head_to_head", "multiway", "curriculum"),
+    parser.add_argument(
+        "--mode",
+        choices=("head_to_head", "multiway", "pilot", "promotion", "curriculum"),
                         required=True)
     parser.add_argument("--path_a_profile", default="models/cfr_regret_deep_v2.pkl",
                         help="Path A CFR profile path")
-    parser.add_argument("--path_b_weights", default="models/deep_cfr_v1.pt",
+    parser.add_argument("--path_b_weights", default="models/deep_cfr_v2.pt",
                         help="Path B Deep CFR weights path")
     parser.add_argument("--tournaments", type=int, default=1000)
     parser.add_argument("--pool", default=DEFAULT_POOL,
                         help="Comma-separated bot pool for multiway mode")
+    parser.add_argument(
+        "--promotion-opponent",
+        default="gto",
+        help="Strongest existing bot spec for promotion mode",
+    )
     parser.add_argument("--chips", type=int, default=500)
     parser.add_argument("--sb", type=int, default=5)
     parser.add_argument("--bb", type=int, default=10)
@@ -587,6 +668,9 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
     parser.add_argument("--output-csv", default=None)
     parser.add_argument("--parallel", type=int, default=1)
     ns = parser.parse_args(argv)
+    seed = ns.seed
+    if ns.mode == "pilot" and seed is None:
+        seed = 20260613
     return EvalConfig(
         mode=ns.mode,
         path_a_profile=ns.path_a_profile,
@@ -598,9 +682,10 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
         bb=ns.bb,
         blind_increase_every=ns.blind_increase_every,
         max_hands=ns.max_hands,
-        seed=ns.seed,
+        seed=seed,
         output_csv=ns.output_csv,
         parallel=max(1, ns.parallel),
+        promotion_opponent=ns.promotion_opponent,
     )
 
 

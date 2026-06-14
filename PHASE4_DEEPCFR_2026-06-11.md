@@ -1,5 +1,12 @@
 # Phase 4 — Deep CFR (Path B) retrain readiness (2026-06-11)
 
+> **Superseded on 2026-06-13 by schema v2.** The shadow/staged all-in
+> curriculum and shared-network v1 design documented below are retained only
+> as history. Current code trains every legal action from traversal one, uses
+> independent advantage/average-strategy/value/sizing networks, deploys the
+> average strategy, uses the sixmax-weighted curriculum, enforces probability
+> canaries from 100k with patience 3, and rejects v1 resume/deployment.
+
 Scope: `bots/deep_cfr_bot.py`, `core/action_history.py`, `training/train_deep_cfr.py`.
 Path A (`bots/cfr_bot.py`, `train_cfr_bot_multiway.py`) and the engine were NOT
 touched. No training launched. Background: `REVIEW_2026-06-05.md` (B1–B5),

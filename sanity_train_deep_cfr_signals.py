@@ -18,9 +18,8 @@ purpose — and forces it to FAIL).
   1. SIGTERM mid-run → checkpoint file exists, exit code 143 (128+15), and
      the summary reports "interrupted".
   2. SIGINT mid-run → same, exit code 130 (128+2).
-  3. The interrupted checkpoint is a FINAL artifact below the all-in deploy
-     gate, so it must carry the "shadow_only": true stamp (B4/I9) and the
-     persisted nonfinite_skips counter (B2/I5 metadata).
+  3. The interrupted checkpoint is a complete schema-v2 artifact with all four
+     reservoirs and the persisted nonfinite_skips counter.
   4. --iterations defaults to 1,000,000 (B4/I9 — the old 100k default sat
      below the 150k deploy gate).
   5. Exact iteration accounting + emergency save is canary-free (4.1): a real
@@ -54,7 +53,7 @@ sys.path.insert(0, REPO)
 import torch  # noqa: E402  (needs repo on sys.path first for checkpoint unpickling)
 
 TRAINER = os.path.join(REPO, "training", "train_deep_cfr.py")
-BANNER = "TRAINING DEEP CFR PLUS"
+BANNER = "TRAINING MULTIWAY DEEP CFR-INSPIRED V2"
 
 
 def _launch(save_path: str) -> tuple[subprocess.Popen, list[str]]:
@@ -230,11 +229,13 @@ def exact_accounting_check() -> bool:
             ok = False
             print(f"  [FAIL] — checkpoint iteration "
                   f"{ckpt.get('iteration')} != {SIGNAL_AT}")
-        if ckpt.get("shadow_only") is True:
-            print("  [PASS] — emergency final save kept the shadow_only stamp")
+        if (ckpt.get("schema_version") == 2
+                and set(ckpt.get("reservoirs", {}))
+                == {"regret", "strategy", "value", "sizing"}):
+            print("  [PASS] — emergency save is a complete schema-v2 snapshot")
         else:
             ok = False
-            print("  [FAIL] — emergency save lost the shadow_only stamp")
+            print("  [FAIL] — emergency save is not a complete schema-v2 snapshot")
     else:
         ok = False
         print("  [FAIL] — emergency checkpoint missing (canary blocked it?)")
@@ -294,7 +295,8 @@ def interrupt_during_failing_canary_check() -> bool:
             "--checkpoint-interval", str(CKPT_AT),  # periodic canary fires
             "--batch-size", "8",
             "--aivat-sims", "1",
-            "--all-in-deploy-iteration", str(CKPT_AT),
+            "--canary-enforce-iteration", str(CKPT_AT),
+            "--canary-fail-patience", "1",
             "--save-path", save_path,
             "--device", "cpu",
             # Canary deliberately ENABLED and mature — it must actually FAIL.
@@ -323,14 +325,15 @@ def interrupt_during_failing_canary_check() -> bool:
               f"{CKPT_AT} completed")
     if os.path.exists(save_path):
         ckpt = torch.load(save_path, map_location="cpu", weights_only=False)
-        if ckpt.get("iteration") == CKPT_AT and not ckpt.get("shadow_only", False):
+        if (ckpt.get("iteration") == CKPT_AT
+                and ckpt.get("schema_version") == 2):
             print("  [PASS] — emergency checkpoint saved despite the FAILing "
                   "canary (correct mature iteration)")
         else:
             ok = False
             print(f"  [FAIL] — emergency checkpoint metadata wrong "
                   f"(iteration={ckpt.get('iteration')}, "
-                  f"shadow_only={ckpt.get('shadow_only')})")
+                  f"schema_version={ckpt.get('schema_version')})")
         if result.get("checkpoint_saved") == save_path:
             print("  [PASS] — result reports the emergency checkpoint path")
         else:
@@ -377,22 +380,22 @@ def run() -> bool:
     print()
 
     print("=" * 60)
-    print("Check 3: interrupted final checkpoint carries metadata stamps")
+    print("Check 3: interrupted checkpoint is fully resumable schema v2")
     print("=" * 60)
     if os.path.exists(term_ckpt):
         ckpt = torch.load(term_ckpt, map_location="cpu", weights_only=False)
-        shadow = ckpt.get("shadow_only")
+        schema = ckpt.get("schema_version")
+        reservoirs = set(ckpt.get("reservoirs", {}))
         skips = ckpt.get("nonfinite_skips")
         iteration = ckpt.get("iteration")
-        print(f"  iteration={iteration}, shadow_only={shadow}, "
+        print(f"  iteration={iteration}, schema_version={schema}, "
               f"nonfinite_skips={skips}")
-        # The run was stopped long before the 150k deploy gate, so the FINAL
-        # checkpoint must be stamped shadow-only (B4/I9).
-        if shadow is True:
-            print("  [PASS] — under-gate final checkpoint stamped shadow_only")
+        if (schema == 2 and reservoirs
+                == {"regret", "strategy", "value", "sizing"}):
+            print("  [PASS] — interrupted checkpoint includes all reservoirs")
         else:
             PASS = False
-            print("  [FAIL] — shadow_only stamp missing on under-gate final save")
+            print("  [FAIL] — interrupted checkpoint is incomplete")
         if skips == 0:
             print("  [PASS] — nonfinite_skips persisted (0 for a clean run)")
         else:
@@ -406,12 +409,17 @@ def run() -> bool:
     print("=" * 60)
     print("Check 4: --iterations defaults to 1,000,000")
     print("=" * 60)
-    from training.train_deep_cfr import parse_args, ALL_IN_DEPLOY_ITERATION
-    default_iters = parse_args(["--variant", "small"]).iterations
-    print(f"  default --iterations = {default_iters:,} "
-          f"(deploy gate {ALL_IN_DEPLOY_ITERATION:,})")
-    if default_iters == 1_000_000 and default_iters >= ALL_IN_DEPLOY_ITERATION:
-        print("  [PASS] — default run trains past the all-in deploy gate")
+    from training.train_deep_cfr import (
+        DEFAULT_CANARY_ENFORCE_ITERATION,
+        parse_args,
+    )
+    defaults = parse_args(["--variant", "small"])
+    print(f"  default --iterations = {defaults.iterations:,}; "
+          f"canary enforcement = {defaults.canary_enforce_iteration:,}")
+    if (defaults.iterations == 1_000_000
+            and defaults.canary_enforce_iteration
+            == DEFAULT_CANARY_ENFORCE_ITERATION):
+        print("  [PASS] — production traversal and canary defaults are active")
     else:
         PASS = False
         print("  [FAIL] — default --iterations is below the deploy gate")

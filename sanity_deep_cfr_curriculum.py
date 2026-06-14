@@ -62,6 +62,7 @@ def check_sampler_validity() -> bool:
 
     n_samples = 600
     seen_counts = set()
+    count_samples = {count: 0 for count in CURRICULUM_PLAYER_COUNTS}
     seen_shared = 0
     seen_asymmetric = 0
     depth_lo = float("inf")
@@ -71,6 +72,7 @@ def check_sampler_validity() -> bool:
         state, hero_seat = sample_curriculum_state(t, rng=rng)
         n = len(state.stacks)
         seen_counts.add(n)
+        count_samples[n] += 1
 
         # Hero rotation rule unchanged: (iteration - 1) % n_seats.
         if hero_seat != (t - 1) % n:
@@ -136,6 +138,17 @@ def check_sampler_validity() -> bool:
         ok = False
         print(f"  [FAIL] — player counts seen {sorted(seen_counts)}, "
               f"expected {list(CURRICULUM_PLAYER_COUNTS)}")
+    expected = {2: 0.125, 3: 0.10, 4: 0.125, 5: 0.15, 6: 0.50}
+    observed = {
+        count: count_samples[count] / n_samples
+        for count in CURRICULUM_PLAYER_COUNTS
+    }
+    if all(abs(observed[count] - expected[count]) <= 0.06 for count in expected):
+        print(f"  [PASS] — sixmax player-count mix matches fixed weights: "
+              f"{observed}")
+    else:
+        ok = False
+        print(f"  [FAIL] — player-count mix {observed}, expected {expected}")
     # 50/50 shared vs per-seat: both modes must actually occur (loose bounds).
     if seen_shared >= n_samples // 5 and seen_asymmetric >= n_samples // 5:
         print(f"  [PASS] — both depth modes sampled "

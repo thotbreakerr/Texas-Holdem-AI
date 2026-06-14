@@ -88,13 +88,22 @@ def _make_temp_deep_cfr_weights() -> str:
     ``DeepCFRBot`` reconstructs when inferring the config from a state dict.
     """
     import torch
-    from bots.deep_cfr_bot import DeepCFRNetwork, DeepCFRConfig
+    from bots.deep_cfr_bot import (
+        DEEP_CFR_SCHEMA_VERSION,
+        DeepCFRNetwork,
+        DeepCFRConfig,
+    )
 
     net = DeepCFRNetwork(DeepCFRConfig.large())
     fd, path = tempfile.mkstemp(suffix="_deep_cfr_path_b.pt")
     os.close(fd)
     with redirect_stdout(io.StringIO()):
-        torch.save({"network_state_dict": net.state_dict(), "iteration": 0}, path)
+        torch.save({
+            "schema_version": DEEP_CFR_SCHEMA_VERSION,
+            "config": DeepCFRConfig.large(),
+            "network_state_dict": net.state_dict(),
+            "iteration": 0,
+        }, path)
     return path
 
 

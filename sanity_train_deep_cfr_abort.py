@@ -1,9 +1,8 @@
 """
 Regressions for canary maturity and mid-run abort signaling.
 
-Pre-deploy, every metric is diagnostic: the all-in row is intentionally
-untrained during shadow and must not kill the first checkpoint.  At/after the
-deploy boundary, the same forced FAIL must abort without saving.
+Before 100k, every metric is diagnostic. At/after the configured enforcement
+boundary, three consecutive failing checkpoints abort without promotion.
 
 The mature check also pins the older signaling fix: run_training returns the
 documented aborted dict rather than propagating RuntimeError.
@@ -42,11 +41,12 @@ def run():
             mature_path = os.path.join(tmp, "mature.pt")
             mature_args = tdc.parse_args([
                 "--variant", "small",
-                "--iterations", "4",
+                "--iterations", "6",
                 "--checkpoint-interval", "2",
                 "--update-interval", "2",
                 "--batch-size", "8",
-                "--all-in-deploy-iteration", "0",
+                "--canary-enforce-iteration", "0",
+                "--canary-fail-patience", "3",
                 "--save-path", mature_path,
                 "--device", "cpu",
             ])
@@ -76,10 +76,10 @@ def run():
 
     if (mature is not None and mature.get("status") == "aborted"
             and mature.get("abort_reason") == "collapse_canary"
-            and mature.get("checkpoint_saved") is None
+            and mature.get("canary_fail_streak") == 3
             and not mature_saved):
-        print(f"[CHECK 3] PASS — mature FAIL aborted at iter "
-              f"{mature.get('final_iter')} without saving")
+        print(f"[CHECK 3] PASS — third consecutive mature FAIL aborted at iter "
+              f"{mature.get('final_iter')} without promotion")
     else:
         PASS = False
         print(f"[CHECK 3] FAIL — mature result={mature}, file={mature_saved}")

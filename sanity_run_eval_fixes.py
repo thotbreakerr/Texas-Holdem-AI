@@ -4,10 +4,16 @@ Regression for run_eval fixes:
     winner by chip count (instead of leaving winner=None, which biased win_rate
     downward and produced an uncredited no-decision).
   - Tier 3's break-even target matches its 7-player field (1/7).
+  - Pilot mode is exactly six-player, rotates every starting seat, and only
+    fails when Path B's Wilson interval is wholly below 1/6.
 """
 import sys
+import tempfile
+import os
 
 sys.path.insert(0, "/Users/jaroslavaupart/Desktop/Projects/Texas-Holdem-AI")
+
+import torch
 
 from core.bot_api import Action
 import run_eval
@@ -59,6 +65,71 @@ def run():
     else:
         PASS = False
         print(f"[CHECK 2] FAIL — Tier 3 target {tier3['target']:.4f} != 1/{n_players}")
+
+    pilot_cfg = run_eval.EvalConfig(
+        mode="pilot", path_a_profile="x.pkl", path_b_weights="y.pt",
+        tournaments=6, seed=100)
+    pilot_specs = run_eval.build_player_specs(pilot_cfg)
+    six_players = len(pilot_specs) == 6 and pilot_specs[0][0] == run_eval.PATH_B
+    print(f"[CHECK 3] {'PASS' if six_players else 'FAIL'} — pilot field has "
+          f"{len(pilot_specs)} players")
+    PASS &= six_players
+
+    seen_first = []
+    original_runner = run_eval._run_one_tournament
+
+    def capture(task):
+        seen_first.append(task[0][0][0])
+        return {
+            "winner": task[0][0][0],
+            "hand_count": 1,
+            "finish_order": [
+                (pid, i + 1, 1, 0)
+                for i, (pid, _) in enumerate(task[0])
+            ],
+            "final_chips": {pid: 0 for pid, _ in task[0]},
+            "chip_swing": None,
+        }
+
+    run_eval._run_one_tournament = capture
+    try:
+        run_eval._run_all_tournaments(pilot_cfg, pilot_specs)
+    finally:
+        run_eval._run_one_tournament = original_runner
+    rotated = seen_first == [pid for pid, _ in pilot_specs]
+    print(f"[CHECK 4] {'PASS' if rotated else 'FAIL'} — starting seats rotate "
+          f"across six tournaments: {seen_first}")
+    PASS &= rotated
+
+    passing = run_eval.pilot_verdict({
+        run_eval.PATH_B: {"win_ci": (0.10, 0.20)}}).startswith("PASS")
+    failing = run_eval.pilot_verdict({
+        run_eval.PATH_B: {"win_ci": (0.05, 0.16)}}).startswith("FAIL")
+    verdict_ok = passing and failing
+    print(f"[CHECK 5] {'PASS' if verdict_ok else 'FAIL'} — pilot verdict uses "
+          "the 1/6 confidence-interval baseline")
+    PASS &= verdict_ok
+
+    promotion_pass = run_eval.promotion_verdict({
+        run_eval.PATH_B: {"win_ci": (0.40, 0.55)}}).startswith("PASS")
+    promotion_fail = run_eval.promotion_verdict({
+        run_eval.PATH_B: {"win_ci": (0.30, 0.49)}}).startswith("FAIL")
+    with tempfile.TemporaryDirectory() as tmp:
+        clean = os.path.join(tmp, "clean.pt")
+        dirty = os.path.join(tmp, "dirty.pt")
+        torch.save({"schema_version": 2, "canary_status": "PASS"}, clean)
+        torch.save({"schema_version": 2, "canary_status": "WARN"}, dirty)
+        run_eval._require_canary_clean_checkpoint(clean)
+        try:
+            run_eval._require_canary_clean_checkpoint(dirty)
+        except RuntimeError:
+            rejected_dirty = True
+        else:
+            rejected_dirty = False
+    promotion_ok = promotion_pass and promotion_fail and rejected_dirty
+    print(f"[CHECK 6] {'PASS' if promotion_ok else 'FAIL'} — promotion requires "
+          "a canary-clean checkpoint and a non-regressing head-to-head CI")
+    PASS &= promotion_ok
 
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")

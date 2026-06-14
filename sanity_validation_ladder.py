@@ -126,16 +126,13 @@ LADDER: list[Gate] = [
     # Tier 3 — feature / schema consistency.
     #   Deep CFR train-vs-inference feature semantics + opponent
     #   committed / can-act / all-in input slots (FIX_REPORT #3/#4); the
-    #   decision tracer (Key Change #1); and the Key Change #2 regret-mask
-    #   plumbing (fast mask checks only — the micro-training smoke is the
-    #   slow Tier 5 gate sanity_deep_cfr_allin_micro).
+    #   decision tracer and schema-v2 traversal/network/checkpoint contracts.
     Gate("sanity_deep_cfr_fixes", 3, "deep-cfr",
          script="sanity_deep_cfr_fixes.py", timeout=600),
     Gate("sanity_deep_cfr_trace", 3, "deep-cfr",
          script="sanity_deep_cfr_trace.py", timeout=120),
-    Gate("sanity_deep_cfr_allin_masks", 3, "deep-cfr",
-         script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "fast"],
-         timeout=300),
+    Gate("sanity_deep_cfr_v2", 3, "deep-cfr",
+         script="sanity_deep_cfr_v2.py", timeout=300),
     # Fold-collapse health gate (post-Key-Change-#2): strong-hand continue
     # gate in the probe + live training canary.  Training-free, so it runs in
     # the default fast tier (not gated behind --full).
@@ -177,14 +174,11 @@ LADDER: list[Gate] = [
     #   nonfinite_guard — B2/I5 finiteness guard (NaN loss skips the step,
     #   threshold abort, counter persisted in checkpoint metadata);
     #   signals — B5/M4 SIGINT/SIGTERM save a checkpoint and exit 130/143,
-    #   plus the B4/I9 shadow_only stamp and the 1M --iterations default.
+    #   complete schema-v2 emergency snapshots and production defaults.
     Gate("sanity_deep_cfr_nonfinite_guard", 5, "deep-cfr",
          script="sanity_deep_cfr_nonfinite_guard.py", timeout=600),
     Gate("sanity_train_deep_cfr_signals", 5, "deep-cfr",
          script="sanity_train_deep_cfr_signals.py", timeout=600),
-    Gate("sanity_deep_cfr_allin_micro", 5, "deep-cfr", slow=True,
-         script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "micro"],
-         timeout=900),
     Gate("sanity_deep_cfr", 5, "deep-cfr", slow=True,
          script="sanity_deep_cfr.py", timeout=1800),
     Gate("sanity_train_deep_cfr", 5, "deep-cfr", slow=True,
