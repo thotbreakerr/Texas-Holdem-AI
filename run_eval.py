@@ -20,10 +20,9 @@ from dataclasses import dataclass
 from multiprocessing import Pool
 from typing import Any
 
-from core.engine import Table, Seat
-from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
-from bots import create_bot, escalate_blinds
-from run_tournament_stats import finalize_finish_order
+from core.engine import Seat
+from core.tournament import run_tournament
+from bots import create_bot
 
 
 PATH_A = "PATH_A"
@@ -205,76 +204,20 @@ def _run_one_tournament(task: tuple) -> dict[str, Any]:
 
     bots = _make_bots(player_specs)
     seats = [Seat(player_id=pid, chips=chips) for pid, _ in player_specs]
-    table = Table(rng=random.Random(seed) if seed is not None else random.Random())
-    dealer_index = 0
-    hand_count = 0
-    total_players = len(seats)
-    finish_order: list[tuple[str, int, int, int]] = []
-
-    with redirect_stdout(io.StringIO()):
-        while True:
-            active_seats = [s for s in seats if s.chips > 0]
-            if len(active_seats) <= 1:
-                break
-
-            hand_count += 1
-            sb, bb = escalate_blinds(
-                hand_count, base_sb, base_bb, blind_increase_every
-            )
-            active_bots = {s.player_id: bots[s.player_id] for s in active_seats}
-            dealer_index = normalize_dealer_seat_index(seats, dealer_index)
-            if dealer_index is None:
-                break
-
-            table.play_hand(
-                seats=seats,
-                small_blind=sb,
-                big_blind=bb,
-                dealer_index=dealer_index,
-                bot_for=active_bots,
-                on_event=None,
-                log_decisions=False,
-            )
-            next_dealer = advance_dealer_seat_index(seats, dealer_index)
-            if next_dealer is not None:
-                dealer_index = next_dealer
-
-            for s in seats:
-                already_ranked = any(e[0] == s.player_id for e in finish_order)
-                if s.chips <= 0 and not already_ranked:
-                    pos = total_players - len(finish_order)
-                    finish_order.append((s.player_id, pos, hand_count, 0))
-
-            if hand_count >= max_hands:
-                break
-
-    finalize_finish_order(seats, finish_order, total_players, hand_count)
-    final_chips = {s.player_id: s.chips for s in seats}
-    winner = None
-    for pid, pos, _, _ in finish_order:
-        if pos == 1:
-            winner = pid
-            break
-
-    if winner is None and final_chips:
-        # No seat was eliminated into 1st place (e.g. the match hit max_hands
-        # with survivors).  Resolve deterministically by final chip count so the
-        # tournament still yields a real winner instead of a silently
-        # uncredited no-decision (which would bias every win_rate downward).
-        winner = max(final_chips, key=lambda p: final_chips[p])
-
-    chip_swing = None
-    if total_players == 2 and winner:
-        loser = next(pid for pid, _ in player_specs if pid != winner)
-        chip_swing = final_chips[winner] - final_chips[loser]
-
-    return {
-        "winner": winner,
-        "hand_count": hand_count,
-        "finish_order": finish_order,
-        "final_chips": final_chips,
-        "chip_swing": chip_swing,
-    }
+    return run_tournament(
+        seats,
+        bots,
+        small_blind=base_sb,
+        big_blind=base_bb,
+        blind_increase_every=blind_increase_every,
+        max_hands=max_hands,
+        dealer_index=0,
+        dealer_rotation="full_table",
+        winner_resolution="chip_count_on_max_hands",
+        rng=random.Random(seed) if seed is not None else random.Random(),
+        suppress_output=True,
+        log_decisions=False,
+    )
 
 
 def _run_all_tournaments(config: EvalConfig,

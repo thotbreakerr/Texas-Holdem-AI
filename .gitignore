@@ -32,6 +32,8 @@ models/*.bak
 
 # Training/run output logs
 output/*.log
+output/.mplconfig/
+output/.algo-mccfr-findings.txt
 
 # Local agent state
 .claude/

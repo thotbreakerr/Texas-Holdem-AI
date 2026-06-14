@@ -47,6 +47,7 @@ from core.bot_api import Action, PlayerView
 from core.aivat import _side_pot_awards
 from core.engine import InProcessBot, Seat, Table
 from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
+import core.tournament as tournament_mod
 from bots.icm_bot import icm_equity, icm_ev_of_call
 import run_eval
 import training.train_deep_cfr as train_deep_cfr
@@ -540,10 +541,13 @@ def test_new_table_order_and_view_contracts() -> None:
         "expected inactive button at 1 and next after 0 to resolve to seat 2",
     )
     run_eval_source = inspect.getsource(run_eval._run_one_tournament)
+    tournament_source = inspect.getsource(tournament_mod.run_tournament)
     check(
         "run_eval uses full-table dealer rotation",
-        "seats=seats" in run_eval_source
-        and "advance_dealer_seat_index" in run_eval_source
+        "run_tournament(" in run_eval_source
+        and 'dealer_rotation="full_table"' in run_eval_source
+        and "normalize_dealer_seat_index" in tournament_source
+        and "advance_dealer_seat_index" in tournament_source
         and "dealer_index % len(active_seats)" not in run_eval_source,
         "run_eval still contains active-list dealer indexing",
     )

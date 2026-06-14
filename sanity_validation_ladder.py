@@ -92,6 +92,8 @@ LADDER: list[Gate] = [
          script="sanity_test_hand.py", timeout=180),
     Gate("sanity_test_followon", 1, "all",
          script="sanity_test_followon.py", timeout=300),
+    Gate("sanity_tournament_consolidation", 1, "all",
+         script="sanity_tournament_consolidation.py", timeout=300),
     Gate("sanity_smart_bot_river", 1, "all",
          script="sanity_smart_bot_river.py", timeout=120),
 
