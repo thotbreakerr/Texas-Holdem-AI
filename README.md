@@ -96,7 +96,7 @@ Bots are created via string keys passed to `create_bot()` or as comma-separated 
 | `ml` | MLBot | Also accepts `mlbot` |
 | `rl`, `rl:<path>` | RLBot | Optional model path: `rl:models/custom.pt` |
 | `cfr` | CFRBot | Loads `models/cfr_regret_deep_v2.pkl` in inference mode |
-| `deep_cfr` | DeepCFRBot | Loads `models/deep_cfr_v1.pt` in inference mode |
+| `deep_cfr` | DeepCFRBot | Loads schema-v2 `models/deep_cfr_v2.pt` in inference mode |
 | `icm` | ICMBot | Also accepts `icmbot` |
 | `exploitative` | ExploitativeBot | Also accepts `exploitativebot` |
 | `gto` | GTOBot | Also accepts `gtobot` |
@@ -253,17 +253,18 @@ Then register it in `bots/__init__.py` by adding a key-to-import mapping in `cre
 
 See `SESSION_LOG_2026-04-26.md` for the full change list and what's running now.
 
-## Current CFR status (as of 2026-04-27)
+## Current CFR status (as of 2026-06-13)
 
-**Build phase complete.** Both Path A (tabular MCCFR maxed) and Path B (Deep CFR Plus) architectures are built, sanity-tested, and ready for overnight training. The eval harness is also built. See `SESSION_LOG_2026-04-27.md` for the full build phase log including the audit/fix cycles.
+**Path B schema v2 is ready for a fresh retrain.** The collapsed v1 checkpoint
+is postmortem-only and is rejected for deployment or resume.
 
 ### Closed gates
 
 - **Gate 1 — Shared utilities.** `core/equity.py`, `core/icm.py`, `core/aivat.py`, `core/opponent_stats.py`, `core/action_history.py`. Both paths consume these read-only.
 - **Gate 2A — Path A maxed CFR** (`bots/cfr_bot.py` extension). Recursive tree CFR via `_cfr_recurse`, AIVAT leaf evaluator, opponent-stat bucket in info-set key (7 fields, 6 colons), card buckets 20→50, real-time depth-3 subgame search.
-- **Gate 2B — Path B Deep CFR Plus architecture** (`bots/deep_cfr_bot.py`). State encoder + regret/value/sizing heads + ReservoirBuffer. Two configs: small (632K params) and large (2.8M params). Below the original 5M/15M aspirational targets but accepted.
+- **Gate 2B — Path B multiway Deep CFR-inspired architecture** (`bots/deep_cfr_bot.py`). Independent advantage, average-strategy, value, and sizing encoder/head networks; zero-initialized advantage output; seated/active player-count features; four reservoirs.
 - **Gate 3A — Path A training pipeline** (`training/train_cfr_bot_multiway.py` polish + `sanity_train_cfr.py`). Default profile path is now `cfr_regret_deep_v2.pkl` to preserve v1 pocket bot.
-- **Gate 3B — Path B training pipeline** (`training/train_deep_cfr.py` + `sanity_train_deep_cfr.py`). SmoothL1 loss, lr=1e-4, AIVAT n_sims configurable (default 500, sanity uses 50).
+- **Gate 3B — Path B schema-v2 training pipeline** (`training/train_deep_cfr.py` + `sanity_train_deep_cfr.py`). Frozen 25k-traversal external-sampling rounds, full traverser-action expansion, average-strategy deployment, sixmax-weighted 2-6 player curriculum, complete resumable checkpoints, and probability-based collapse canaries.
 - **Eval harness** (`run_eval.py` + `sanity_eval.py`). Head-to-head and multiway modes, Wilson 95% CIs, decisive-winner verdict logic.
 
 ### Pre-existing artifacts
@@ -276,11 +277,30 @@ See `SESSION_LOG_2026-04-26.md` for the full change list and what's running now.
 ```bash
 # Path B first (GPU/RAM-bound, M5 Max):
 python training/train_deep_cfr.py --variant large --iterations 1000000 \
-    --save-path models/deep_cfr_v1.pt --device auto
+    --curriculum-profile sixmax --canary-enforce-iteration 100000 \
+    --canary-fail-patience 3 --save-path models/deep_cfr_v2.pt --device auto
 
 # Path A second (CPU-bound, never concurrent with Path B):
 python training/train_cfr_bot_multiway.py --tournaments 5000 --iterations 10 \
     --save_every 500 --profile models/cfr_regret_deep_v2.pkl
+```
+
+Schema-v2 rollout:
+
+```bash
+# 10k smoke, then a fresh 150k pilot.
+python training/train_deep_cfr.py --variant large --iterations 10000 \
+    --save-path models/deep_cfr_v2_smoke.pt --device auto
+python training/train_deep_cfr.py --variant large --iterations 150000 \
+    --save-path models/deep_cfr_v2_pilot.pt --device auto
+
+# Six-player, fixed-seed, seat-rotated pilot against five existing bots.
+python run_eval.py --mode pilot --tournaments 500 --seed 20260613 \
+    --path_b_weights models/deep_cfr_v2_pilot.pt
+
+# Final canary-clean promotion check against the strongest existing bot.
+python run_eval.py --mode promotion --tournaments 1000 --seed 20260613 \
+    --promotion-opponent gto --path_b_weights models/deep_cfr_v2.pt
 ```
 
 After both train, run `python run_eval.py --mode multiway --tournaments 1000 ...` to determine which path becomes production CFR.
