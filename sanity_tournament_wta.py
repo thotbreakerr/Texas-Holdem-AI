@@ -29,18 +29,6 @@ class CheckCallBot:
         return Action(view.legal_actions[0]["type"])
 
 
-class JamBot:
-    def act(self, view):
-        for action_type in ("raise", "bet"):
-            choices = [a for a in view.legal_actions if a["type"] == action_type]
-            if choices:
-                return Action(action_type, choices[0]["max"])
-        for action_type in ("call", "check", "fold"):
-            if any(a["type"] == action_type for a in view.legal_actions):
-                return Action(action_type)
-        return Action(view.legal_actions[0]["type"])
-
-
 def _wrapped(bot):
     return InProcessBot(bot)
 
@@ -118,15 +106,22 @@ def run():
         ante_events == [2, 3, 4],
         f"antes={ante_events}",
     )
+    schedule_final_chips = schedule_result["final_chips"]
+    schedule_chip_leader = max(schedule_final_chips, key=schedule_final_chips.get)
     passed &= _check(
         "max-hands WTA winner resolved",
-        schedule_result["winner"] in {"A", "B"},
+        len(set(schedule_final_chips.values())) == len(schedule_final_chips)
+        and schedule_result["winner"] == schedule_chip_leader,
         f"result={schedule_result}",
     )
 
     result = run_tournament(
         [Seat("P1", 120), Seat("P2", 120), Seat("P3", 120)],
-        {"P1": _wrapped(JamBot()), "P2": _wrapped(JamBot()), "P3": _wrapped(JamBot())},
+        {
+            "P1": _wrapped(CheckCallBot()),
+            "P2": _wrapped(CheckCallBot()),
+            "P3": _wrapped(CheckCallBot()),
+        },
         small_blind=5,
         big_blind=10,
         blind_increase_every=50,
@@ -137,7 +132,7 @@ def run():
         ante=3,
         suppress_output=True,
     )
-    player_specs = [(pid, "jam") for pid in ("P1", "P2", "P3")]
+    player_specs = [(pid, "check_call") for pid in ("P1", "P2", "P3")]
     aggregated = aggregate_results([result], player_specs)
     winner = result["winner"]
     passed &= _check(
@@ -154,8 +149,8 @@ def run():
     )
     passed &= _check(
         "tournament chips conserve with antes",
-        sum(result["final_chips"].values()) == 360,
-        f"final_chips={result['final_chips']}",
+        result["hand_count"] > 1 and sum(result["final_chips"].values()) == 360,
+        f"hand_count={result['hand_count']} final_chips={result['final_chips']}",
     )
 
     print("=" * 60)
