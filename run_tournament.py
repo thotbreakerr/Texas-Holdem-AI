@@ -33,8 +33,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.widgets import Button
 
-from core.engine import Table, Seat
-from bots import parse_players, escalate_blinds
+from core.engine import Seat
+from core.tournament import run_tournament
+from bots import parse_players
 
 # ─── DEFAULTS ────────────────────────────────────────────────────────────────
 
@@ -320,72 +321,63 @@ class TournamentUI:
 
         seats = [Seat(player_id=pid, chips=self.starting_chips)
                  for pid in self.player_ids]
-        by_pid = {s.player_id: s for s in seats}
 
-        snap = {"hand": 0, **{pid: self.starting_chips for pid in self.player_ids}}
-        self.chip_history.append(snap)
-        self._mark_dirty()
+        def should_cancel():
+            return self._cancel_event.is_set()
 
-        active_seats = list(seats)
-        table        = Table()
-        dealer       = 0
-        hand_num     = 0
-        finishing     = []
-        total        = len(seats)
-
-        while len(active_seats) > 1:
-            # Cancellation check (runs before every hand)
-            if self._cancel_event.is_set():
-                self._signal_cancelled()
-                return
-            # Pause loop — also exits immediately on cancel
+        def wait_if_paused():
             while self._paused and not self._cancel_event.is_set():
                 time.sleep(0.05)
 
-            hand_num += 1
-            sb, bb = escalate_blinds(hand_num, self.base_sb, self.base_bb,
-                                     self.blind_increase_every)
-            self._current_blinds = (sb, bb)
-            dealer_i = dealer % len(active_seats)
-
-            active_bots = {s.player_id: self.bots[s.player_id]
-                           for s in active_seats}
-
-            try:
-                table.play_hand(
-                    active_seats, sb, bb,
-                    dealer_i, active_bots,
-                )
-            except Exception as e:
-                print(f"[hand {hand_num}] error: {e}")
-                break
-
-            snap = {"hand": hand_num}
-            for pid in self.player_ids:
-                snap[pid] = by_pid[pid].chips
-            self.chip_history.append(snap)
-            self._detect_highlights(hand_num)
-            self._mark_dirty()
-
-            eliminated = [s for s in active_seats if s.chips <= 0]
-            for s in eliminated:
-                pos = total - len(finishing)
-                finishing.append((s.player_id, pos))
-                self._eliminations[s.player_id] = pos
-                self._elimination_events.append((s.player_id, hand_num, pos))
-                active_seats.remove(s)
-                print(f"  [OUT] {s.player_id} — position {pos}")
-
-            dealer = (dealer + 1) % max(len(active_seats), 1)
+        def delay():
             time.sleep(self.hand_delay)
 
-        if active_seats:
-            finishing.append((active_seats[0].player_id, 1))
-            winner = active_seats[0].player_id
-        else:
-            winner = "?"
+        def on_tournament_event(event):
+            event_type = event["type"]
+            if event_type == "start":
+                self.chip_history = list(event["chip_history"])
+                self._mark_dirty()
+            elif event_type == "hand_start":
+                self._current_blinds = (
+                    event["small_blind"],
+                    event["big_blind"],
+                )
+            elif event_type == "hand_end":
+                hand_num = event["hand"]
+                self.chip_history = list(event["chip_history"])
+                self._detect_highlights(hand_num)
+                for pid, pos, _, _ in event["eliminations"]:
+                    self._eliminations[pid] = pos
+                    self._elimination_events.append((pid, hand_num, pos))
+                    print(f"  [OUT] {pid} — position {pos}")
+                self._mark_dirty()
 
-        self._signal_finish(winner, hand_num)
+        try:
+            result = run_tournament(
+                seats,
+                self.bots,
+                small_blind=self.base_sb,
+                big_blind=self.base_bb,
+                blind_increase_every=self.blind_increase_every,
+                max_hands=None,
+                dealer_index=0,
+                dealer_rotation="active_circle",
+                winner_resolution="finish_order",
+                on_event=on_tournament_event,
+                should_cancel=should_cancel,
+                wait_if_paused=wait_if_paused,
+                hand_delay=delay,
+            )
+        except Exception as e:
+            print(f"[tournament] error: {e}")
+            self._signal_finish("?", len(self.chip_history))
+            return
+
+        if result.get("cancelled"):
+            self._signal_cancelled()
+            return
+
+        self._signal_finish(result.get("winner") or "?", result["hand_count"])
 
     # ── Leaderboard ───────────────────────────────────────────────────────────
 

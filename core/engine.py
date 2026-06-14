@@ -919,76 +919,58 @@ class TournamentManager:
 
     def run(self, seats, bot_for, small_blind, big_blind, dealer_index=0,
             on_event=None, live_graph=True):
+        from core.tournament import run_tournament
+
         seats = [s if isinstance(s, Seat) else Seat(**s) for s in seats]
-        active_seats = list(seats)
-        dealer = dealer_index
-        hand_number = 0
         chip_history: List[Dict] = []
-        # finishing_order: list of (player_id, position) where position 1 = winner
-        finishing_order: List[Tuple[str, int]] = []
-        total_players = len(seats)
 
         # Set up live graph
         player_ids = [s.player_id for s in seats]
         graph = LiveTournamentGraph(player_ids) if live_graph else None
 
-        # Record initial chip snapshot
-        snapshot = {"hand": 0}
-        for s in seats:
-            snapshot[s.player_id] = s.chips
-        chip_history.append(snapshot)
+        def handle_tournament_event(event):
+            nonlocal chip_history
+            event_type = event["type"]
+            if event_type == "start":
+                chip_history = list(event["chip_history"])
+                if graph:
+                    graph.update(chip_history)
+            elif event_type == "hand_end":
+                chip_history = list(event["chip_history"])
+                if graph:
+                    graph.update(chip_history)
+                for pid, position, _, _ in event["eliminations"]:
+                    print(
+                        f"  [ELIMINATED] {pid} finishes in position {position}"
+                    )
 
-        if graph:
-            graph.update(chip_history)
-
-        while len(active_seats) > 1:
-            hand_number += 1
-            # Fix dealer index if it's out of range
-            dealer = dealer % len(active_seats)
-
-            self.table.play_hand(
-                active_seats, small_blind, big_blind, dealer, bot_for, on_event=on_event
-            )
-
-            # Record chip snapshot after this hand
-            snapshot = {"hand": hand_number}
-            for s in seats:
-                snapshot[s.player_id] = s.chips
-            chip_history.append(snapshot)
-
-            # Update live graph
-            if graph:
-                graph.update(chip_history)
-
-            # Eliminate busted players (chips <= 0)
-            eliminated = [s for s in active_seats if s.chips <= 0]
-            for s in eliminated:
-                # Last place = total_players, first eliminated gets worst position
-                position = total_players - len(finishing_order)
-                finishing_order.append((s.player_id, position))
-                active_seats.remove(s)
-                print(f"  [ELIMINATED] {s.player_id} finishes in position {position}")
-
-            # Advance dealer
-            if active_seats:
-                dealer = (dealer + 1) % len(active_seats)
-
-        # The last player standing is the winner (position 1)
-        if active_seats:
-            finishing_order.append((active_seats[0].player_id, 1))
-            print(f"  [WINNER] {active_seats[0].player_id} wins the tournament!")
+        result = run_tournament(
+            seats,
+            bot_for,
+            small_blind=small_blind,
+            big_blind=big_blind,
+            blind_increase_every=0,
+            max_hands=None,
+            dealer_index=dealer_index,
+            dealer_rotation="active_circle",
+            winner_resolution="finish_order",
+            table=self.table,
+            on_event=handle_tournament_event,
+        )
+        if result["winner"]:
+            print(f"  [WINNER] {result['winner']} wins the tournament!")
 
         # Finalize graph — save and keep window open
         if graph:
             graph.finish()
 
         # Build results dict: player_id -> finishing position
-        results = {pid: pos for pid, pos in finishing_order}
+        results = {pid: pos for pid, pos, _, _ in result["finish_order"]}
 
         return {
             "results": results,
             "chip_history": chip_history,
-            "hands_played": hand_number,
+            "hands_played": result["hand_count"],
             "final_stacks": {s.player_id: s.chips for s in seats},
         }
 
