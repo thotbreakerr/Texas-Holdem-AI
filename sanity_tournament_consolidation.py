@@ -1,4 +1,9 @@
-"""Phase 1 gate: canonical tournament loop matches the legacy loops."""
+"""Phase 1 gate: canonical tournament loop matches the legacy loops.
+
+This proves loop/refactor parity only. The legacy oracle and run_tournament
+both call the same core.engine.play_hand, so shared engine bugs are invisible
+here and need separate engine-level coverage.
+"""
 
 from __future__ import annotations
 

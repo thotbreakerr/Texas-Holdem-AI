@@ -32,6 +32,7 @@ def _coerce_seats(seats: list[Seat | dict[str, Any]], chips: int | None) -> list
 
 
 def _active_seats(seats: list[Seat]) -> list[Seat]:
+    # Sitting-out seats are intentionally excluded; eval's chips-only filter is a benign subset.
     return [s for s in seats if s.chips > 0 and not s.is_sitting_out]
 
 
@@ -126,7 +127,6 @@ def run_tournament(
                     "hand_count": hand_count,
                     "finish_order": finish_order,
                     "final_chips": {s.player_id: s.chips for s in seats},
-                    "final_stacks": {s.player_id: s.chips for s in seats},
                     "chip_swing": None,
                     "chip_history": chip_history,
                     "cancelled": True,
@@ -242,10 +242,8 @@ def run_tournament(
     result = {
         "winner": winner,
         "hand_count": hand_count,
-        "hands_played": hand_count,
         "finish_order": finish_order,
         "final_chips": final_chips,
-        "final_stacks": final_chips,
         "chip_swing": chip_swing,
         "chip_history": chip_history,
         "cancelled": False,
