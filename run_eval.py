@@ -232,7 +232,7 @@ def _run_one_tournament(task: TournamentTask) -> dict[str, Any]:
 
     bots = _make_bots(task.player_specs)
     seats = [Seat(player_id=pid, chips=task.chips) for pid, _ in task.player_specs]
-    return run_tournament(
+    result = run_tournament(
         seats,
         bots,
         small_blind=task.base_sb,
@@ -247,6 +247,8 @@ def _run_one_tournament(task: TournamentTask) -> dict[str, Any]:
         log_decisions=False,
         **_ante_kwargs(task.ante_mode, task.ante_fraction_of_bb, task.base_bb),
     )
+    result.pop("chip_history", None)
+    return result
 
 
 def _run_all_tournaments(config: EvalConfig,

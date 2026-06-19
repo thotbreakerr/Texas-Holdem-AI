@@ -3,6 +3,8 @@ Regression for run_eval fixes:
   - A tournament that hits max_hands with survivors resolves a deterministic
     winner by chip count (instead of leaving winner=None, which biased win_rate
     downward and produced an uncredited no-decision).
+  - Eval worker results do not retain per-hand chip history, which is unused by
+    aggregation and expensive to pickle at default eval scale.
   - Tier 3's break-even target matches its 7-player field (1/7).
   - Pilot mode is exactly six-player, rotates every starting seat, and only
     fails when Path B's Wilson interval is wholly below 1/6.
@@ -63,6 +65,11 @@ def run():
     else:
         PASS = False
         print(f"[CHECK 1] FAIL — winner not resolved: {result['winner']}")
+
+    history_trimmed = "chip_history" not in result
+    print(f"[CHECK 1b] {'PASS' if history_trimmed else 'FAIL'} — eval worker "
+          "omits unused chip_history payload")
+    PASS &= history_trimmed
 
     # ── Tier 3 target matches field size ─────────────────────────────────────
     cfg = run_eval.EvalConfig(mode="curriculum",
