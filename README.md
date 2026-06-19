@@ -1,7 +1,7 @@
 
 # Texas Hold'em Bot
 
-A poker engine with pluggable AI bots. Ships with nine bot types ranging from simple heuristics to neural-network, reinforcement-learning, game-theoretic, and opponent-modeling strategies, plus a live tournament UI, batch statistics runner, and training pipelines for the ML, RL, and CFR bots.
+A poker engine with pluggable AI bots. Ships with tournament, heuristic, neural-network, reinforcement-learning, game-theoretic, and opponent-modeling strategies, plus a live tournament UI, batch statistics runner, and training pipelines for the ML, RL, and CFR bots.
 
 ## Setup
 
@@ -46,7 +46,7 @@ The `--rl_model` flag automatically rewrites any `rl` entries in the `--players`
 │   ├── bot_api.py                 Action, PlayerView, BotAdapter interfaces
 │   └── logger.py                  Per-decision JSONL logger for ML training
 │
-├── bots/                          Nine bot implementations + factory
+├── bots/                          Bot implementations + factory
 │   ├── __init__.py                Bot factory (create_bot, parse_players, escalate_blinds)
 │   ├── monte_carlo_bot.py         Monte Carlo rollout equity estimation
 │   ├── poker_mind_bot.py          Heuristic hand-tier classification (SmartBot)
@@ -56,7 +56,8 @@ The `--rl_model` flag automatically rewrites any `rl` entries in the `--players`
 │   ├── icm_bot.py                 Tournament equity (Independent Chip Model)
 │   ├── exploitative_bot.py        Opponent-tracking exploitation
 │   ├── gto_bot.py                 GTO approximation with balanced mixed strategies
-│   └── opponent_model_bot.py      Bayesian hand-range modeling
+│   ├── opponent_model_bot.py      Bayesian hand-range modeling
+│   └── tournament_hybrid_bot.py   Final tournament bot profiles
 │
 ├── models/                        Saved weights and precomputed tables
 │   └── five_card_table.pkl        Precomputed hand evaluator lookup (~45 MB)
@@ -101,6 +102,8 @@ Bots are created via string keys passed to `create_bot()` or as comma-separated 
 | `exploitative` | ExploitativeBot | Also accepts `exploitativebot` |
 | `gto` | GTOBot | Also accepts `gtobot` |
 | `opponentmodel` | OpponentModelBot | Also accepts `opponentmodelbot` |
+| `final`, `final_survival` | TournamentHybridBot | Survival profile |
+| `final_aggro` | TournamentHybridBot | Aggro profile |
 | `random` | RandomBot | Uniform random legal actions |
 
 Example: `--players mc200,smart,rl,cfr` creates a 4-player table with auto-assigned IDs (P1-P4). Named seats: `--players P1=mc200,P2=smart`.

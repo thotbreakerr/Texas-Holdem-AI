@@ -193,6 +193,8 @@ LADDER: list[Gate] = [
          script="sanity_train_cfr.py", timeout=1800),
 
     # Tier 6 — eval / readiness
+    Gate("sanity_tournament_hybrid", 6, "all",
+         script="sanity_tournament_hybrid.py", timeout=300),
     Gate("sanity_run_eval_fixes", 6, "all",
          script="sanity_run_eval_fixes.py", timeout=600),
     Gate("sanity_eval", 6, "all", slow=True,
