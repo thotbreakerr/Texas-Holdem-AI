@@ -37,3 +37,6 @@ output/.algo-mccfr-findings.txt
 
 # Local agent state
 .claude/
+
+# Phase 5 ablation eval run logs (reproducible via eval_final_bot.py --p5-arms all)
+eval_runs/

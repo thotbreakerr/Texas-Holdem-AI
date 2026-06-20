@@ -332,7 +332,8 @@ class Table:
                   dealer_index: int, bot_for: Dict[str, BotAdapter], on_event=None,
                   log_decisions: bool = False,
                   logger: Optional[DecisionLogger] = None,
-                  ante: int = 0) -> Dict[str, int]:
+                  ante: int = 0,
+                  blind_increase_every: Optional[int] = None) -> Dict[str, int]:
 
         # An externally provided logger spans multiple hands (one session
         # file per tournament — required for ML training memory features);
@@ -438,6 +439,7 @@ class Table:
                 on_event,
                 logger=logger,
                 hand_id=hand_id,
+                blind_increase_every=blind_increase_every,
                 **extra_kwargs,
             )
 
@@ -520,7 +522,8 @@ class Table:
     def _betting_round(
         self, street, seats, ring, pos_by_pid, hole, board, contrib, pot, bb,
         bot_for, history, on_event, logger, start_idx: int = 0,
-        folded_pids: set = None, hand_id: Optional[int] = None
+        folded_pids: set = None, hand_id: Optional[int] = None,
+        blind_increase_every: Optional[int] = None
     ):
         # print(f"\n=== BETTING ROUND START: {street} ===")
         # print(f"Pot before street: {pot}")
@@ -732,6 +735,7 @@ class Table:
                 seat_indices=seat_indices,
                 acting_opponents=acting_opponents,
                 all_in_opponents=all_in_opponents,
+                blind_increase_every=blind_increase_every,
             )
 
             # BOT ACTION

@@ -155,17 +155,37 @@ def _pool_specs(pool: str) -> list[tuple[str, str]]:
     return specs
 
 
+def _path_a_spec(config: EvalConfig) -> str:
+    raw = str(config.path_a_profile or "").strip()
+    lower = raw.lower()
+    if lower.startswith("bot:"):
+        return raw.split(":", 1)[1]
+    if lower.startswith("final"):
+        return raw
+    return f"cfr:{config.path_a_profile}"
+
+
+def _path_b_spec(config: EvalConfig) -> str:
+    raw = str(config.path_b_weights or "").strip()
+    lower = raw.lower()
+    if lower.startswith("bot:"):
+        return raw.split(":", 1)[1]
+    if lower.startswith("final"):
+        return raw
+    return f"deep_cfr:{config.path_b_weights}"
+
+
 def build_player_specs(config: EvalConfig) -> list[tuple[str, str]]:
     """Build (pid, bot_spec) entries for the selected eval mode."""
     if config.mode == "head_to_head":
         return [
-            (PATH_A, f"cfr:{config.path_a_profile}"),
-            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            (PATH_A, _path_a_spec(config)),
+            (PATH_B, _path_b_spec(config)),
         ]
     if config.mode == "multiway":
         return [
-            (PATH_A, f"cfr:{config.path_a_profile}"),
-            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            (PATH_A, _path_a_spec(config)),
+            (PATH_B, _path_b_spec(config)),
             *_pool_specs(config.pool),
         ]
     if config.mode == "pilot":
@@ -173,17 +193,17 @@ def build_player_specs(config: EvalConfig) -> list[tuple[str, str]]:
         if len(pool) < 5:
             raise ValueError("pilot mode requires at least five pool opponents")
         return [
-            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            (PATH_B, _path_b_spec(config)),
             *pool[:5],
         ]
     if config.mode == "promotion":
         _require_canary_clean_checkpoint(config.path_b_weights)
         return [
-            (PATH_B, f"deep_cfr:{config.path_b_weights}"),
+            (PATH_B, _path_b_spec(config)),
             ("PROMOTION_OPPONENT", config.promotion_opponent),
         ]
     if config.mode == "curriculum":
-        return [(PATH_B, f"deep_cfr:{config.path_b_weights}")]
+        return [(PATH_B, _path_b_spec(config))]
     raise ValueError(f"unknown mode: {config.mode}")
 
 
@@ -638,9 +658,9 @@ def parse_args(argv: list[str] | None = None) -> EvalConfig:
         choices=("head_to_head", "multiway", "pilot", "promotion", "curriculum"),
                         required=True)
     parser.add_argument("--path_a_profile", default="models/cfr_regret_deep_v2.pkl",
-                        help="Path A CFR profile path")
+                        help="Path A CFR profile path, or explicit final*/bot: spec")
     parser.add_argument("--path_b_weights", default="models/deep_cfr_v2.pt",
-                        help="Path B Deep CFR weights path")
+                        help="Path B Deep CFR weights path, or explicit final*/bot: spec")
     parser.add_argument("--tournaments", type=int, default=1000)
     parser.add_argument("--pool", default=DEFAULT_POOL,
                         help="Comma-separated bot pool for multiway mode")

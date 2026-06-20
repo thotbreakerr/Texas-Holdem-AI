@@ -7,6 +7,7 @@ import io
 import os
 import random
 import sys
+import copy
 from contextlib import redirect_stdout
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -245,6 +246,7 @@ def _check_fuzz():
             ok &= action.type == "fold"
         ok &= bot.last_decision is not None
 
+    # Phase 3: top pair top kicker facing a modest bet must continue, not fold.
     postflop_view = _view(
         [{"type": "fold"}, {"type": "call"}, {"type": "raise", "min": 40, "max": 120}],
         street="flop",
@@ -254,8 +256,10 @@ def _check_fuzz():
     for profile in ("survival", "aggro"):
         postflop_bot = TournamentHybridBot(profile)
         postflop_action = postflop_bot.act(postflop_view)
-        ok &= postflop_action == _passive_action(postflop_view)
-        ok &= postflop_bot.last_decision.get("path") == "passive"
+        ok &= _valid_action(postflop_action, postflop_view.legal_actions)
+        ok &= postflop_action.type in {"call", "raise"}
+        ok &= postflop_bot.last_decision.get("path") == "postflop"
+        ok &= "equity" in postflop_bot.last_decision
 
     reset_bot = TournamentHybridBot("survival")
     reset_bot.act(normal_cases[0][1])
@@ -1068,6 +1072,1228 @@ def _check_determinism_and_preflop_fuzz():
     return ok
 
 
+def _postflop_view(
+    hole,
+    board,
+    *,
+    street="flop",
+    to_call=0,
+    pot=60,
+    opponents=("Villain1", "Villain2"),
+    hero_stack=400,
+    legal=None,
+    hand_id=4000,
+):
+    opp_list = list(opponents)
+    stacks = {"Hero": hero_stack}
+    for opp in opp_list:
+        stacks[opp] = 400
+    if legal is None:
+        if to_call > 0:
+            min_total = max(2 * to_call, to_call + max(1, pot // 2))
+            legal = [
+                {"type": "fold"},
+                {"type": "call"},
+                {"type": "raise", "min": min(min_total, hero_stack), "max": hero_stack},
+            ]
+        else:
+            legal = [
+                {"type": "check"},
+                {"type": "bet", "min": max(1, pot // 4), "max": hero_stack},
+            ]
+    return _view(
+        legal,
+        street=street,
+        board=list(board),
+        hole_cards=list(hole),
+        pot=pot,
+        to_call=to_call,
+        max_raise=hero_stack,
+        stacks=stacks,
+        opponents=opp_list,
+        seat_indices={pid: idx for idx, pid in enumerate(["Hero"] + opp_list)},
+        acting_opponents=opp_list,
+        all_in_opponents=[],
+        hand_id=hand_id,
+    )
+
+
+def _check_postflop():
+    ok = True
+
+    # Draw detector unit checks.
+    ok &= TournamentHybridBot._draw_category(
+        [("K", "s"), ("Q", "s")], [("J", "s"), ("7", "s"), ("2", "d")]
+    ) == "flush"
+    ok &= TournamentHybridBot._draw_category(
+        [("9", "h"), ("8", "d")], [("7", "c"), ("6", "s"), ("2", "h")]
+    ) == "oeso"
+    ok &= TournamentHybridBot._draw_category(
+        [("9", "h"), ("5", "d")], [("7", "c"), ("6", "s"), ("2", "h")]
+    ) == "gutshot"
+    ok &= TournamentHybridBot._draw_category(
+        [("K", "h"), ("3", "d")], [("8", "c"), ("6", "s"), ("2", "h")]
+    ) == "none"
+
+    # Monster with no bet to call value-bets.
+    monster = _postflop_view(
+        [("A", "s"), ("A", "d")],
+        [("A", "c"), ("7", "d"), ("2", "h")],
+        to_call=0,
+        pot=60,
+        hand_id=4001,
+    )
+    for profile in ("survival", "aggro"):
+        bot = TournamentHybridBot(profile)
+        action = bot.act(monster)
+        ok &= _valid_action(action, monster.legal_actions)
+        ok &= action.type in {"bet", "raise"}
+        ok &= bot.last_decision.get("branch") == "postflop_value_bet"
+        ok &= bot.last_decision.get("path") == "postflop"
+
+    # Air facing a large bet folds.
+    trash = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=80,
+        pot=100,
+        hand_id=4002,
+    )
+    for profile in ("survival", "aggro"):
+        bot = TournamentHybridBot(profile)
+        action = bot.act(trash)
+        ok &= _valid_action(action, trash.legal_actions)
+        ok &= action.type == "fold"
+        ok &= bot.last_decision.get("branch") == "postflop_fold"
+
+    missing_hole = _postflop_view(
+        [],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=20,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=4004,
+    )
+    malformed_hole = _postflop_view(
+        [("Z", "z"), ("A", "s")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=20,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=4005,
+    )
+
+    class _NoEquityBot(TournamentHybridBot):
+        def _postflop_equity(self, view, hole, board, n_opp, sims):
+            return None
+
+    class _ExplodingPostflopBot(TournamentHybridBot):
+        def _postflop_action(self, view, context):
+            raise RuntimeError("intentional postflop failure")
+
+    no_equity = _postflop_view(
+        [("A", "s"), ("K", "s")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=20,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=4006,
+    )
+    exploding = _postflop_view(
+        [("A", "s"), ("K", "s")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=20,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=4007,
+    )
+    for view in (missing_hole, malformed_hole):
+        bot = TournamentHybridBot("survival")
+        action = bot.act(view)
+        ok &= _valid_action(action, view.legal_actions)
+        ok &= action.type == "fold"
+        ok &= bot.last_decision.get("branch") == "postflop_no_cards"
+    no_equity_bot = _NoEquityBot("survival")
+    no_equity_action = no_equity_bot.act(no_equity)
+    ok &= _valid_action(no_equity_action, no_equity.legal_actions)
+    ok &= no_equity_action.type == "fold"
+    ok &= no_equity_bot.last_decision.get("branch") == "postflop_equity_error"
+    exploding_bot = _ExplodingPostflopBot("survival")
+    exploding_action = exploding_bot.act(exploding)
+    ok &= _valid_action(exploding_action, exploding.legal_actions)
+    ok &= exploding_action.type == "fold"
+    ok &= exploding_bot.last_decision.get("branch") == "postflop_exception"
+
+    class _FixedEquityBot(TournamentHybridBot):
+        def _postflop_equity(self, view, hole, board, n_opp, sims):
+            return 0.30
+
+    call_for_less = _postflop_view(
+        [("A", "s"), ("7", "d")],
+        [("K", "c"), ("7", "h"), ("2", "d")],
+        to_call=100,
+        pot=120,
+        opponents=("V",),
+        hero_stack=40,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=4008,
+    )
+    fixed_bot = _FixedEquityBot("aggro")
+    fixed_action = fixed_bot.act(call_for_less)
+    ok &= _valid_action(fixed_action, call_for_less.legal_actions)
+    ok &= fixed_action.type == "call"
+    ok &= fixed_bot.last_decision.get("pot_odds") == 0.25
+    ok &= fixed_bot.last_decision.get("stack_state", {}).get("commit_frac") == 1.0
+
+    # Strong made hand facing a small bet continues (call or raise).
+    strong = _postflop_view(
+        [("A", "s"), ("A", "d")],
+        [("A", "c"), ("7", "d"), ("2", "h")],
+        to_call=15,
+        pot=60,
+        hand_id=4003,
+    )
+    for profile in ("survival", "aggro"):
+        bot = TournamentHybridBot(profile)
+        action = bot.act(strong)
+        ok &= _valid_action(action, strong.legal_actions)
+        ok &= action.type in {"call", "raise"}
+
+    # Determinism: identical postflop spot resolves identically.
+    repeat_bot = TournamentHybridBot("aggro")
+    first = repeat_bot.act(strong)
+    second = repeat_bot.act(strong)
+    ok &= first == second
+
+    # Aggro applies at least as much postflop pressure as survival.
+    rng = random.Random(424242)
+    aggro_aggressive = 0
+    survival_aggressive = 0
+    deck = [(r, s) for r in "23456789TJQKA" for s in "cdhs"]
+    for i in range(60):
+        cards = rng.sample(deck, 5)
+        hole, board = cards[:2], cards[2:]
+        street = rng.choice(["flop", "turn", "river"])
+        if street == "turn":
+            board = board + [rng.choice([c for c in deck if c not in cards])]
+        elif street == "river":
+            extra = rng.sample([c for c in deck if c not in cards], 2)
+            board = board + extra
+        view = _postflop_view(hole, board, street=street, to_call=0, pot=80,
+                              hand_id=5000 + i)
+        a_action = TournamentHybridBot("aggro").act(view)
+        s_action = TournamentHybridBot("survival").act(view)
+        ok &= _valid_action(a_action, view.legal_actions)
+        ok &= _valid_action(s_action, view.legal_actions)
+        if a_action.type in ("bet", "raise"):
+            aggro_aggressive += 1
+        if s_action.type in ("bet", "raise"):
+            survival_aggressive += 1
+    ok &= aggro_aggressive >= survival_aggressive
+
+    # Legality fuzz across random postflop spots and legal sets.
+    for i in range(80):
+        cards = rng.sample(deck, rng.choice([5, 6, 7]))
+        hole = cards[:2]
+        board_len = rng.choice([3, 4, 5])
+        board = cards[2:2 + board_len]
+        street = {3: "flop", 4: "turn", 5: "river"}[len(board)]
+        n_opp = rng.randint(1, 4)
+        opponents = [f"V{j}" for j in range(n_opp)]
+        to_call = rng.choice([0, 0, 10, 40, 120, 400])
+        pot = rng.randint(20, 400)
+        scenario = rng.choice(["normal", "check_only", "no_raise", "all_in_raise", "empty"])
+        if scenario == "check_only":
+            legal = [{"type": "check"}]
+            to_call = 0
+        elif scenario == "no_raise":
+            legal = [{"type": "fold"}, {"type": "call"}]
+            to_call = max(10, to_call)
+        elif scenario == "all_in_raise":
+            legal = [
+                {"type": "fold"},
+                {"type": "call"},
+                {"type": "raise", "min": 400, "max": 400, "all_in": True, "reopens": False},
+            ]
+            to_call = max(10, to_call)
+        elif scenario == "empty":
+            legal = []
+        else:
+            legal = None
+        view = _postflop_view(hole, board, street=street, to_call=to_call, pot=pot,
+                              opponents=opponents, legal=legal, hand_id=6000 + i)
+        for profile in ("survival", "aggro"):
+            bot = TournamentHybridBot(profile)
+            try:
+                action = bot.act(view)
+            except Exception:
+                ok = False
+                continue
+            enforceable = bool(_legal_types(view.legal_actions) & {"check", "call", "fold"})
+            enforceable |= any(
+                _has_valid_aggressive_spec(view.legal_actions, typ)
+                for typ in ("bet", "raise")
+            )
+            if enforceable:
+                ok &= _valid_action(action, view.legal_actions)
+            else:
+                ok &= action.type == "fold"
+            ok &= bot.last_decision is not None
+            ok &= bot.last_decision.get("path") in {"postflop", "passive", "fallback"}
+
+    print(f"[CHECK 14] {'PASS' if ok else 'FAIL'} - postflop equity, value/fold, "
+          "draw detection, aggro pressure, and legality fuzz")
+    return ok
+
+
+def _rank_view(stacks, *, hand_id=15000, street="preflop", legal=None):
+    if legal is None:
+        legal = [{"type": "check"}]
+    pids = ["Hero"] + [pid for pid in stacks if pid != "Hero"]
+    return _view(
+        legal,
+        street=street,
+        stacks=dict(stacks),
+        opponents=[pid for pid in pids if pid != "Hero"],
+        acting_opponents=[pid for pid in pids if pid != "Hero"],
+        all_in_opponents=[],
+        seat_indices={pid: idx for idx, pid in enumerate(pids)},
+        hand_id=hand_id,
+    )
+
+
+def _ranked_rfi_view(position, hole, *, chips, stacks, hand_id):
+    view = _rfi_view(position, hole, chips=chips, hand_id=hand_id)
+    pids = ["Hero"] + [pid for pid in stacks if pid != "Hero"]
+    view.stacks = dict(stacks)
+    view.opponents = [pid for pid in pids if pid != "Hero"]
+    view.acting_opponents = list(view.opponents)
+    view.all_in_opponents = []
+    view.seat_indices = {pid: idx for idx, pid in enumerate(pids)}
+    return view
+
+
+def _postflop_with_bb(view, *, bb=10):
+    view.history = [{
+        "street": "preflop",
+        "pid": "Hero",
+        "type": "raise",
+        "amount": 2 * bb,
+        "to_call_before": bb,
+        "pot_before": round(1.5 * bb),
+    }]
+    view.min_raise = bb
+    return view
+
+
+def _check_stack_rank_phase4():
+    ok = True
+    bot = TournamentHybridBot("survival")
+
+    dominant = _rank_view({
+        "Hero": 1800, "A": 1000, "B": 900, "C": 800, "D": 760, "E": 740,
+    }, hand_id=15001)
+    ok &= bot._rank_context(dominant).get("bucket") == "chip_leader"
+
+    flat_top = _rank_view({
+        "Hero": 1020, "A": 1010, "B": 1000, "C": 1000, "D": 990, "E": 980,
+    }, hand_id=15002)
+    flat_bottom = _rank_view({
+        "A": 1020, "B": 1010, "C": 1000, "D": 1000, "E": 990, "Hero": 980,
+    }, hand_id=15003)
+    ok &= bot._rank_context(flat_top).get("bucket") in {"top_2", "middle"}
+    ok &= bot._rank_context(flat_bottom).get("bucket") in {"top_2", "middle"}
+
+    tie_top = _rank_view({
+        "Hero": 1000, "A": 1001, "B": 1000, "C": 999, "D": 998, "E": 997,
+    }, hand_id=15004)
+    ok &= bot._rank_context(tie_top).get("bucket") != "chip_leader"
+
+    side_pot = _postflop_view(
+        [("A", "s"), ("K", "s")],
+        [("A", "c"), ("7", "d"), ("2", "h")],
+        to_call=0,
+        opponents=("A", "B"),
+        hero_stack=1000,
+        legal=[{"type": "check"}],
+        hand_id=15006,
+    )
+    side_pot.stacks = {"Hero": 1000, "A": 1000, "B": 0}
+    side_pot.acting_opponents = ["A"]
+    side_pot.all_in_opponents = ["B"]
+    side_bot = TournamentHybridBot("survival")
+    side_bot.postflop_base_sims = 20
+    side_bot.postflop_sim_cap = 20
+    side_action = side_bot.act(side_pot)
+    side_rank = side_bot._rank_context(side_pot)
+    ok &= _valid_action(side_action, side_pot.legal_actions)
+    ok &= side_rank.get("players_left") == 3
+    ok &= side_rank.get("bucket") != "hu_even"
+    ok &= side_bot.last_decision.get("players_left") == 3
+    ok &= side_bot.last_decision.get("heads_up_weight") == 0.0
+
+    bottom_40bb = _ranked_rfi_view(
+        "BTN",
+        [("K", "s"), ("6", "s")],
+        chips=400,
+        stacks={"Hero": 400, "A": 1200, "B": 1100, "C": 1000, "D": 900, "E": 800},
+        hand_id=15005,
+    )
+    acted = TournamentHybridBot("survival")
+    action = acted.act(bottom_40bb)
+    rank_ctx = acted._rank_context(bottom_40bb)
+    ok &= rank_ctx.get("bucket") == "short_stack"
+    ok &= action.type == "fold"
+    ok &= acted.last_decision.get("band") == "deep"
+    ok &= acted.last_decision.get("stack_state", {}).get("short_weight") == 0.0
+
+    print(f"[CHECK 15] {'PASS' if ok else 'FAIL'} - stack-rank buckets, flat tables, "
+          "tie tolerance, and non-desperate 40bb short rank")
+    return ok
+
+
+def _check_desperation_not_rank_phase4():
+    ok = True
+    short_stacks = {"Hero": 60, "CL": 80, "V1": 50, "V2": 40, "V3": 30, "V4": 20}
+    shove_trace = None
+    shove_action = None
+    for hand_id in range(16000, 16200):
+        view = _ranked_rfi_view(
+            "BTN",
+            [("K", "s"), ("6", "s")],
+            chips=60,
+            stacks=short_stacks,
+            hand_id=hand_id,
+        )
+        bot = TournamentHybridBot("survival")
+        action = bot.act(view)
+        if action.type == "raise":
+            shove_trace = bot.last_decision
+            shove_action = action
+            break
+
+    ok &= shove_action is not None and shove_action.type == "raise"
+    ok &= shove_trace is not None
+    if shove_trace:
+        ok &= shove_trace.get("band") == "short"
+        ok &= shove_trace.get("branch") == "short_open_shove"
+        ok &= shove_trace.get("base_range_hit") is False
+        ok &= shove_trace.get("range_expansion_hit") is True
+        ok &= shove_trace.get("future_edge_tax") == 0.0
+        ok &= shove_trace.get("rank_ctx", {}).get("bucket") == "top_2"
+
+    deep_last = _ranked_rfi_view(
+        "BTN",
+        [("K", "s"), ("6", "s")],
+        chips=400,
+        stacks={"Hero": 400, "A": 1200, "B": 1100, "C": 1000, "D": 900, "E": 800},
+        hand_id=16201,
+    )
+    bot = TournamentHybridBot("survival")
+    action = bot.act(deep_last)
+    ok &= action.type == "fold"
+    ok &= bot.last_decision.get("band") == "deep"
+    ok &= bot.last_decision.get("rank_ctx", {}).get("bucket") == "short_stack"
+    ok &= bot.last_decision.get("stack_state", {}).get("short_weight") == 0.0
+    ok &= not bot._action_is_all_in(deep_last, action)
+
+    print(f"[CHECK 16] {'PASS' if ok else 'FAIL'} - 6bb desperation overrides rank, "
+          "while 40bb last place does not panic jam")
+    return ok
+
+
+def _rfi_pressure_count(profile, hole, stacks, *, start=17000, samples=200):
+    count = 0
+    last_trace = None
+    for hand_id in range(start, start + samples):
+        view = _ranked_rfi_view("BTN", hole, chips=2000, stacks=stacks, hand_id=hand_id)
+        bot = TournamentHybridBot(profile)
+        action = bot.act(view)
+        if action.type == "raise":
+            count += 1
+        last_trace = bot.last_decision
+    return count, last_trace
+
+
+def _pressure_postflop_trace(profile, *, hand_id=17500):
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=80,
+        opponents=("A", "B", "C", "D", "E"),
+        hero_stack=2000,
+        hand_id=hand_id,
+    )
+    view = _postflop_with_bb(view)
+    view.stacks = {"Hero": 2000, "A": 500, "B": 500, "C": 500, "D": 500, "E": 500}
+    view.seat_indices = {pid: idx for idx, pid in enumerate(["Hero", "A", "B", "C", "D", "E"])}
+    view.acting_opponents = ["A", "B", "C", "D", "E"]
+    bot = TournamentHybridBot(profile)
+    bot.postflop_base_sims = 30
+    bot.postflop_sim_cap = 30
+    bot.act(view)
+    return bot.last_decision
+
+
+def _check_chipleader_pressure_phase4():
+    ok = True
+    leader = {"Hero": 2000, "A": 500, "B": 500, "C": 500, "D": 500, "E": 500}
+    flat = {"Hero": 2000, "A": 2000, "B": 2000, "C": 2000, "D": 2000, "E": 2000}
+
+    pressure_hand = [("Q", "h"), ("8", "d")]
+    survival_base, _ = _rfi_pressure_count(
+        "survival", pressure_hand, flat, start=17000
+    )
+    survival_pressure, survival_trace = _rfi_pressure_count(
+        "survival", pressure_hand, leader, start=17000
+    )
+    aggro_base, _ = _rfi_pressure_count(
+        "aggro", pressure_hand, flat, start=17000
+    )
+    aggro_pressure, aggro_trace = _rfi_pressure_count(
+        "aggro", pressure_hand, leader, start=17000
+    )
+
+    ok &= survival_pressure > survival_base
+    ok &= aggro_pressure > aggro_base
+    ok &= aggro_pressure >= survival_pressure
+    ok &= survival_trace.get("range_nudge_pp", 0.0) <= 0.08
+    ok &= aggro_trace.get("range_nudge_pp", 0.0) <= 0.12
+    ok &= survival_trace.get("pressure_weight", 0.0) > 0.0
+    ok &= aggro_trace.get("pressure_weight", 0.0) >= survival_trace.get("pressure_weight", 0.0)
+
+    s_post = _pressure_postflop_trace("survival", hand_id=17501)
+    a_post = _pressure_postflop_trace("aggro", hand_id=17502)
+    ok &= s_post.get("freq_after", 0.0) > s_post.get("freq_before", 0.0)
+    ok &= a_post.get("freq_after", 0.0) > a_post.get("freq_before", 0.0)
+    ok &= a_post.get("freq_after", 0.0) >= s_post.get("freq_after", 0.0)
+    ok &= s_post.get("value_threshold_before") == s_post.get("value_threshold_after")
+    ok &= a_post.get("value_threshold_before") == a_post.get("value_threshold_after")
+    ok &= s_post.get("freq_after", 0.0) <= min(
+        s_post.get("freq_before", 0.0) * 1.25,
+        s_post.get("freq_before", 0.0) + 0.15,
+        0.92,
+    ) + 1e-9
+    ok &= a_post.get("freq_after", 0.0) <= min(
+        a_post.get("freq_before", 0.0) * 1.40,
+        a_post.get("freq_before", 0.0) + 0.22,
+        0.96,
+    ) + 1e-9
+
+    print(f"[CHECK 17] {'PASS' if ok else 'FAIL'} - chip-leader pressure widens "
+          "ranges/frequencies, aggro >= survival, value thresholds unchanged")
+    return ok
+
+
+def _hu_postflop_open_trace(profile, *, hand_id=18000):
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=80,
+        opponents=("V",),
+        hero_stack=1000,
+        hand_id=hand_id,
+    )
+    view = _postflop_with_bb(view)
+    view.stacks = {"Hero": 1000, "V": 1000}
+    view.seat_indices = {"Hero": 0, "V": 1}
+    view.acting_opponents = ["V"]
+    bot = TournamentHybridBot(profile)
+    bot.postflop_base_sims = 30
+    bot.postflop_sim_cap = 30
+    bot.act(view)
+    return bot.last_decision
+
+
+def _hu_postflop_call_trace(profile, *, to_call=40, hand_id=18100):
+    view = _postflop_view(
+        [("A", "s"), ("7", "d")],
+        [("K", "c"), ("7", "h"), ("2", "d")],
+        to_call=to_call,
+        pot=max(100, to_call),
+        opponents=("V",),
+        hero_stack=1000,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=hand_id,
+    )
+    view = _postflop_with_bb(view)
+    view.stacks = {"Hero": 1000, "V": 1000}
+    view.seat_indices = {"Hero": 0, "V": 1}
+    view.acting_opponents = ["V"]
+    bot = TournamentHybridBot(profile)
+    bot.postflop_base_sims = 30
+    bot.postflop_sim_cap = 30
+    bot.act(view)
+    return bot.last_decision
+
+
+def _check_heads_up_phase4():
+    ok = True
+    for profile in ("survival", "aggro"):
+        open_trace = _hu_postflop_open_trace(profile, hand_id=18000 + (0 if profile == "survival" else 1))
+        ok &= open_trace.get("players_left") == 2
+        ok &= open_trace.get("heads_up_weight", 0.0) > 0.0
+        ok &= open_trace.get("freq_after", 0.0) > open_trace.get("freq_before", 0.0)
+        ok &= open_trace.get("value_threshold_after", 1.0) < open_trace.get("value_threshold_before", 0.0)
+
+        call_trace = _hu_postflop_call_trace(profile, to_call=40, hand_id=18100 + (0 if profile == "survival" else 1))
+        ok &= call_trace.get("call_cushion_after", 1.0) < call_trace.get("call_cushion_before", 0.0)
+        ok &= call_trace.get("future_edge_tax") == 0.0
+
+        all_in_trace = _hu_postflop_call_trace(profile, to_call=1000, hand_id=18200 + (0 if profile == "survival" else 1))
+        ok &= all_in_trace.get("spot_type") == "all_in_call"
+        ok &= all_in_trace.get("call_cushion_after") == all_in_trace.get("call_cushion_before")
+        ok &= 0.0 < all_in_trace.get("future_edge_tax", 0.0) <= (0.010 if profile == "survival" else 0.004)
+
+    print(f"[CHECK 18] {'PASS' if ok else 'FAIL'} - heads-up aggression loosens "
+          "non-all-in play while preserving a small deep stack-off premium")
+    return ok
+
+
+def _check_phase4_invariants():
+    ok = True
+    view = _ranked_rfi_view(
+        "BTN",
+        [("K", "s"), ("8", "s")],
+        chips=2000,
+        stacks={"Hero": 2000, "A": 500, "B": 500, "C": 500, "D": 500, "E": 500},
+        hand_id=19001,
+    )
+    bot = TournamentHybridBot("survival")
+    first = bot.act(view)
+    second = bot.act(view)
+    ok &= first == second
+    ok &= bot.last_decision.get("rank_ctx", {}).get("bucket") == "chip_leader"
+
+    cached_bot = TournamentHybridBot("survival")
+    cache_first = _rank_view({"Hero": 2000, "A": 500, "B": 500}, hand_id=19002)
+    cache_second = _rank_view({"Hero": 100, "A": 2000, "B": 0}, hand_id=19002)
+    first_ctx = cached_bot._rank_context(cache_first)
+    second_ctx = cached_bot._rank_context(cache_second)
+    ok &= second_ctx == first_ctx
+    ok &= second_ctx.get("hero_stack") == 2000
+
+    clock_default = _rank_view({"Hero": 1000, "A": 1000}, hand_id=38)
+    clock_custom = _rank_view({"Hero": 1000, "A": 1000}, hand_id=38)
+    clock_disabled = _rank_view({"Hero": 1000, "A": 1000}, hand_id=38)
+    clock_custom.blind_increase_every = 20
+    clock_disabled.blind_increase_every = 0
+    ok &= TournamentHybridBot._hands_until_blind_up(clock_default) == 12
+    ok &= TournamentHybridBot._hands_until_blind_up(clock_custom) == 2
+    ok &= TournamentHybridBot._hands_until_blind_up(clock_disabled) > 1_000_000
+
+    rng = random.Random(20260620)
+    deck = [(r, s) for r in "23456789TJQKA" for s in "cdhs"]
+    for i in range(100):
+        n = rng.randint(2, 6)
+        positions = _positions(n)
+        hero_pos = rng.choice(positions)
+        chips = rng.randint(40, 1800)
+        stacks = {"Hero": chips}
+        for j in range(n - 1):
+            stacks[f"V{j}"] = rng.randint(1, 2200)
+        hole = rng.sample(deck, 2)
+        if rng.choice([True, False]):
+            fuzz = _ranked_rfi_view(hero_pos, hole, chips=chips, stacks=stacks, hand_id=19100 + i)
+        else:
+            board = rng.sample([c for c in deck if c not in hole], rng.choice([3, 4, 5]))
+            fuzz = _postflop_view(
+                hole,
+                board,
+                street={3: "flop", 4: "turn", 5: "river"}[len(board)],
+                to_call=rng.choice([0, 10, 40, 120]),
+                pot=rng.randint(20, 300),
+                opponents=tuple(pid for pid in stacks if pid != "Hero"),
+                hero_stack=chips,
+                hand_id=19100 + i,
+            )
+            fuzz = _postflop_with_bb(fuzz, bb=10)
+            fuzz.stacks = stacks
+            fuzz.seat_indices = {pid: idx for idx, pid in enumerate(["Hero"] + [pid for pid in stacks if pid != "Hero"])}
+            fuzz.acting_opponents = [pid for pid in stacks if pid != "Hero"]
+        for profile in ("survival", "aggro"):
+            active = TournamentHybridBot(profile)
+            active.postflop_base_sims = 20
+            active.postflop_sim_cap = 20
+            try:
+                action = active.act(fuzz)
+            except Exception:
+                ok = False
+                continue
+            ok &= _valid_action(action, fuzz.legal_actions)
+            ok &= active.last_decision.get("path") in {"preflop", "postflop", "passive", "fallback"}
+            ok &= "rank_ctx" in active.last_decision.get("context", {})
+
+    reset_bot = TournamentHybridBot("survival")
+    reset_bot.act(view)
+    ok &= bool(reset_bot._rank_cache)
+    reset_bot.reset_memory()
+    ok &= reset_bot._rank_cache == {}
+
+    print(f"[CHECK 19] {'PASS' if ok else 'FAIL'} - Phase 4 determinism, legality "
+          "fuzz, trace path set, rank-cache reset, and blind-clock schedule")
+    return ok
+
+
+class _FixedEquityBot(TournamentHybridBot):
+    def __init__(self, profile="survival", equity=0.10):
+        super().__init__(profile)
+        self.fixed_equity = equity
+        self.postflop_base_sims = 1
+        self.postflop_big_sims = 1
+        self.postflop_allin_sims = 1
+        self.postflop_sim_cap = 1
+
+    def _postflop_equity(self, view, hole, board, n_opp, sims):
+        return self.fixed_equity
+
+
+def _p5_history_entry(street, pid, action_type, *, amount=None, to_call_before=0, pot_before=0):
+    return {
+        "street": street,
+        "pid": pid,
+        "type": action_type,
+        "amount": amount,
+        "to_call_before": to_call_before,
+        "pot_before": pot_before,
+    }
+
+
+def _p5_counter_view(history, *, hand_id=20000, opponents=("V",), all_in=()):
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=120,
+        opponents=opponents,
+        legal=[{"type": "check"}],
+        hand_id=hand_id,
+    )
+    view.history = list(history)
+    view.all_in_opponents = list(all_in)
+    for pid in all_in:
+        view.stacks[pid] = 0
+    return view
+
+
+def _p5_feed_station(bot, pid="V", *, start=21000, calls=30):
+    for i in range(calls):
+        history = [
+            _p5_history_entry("flop", "Hero", "bet", amount=40, pot_before=80),
+            _p5_history_entry("flop", pid, "call", amount=40, to_call_before=40, pot_before=120),
+        ]
+        bot.act(_p5_counter_view(history, hand_id=start + i, opponents=(pid,)))
+
+
+def _p5_feed_overfolder(bot, pid="V", *, start=22000, folds=12):
+    for i in range(folds):
+        history = [
+            _p5_history_entry("flop", "Hero", "bet", amount=40, pot_before=80),
+            _p5_history_entry("flop", pid, "fold", to_call_before=40, pot_before=120),
+        ]
+        bot.act(_p5_counter_view(history, hand_id=start + i, opponents=(pid,)))
+
+
+def _p5_feed_spewy(bot, pid="V", *, start=23000, short=False):
+    amount = 80 if short else 150
+    for i in range(3):
+        history = [
+            _p5_history_entry("preflop", pid, "raise", amount=30, to_call_before=10, pot_before=15),
+            _p5_history_entry("flop", pid, "bet", amount=amount, pot_before=80),
+        ]
+        bot.act(_p5_counter_view(history, hand_id=start + i, opponents=(pid,), all_in=(pid,)))
+
+
+def _p5_r2_view(*, hand_id=24000, opponents=("V",), to_call=1000, hero_stack=1000,
+                 all_in=True):
+    view = _postflop_view(
+        [("A", "s"), ("7", "d")],
+        [("K", "c"), ("7", "h"), ("2", "d")],
+        to_call=to_call,
+        pot=1000,
+        opponents=opponents,
+        hero_stack=hero_stack,
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=hand_id,
+    )
+    view.history = [
+        _p5_history_entry("preflop", "Hero", "raise", amount=20, to_call_before=10, pot_before=15),
+        _p5_history_entry("flop", "V", "bet", amount=to_call, pot_before=1000),
+    ]
+    if all_in:
+        view.all_in_opponents = ["V"]
+        view.stacks["V"] = 0
+    return view
+
+
+def _strip_p5(trace):
+    return {k: v for k, v in (trace or {}).items() if not str(k).startswith("p5_")}
+
+
+def _check_p5_accumulation_dedup():
+    bot = _FixedEquityBot()
+    prefix = [
+        _p5_history_entry("preflop", "V", "call", amount=10, to_call_before=10, pot_before=15),
+    ]
+    full = prefix + [
+        _p5_history_entry("flop", "V", "call", amount=30, to_call_before=30, pot_before=60),
+    ]
+    bot.act(_p5_counter_view(prefix, hand_id=20001))
+    bot.act(_p5_counter_view(full, hand_id=20001))
+    snap = copy.deepcopy(bot._profiles.all_raw())
+    bot.act(_p5_counter_view(full, hand_id=20001))
+    raw = bot._profiles.raw("V")
+    ok = (
+        snap == bot._profiles.all_raw()
+        and raw["preflop_action_seen"] == 1
+        and raw["vpip_seen"] == 1
+        and raw["postflop_pressure_call"] == 1
+    )
+    print(f"[CHECK 20] {'PASS' if ok else 'FAIL'} - P5 accumulation and dedup across overlapping prefixes")
+    return ok
+
+
+def _check_p5_once_per_hand_vpip():
+    bot = _FixedEquityBot()
+    history = [
+        _p5_history_entry("preflop", "V", "call", amount=10, to_call_before=10, pot_before=15),
+        _p5_history_entry("preflop", "Hero", "raise", amount=40, to_call_before=10, pot_before=25),
+        _p5_history_entry("preflop", "V", "call", amount=30, to_call_before=30, pot_before=65),
+        _p5_history_entry("preflop", "V", "raise", amount=90, to_call_before=0, pot_before=95),
+    ]
+    bot.act(_p5_counter_view(history, hand_id=21001))
+    raw = bot._profiles.raw("V")
+    ok = (
+        raw["preflop_action_seen"] == 1
+        and raw["vpip_seen"] == 1
+        and raw["preflop_raise_seen"] == 1
+    )
+    print(f"[CHECK 21] {'PASS' if ok else 'FAIL'} - P5 once-per-hand VPIP and preflop aggression")
+    return ok
+
+
+def _check_p5_pressure_state_machine():
+    bot = _FixedEquityBot()
+    history = [
+        _p5_history_entry("preflop", "V", "call", amount=10, to_call_before=10, pot_before=15),
+        _p5_history_entry("preflop", "BB", "check", to_call_before=0, pot_before=25),
+        _p5_history_entry("preflop", "Hero", "raise", amount=40, to_call_before=10, pot_before=25),
+        _p5_history_entry("preflop", "V", "fold", to_call_before=30, pot_before=65),
+        _p5_history_entry("flop", "V", "call", amount=20, to_call_before=20, pot_before=80),
+    ]
+    bot.act(_p5_counter_view(history, hand_id=22001, opponents=("V", "BB")))
+    v = bot._profiles.raw("V")
+    bb = bot._profiles.raw("BB")
+    ok = (
+        v["vpip_seen"] == 1
+        and v["pressure_fold"] == 1
+        and v["postflop_pressure_call"] == 1
+        and bb["vpip_seen"] == 0
+        and bb["pressure_fold"] == 0
+        and bb["pressure_call"] == 0
+        and bb["pressure_raise"] == 0
+    )
+    print(f"[CHECK 22] {'PASS' if ok else 'FAIL'} - P5 facing-pressure state machine")
+    return ok
+
+
+def _check_p5_censoring_discipline():
+    ok = True
+    bot = _FixedEquityBot()
+    hero_bet_only = [_p5_history_entry("flop", "Hero", "bet", amount=50, pot_before=80)]
+    bot.act(_p5_counter_view(hero_bet_only, hand_id=23001))
+    ok &= bot._profiles.all_raw() == {}
+    bot.act(_p5_counter_view(hero_bet_only, hand_id=23001))
+    ok &= bot._profiles.all_raw() == {}
+
+    folded = _FixedEquityBot()
+    _p5_feed_overfolder(folded, folds=5)
+    fstats = folded._profiles.stat_summary("V")
+    ok &= fstats["station_response_n"] == 0
+    ok &= folded._profiles.read_strength("V", "station_score", threshold=0.60, band=0.25) == 0.0
+
+    caller = _FixedEquityBot()
+    _p5_feed_station(caller, calls=5)
+    cstats = caller._profiles.stat_summary("V")
+    ok &= cstats["fold_to_pressure_hat"] < 0.58
+    ok &= caller._profiles.read_strength("V", "fold_to_pressure", threshold=0.58, band=0.17) == 0.0
+
+    print(f"[CHECK 23] {'PASS' if ok else 'FAIL'} - P5 censored-fold discipline")
+    return ok
+
+
+def _p5_trace_for_open(bot, *, is_pfr=False, equity=0.10, hand_id=24001):
+    bot.fixed_equity = equity
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=80,
+        opponents=("V",),
+        hero_stack=1000,
+        hand_id=hand_id,
+    )
+    if is_pfr:
+        view = _postflop_with_bb(view)
+    bot.act(view)
+    return bot.last_decision
+
+
+def _check_p5_station_suppression_active():
+    ok = True
+
+    p4_cbet = _FixedEquityBot(equity=0.10)
+    p5_cbet = _FixedEquityBot(equity=0.10)
+    p5_cbet.p5_enabled = True
+    _p5_feed_station(p4_cbet, start=24100)
+    _p5_feed_station(p5_cbet, start=24100)
+    c4 = _p5_trace_for_open(p4_cbet, is_pfr=True, hand_id=24201)
+    c5 = _p5_trace_for_open(p5_cbet, is_pfr=True, hand_id=24201)
+    ok &= c5["freq_after"] < c4["freq_after"]
+    ok &= 0.70 <= (c5["freq_after"] / c4["freq_after"]) <= 0.90
+    ok &= c5.get("p5_station_applied") is True
+
+    p4_bluff = _FixedEquityBot(equity=0.10)
+    p5_bluff = _FixedEquityBot(equity=0.10)
+    p5_bluff.p5_enabled = True
+    _p5_feed_station(p4_bluff, start=24300)
+    _p5_feed_station(p5_bluff, start=24300)
+    b4 = _p5_trace_for_open(p4_bluff, is_pfr=False, hand_id=24401)
+    b5 = _p5_trace_for_open(p5_bluff, is_pfr=False, hand_id=24401)
+    ok &= b5["freq_after"] < b4["freq_after"]
+    ok &= 0.45 <= (b5["freq_after"] / b4["freq_after"]) <= 0.65
+
+    p4_semi = _FixedEquityBot(equity=0.35)
+    p5_semi = _FixedEquityBot(equity=0.35)
+    p5_semi.p5_enabled = True
+    _p5_feed_station(p4_semi, start=24500)
+    _p5_feed_station(p5_semi, start=24500)
+    semi_view = _postflop_view(
+        [("K", "s"), ("Q", "s")],
+        [("J", "s"), ("7", "s"), ("2", "d")],
+        to_call=0,
+        pot=80,
+        opponents=("V",),
+        hero_stack=1000,
+        hand_id=24601,
+    )
+    p4_semi.act(semi_view)
+    p5_semi.act(semi_view)
+    ok &= p5_semi.last_decision.get("spot_type") == "semibluff"
+    ok &= p5_semi.last_decision.get("freq_after") == p4_semi.last_decision.get("freq_after")
+    ok &= p5_semi.last_decision.get("p5_station_applied") is False
+
+    p5_raise = _FixedEquityBot(equity=0.10)
+    p5_raise.p5_enabled = True
+    _p5_feed_station(p5_raise, start=24700)
+    raise_view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=40,
+        pot=100,
+        opponents=("V",),
+        hero_stack=1000,
+        hand_id=24801,
+    )
+    raise_action = p5_raise.act(raise_view)
+    ok &= raise_action.type != "raise"
+
+    p4_value = _FixedEquityBot(equity=0.90)
+    p5_value = _FixedEquityBot(equity=0.90)
+    p5_value.p5_enabled = True
+    _p5_feed_station(p4_value, start=24900)
+    _p5_feed_station(p5_value, start=24900)
+    v4 = _p5_trace_for_open(p4_value, is_pfr=False, equity=0.90, hand_id=25001)
+    v5 = _p5_trace_for_open(p5_value, is_pfr=False, equity=0.90, hand_id=25001)
+    ok &= v5.get("branch") == "postflop_value_bet"
+    ok &= v5.get("value_threshold_after") == v4.get("value_threshold_after")
+
+    print(f"[CHECK 24] {'PASS' if ok else 'FAIL'} - P5 station suppression active only in safe directions")
+    return ok
+
+
+def _check_p5_neutral_default_reset():
+    p4 = _FixedEquityBot(equity=0.10)
+    p5 = _FixedEquityBot(equity=0.10)
+    p5.p5_enabled = True
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=80,
+        opponents=("V",),
+        hero_stack=1000,
+        hand_id=26001,
+    )
+    a4 = p4.act(view)
+    a5 = p5.act(view)
+    _p5_feed_station(p5, start=26100, calls=4)
+    p5.reset_memory()
+    ok = (
+        TournamentHybridBot().p5_enabled is False
+        and a4 == a5
+        and p5._profiles.all_raw() == {}
+        and p5.last_decision is None
+        and p5.p5_error_count == 0
+    )
+    print(f"[CHECK 25] {'PASS' if ok else 'FAIL'} - P5 neutral default and reset")
+    return ok
+
+
+def _check_p5_idempotent_prefix_replay():
+    bot = _FixedEquityBot()
+    prefix = [_p5_history_entry("preflop", "V", "call", amount=10, to_call_before=10, pot_before=15)]
+    full = prefix + [_p5_history_entry("flop", "V", "call", amount=30, to_call_before=30, pot_before=60)]
+    bot.act(_p5_counter_view(prefix, hand_id=27001))
+    one = copy.deepcopy(bot._profiles.all_raw())
+    bot.act(_p5_counter_view(full, hand_id=27001))
+    two = copy.deepcopy(bot._profiles.all_raw())
+    bot.act(_p5_counter_view(full, hand_id=27001))
+    three = copy.deepcopy(bot._profiles.all_raw())
+    raw = bot._profiles.raw("V")
+    ok = (
+        one != two
+        and two == three
+        and raw["vpip_seen"] == 1
+        and raw["postflop_pressure_call"] == 1
+    )
+    print(f"[CHECK 26] {'PASS' if ok else 'FAIL'} - P5 idempotent prefix replay preserves counter bytes")
+    return ok
+
+
+def _check_p5_off_log_only_parity():
+    ok = True
+    views = [
+        _rfi_view("BTN", [("J", "s"), ("8", "s")], hand_id=28001),
+        _facing_open_view([("A", "s"), ("Q", "s")], opener="UTG", hand_id=28002),
+        _limped_view([("6", "s"), ("5", "s")], hero_pos="BTN", limpers=2, hand_id=28003),
+        _postflop_view([("7", "s"), ("2", "d")], [("A", "c"), ("K", "d"), ("9", "h")],
+                       to_call=0, opponents=("V",), hand_id=28004),
+        _postflop_view([("7", "s"), ("2", "d")], [("A", "c"), ("K", "d"), ("9", "h")],
+                       to_call=40, opponents=("V",), legal=[{"type": "fold"}, {"type": "call"}],
+                       hand_id=28005),
+    ]
+    malformed = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        opponents=("V",),
+        hand_id=28006,
+    )
+    malformed.history = [None, {"pid": "V", "type": "call"}, "bad"]
+    views.append(malformed)
+
+    for idx, view in enumerate(views):
+        p4 = _FixedEquityBot(equity=0.10)
+        off = _FixedEquityBot(equity=0.10)
+        log = _FixedEquityBot(equity=0.10)
+        log.p5_enabled = True
+        log.p5_log_only = True
+        _p5_feed_station(log, start=28100 + idx * 100)
+        a4 = p4.act(view)
+        a_off = off.act(view)
+        a_log = log.act(view)
+        p4_keys = set(_strip_p5(p4.last_decision).keys())
+        ok &= a4 == a_off == a_log
+        ok &= set(_strip_p5(off.last_decision).keys()) == p4_keys
+        ok &= set(_strip_p5(log.last_decision).keys()) == p4_keys
+        ok &= all(str(k).startswith("p5_") or k in p4.last_decision for k in off.last_decision)
+
+    print(f"[CHECK 27] {'PASS' if ok else 'FAIL'} - P5 off/log-only Phase 4 parity and trace namespace")
+    return ok
+
+
+def _check_p5_log_only_overfolder():
+    p4 = _FixedEquityBot(equity=0.10)
+    p5 = _FixedEquityBot(equity=0.10)
+    p5.p5_enabled = True
+    _p5_feed_overfolder(p5, folds=20)
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        opponents=("V",),
+        hand_id=29001,
+    )
+    a4 = p4.act(view)
+    a5 = p5.act(view)
+    ok = (
+        a4 == a5
+        and p5.last_decision.get("p5_overfolder_delta_log_only", 0.0) > 0.0
+    )
+    print(f"[CHECK 28] {'PASS' if ok else 'FAIL'} - P5 overfolder widening stays log-only")
+    return ok
+
+
+def _check_p5_log_only_passive_tight():
+    p4 = _FixedEquityBot(equity=0.30)
+    p5 = _FixedEquityBot(equity=0.30)
+    p5.p5_enabled = True
+    for i in range(8):
+        history = [
+            _p5_history_entry("preflop", "V", "fold", to_call_before=10, pot_before=15),
+            _p5_history_entry("flop", "V", "check", pot_before=80),
+        ]
+        p5.act(_p5_counter_view(history, hand_id=30000 + i))
+    view = _postflop_view(
+        [("A", "s"), ("7", "d")],
+        [("K", "c"), ("7", "h"), ("2", "d")],
+        to_call=40,
+        pot=100,
+        opponents=("V",),
+        legal=[{"type": "fold"}, {"type": "call"}],
+        hand_id=30099,
+    )
+    a4 = p4.act(view)
+    a5 = p5.act(view)
+    ok = (
+        a4 == a5
+        and p5.last_decision.get("p5_passive_tight_delta_log_only", 0.0) > 0.0
+    )
+    print(f"[CHECK 29] {'PASS' if ok else 'FAIL'} - P5 passive/tight flip stays log-only")
+    return ok
+
+
+def _check_p5_strict_r2_scope():
+    ok = True
+    p4 = _FixedEquityBot(equity=0.575)
+    p5 = _FixedEquityBot(equity=0.575)
+    p5.p5_enabled = True
+    _p5_feed_spewy(p5, start=31000)
+    view = _p5_r2_view(hand_id=31100)
+    a4 = p4.act(view)
+    a5 = p5.act(view)
+    t = p5.last_decision
+    ok &= a4.type == "fold" and a5.type == "call"
+    ok &= t.get("p5_r2_relief_applied") is True
+    ok &= 0.0 < t.get("future_edge_tax", 0.0) < t.get("p5_r2_tax_before", 0.0)
+    ok &= t.get("future_edge_tax") == t.get("p5_r2_tax_after_proposed")
+
+    open_jam = _postflop_view(
+        [("A", "s"), ("A", "d")],
+        [("K", "c"), ("7", "h"), ("2", "d")],
+        to_call=0,
+        pot=1000,
+        opponents=("V",),
+        hero_stack=1000,
+        legal=[{"type": "check"}, {"type": "bet", "min": 1000, "max": 1000, "all_in": True}],
+        hand_id=31101,
+    )
+    p5.act(open_jam)
+    ok &= p5.last_decision.get("p5_r2_relief_applied") is False
+
+    p5.act(_p5_r2_view(hand_id=31102, to_call=500, all_in=False))
+    ok &= p5.last_decision.get("p5_r2_relief_applied") is False
+
+    p5.act(_p5_r2_view(hand_id=31103, opponents=("V", "W")))
+    ok &= p5.last_decision.get("p5_r2_relief_applied") is False
+
+    tight = _FixedEquityBot(equity=0.575)
+    tight.p5_enabled = True
+    tight.act(_p5_r2_view(hand_id=31104))
+    ok &= tight.last_decision.get("p5_r2_relief_applied") is False
+
+    short = _FixedEquityBot(equity=0.575)
+    short.p5_enabled = True
+    _p5_feed_spewy(short, start=31200, short=True)
+    short.act(_p5_r2_view(hand_id=31299))
+    ok &= short.last_decision.get("p5_r2_relief_applied") is False
+    ok &= short.last_decision.get("p5_r2_short_jam_like_count", 0) > 0
+
+    neg = _FixedEquityBot(equity=0.40)
+    neg.p5_enabled = True
+    _p5_feed_spewy(neg, start=31300)
+    neg.act(_p5_r2_view(hand_id=31399))
+    ok &= neg.last_decision.get("p5_r2_relief_applied") is False
+    ok &= neg.last_decision.get("p5_r2_chip_ev_ok") is False
+
+    print(f"[CHECK 30] {'PASS' if ok else 'FAIL'} - P5 strict R2 fires only in scoped all-in call spots")
+    return ok
+
+
+def _check_p5_reset_across_tournaments():
+    bot = _FixedEquityBot()
+    _p5_feed_station(bot, start=32000, calls=8)
+    ok = bot._profiles.raw("V")["postflop_pressure_call"] == 8
+    bot.act(_p5_counter_view([], hand_id=1))
+    ok &= bot._profiles.all_raw() == {}
+    fresh = _FixedEquityBot()
+    ok &= fresh._profiles.all_raw() == {}
+    print(f"[CHECK 31] {'PASS' if ok else 'FAIL'} - P5 reset/regression boundary prevents tournament leakage")
+    return ok
+
+
+def _check_p5_log_only_multi_read_precedence():
+    p4 = _FixedEquityBot(equity=0.10)
+    p5 = _FixedEquityBot(equity=0.10)
+    p5.p5_enabled = True
+    p5.p5_log_only = True
+    _p5_feed_overfolder(p5, pid="F", start=33000, folds=20)
+    _p5_feed_station(p5, pid="S", start=33100, calls=20)
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        opponents=("F", "S"),
+        hand_id=33200,
+    )
+    a4 = p4.act(view)
+    a5 = p5.act(view)
+    ok = (
+        a4 == a5
+        and p5.last_decision.get("p5_overfolder_delta_log_only", 0.0) > 0.0
+        and p5.last_decision.get("p5_station_value_delta_log_only", 0.0) > 0.0
+        and p5.last_decision.get("p5_station_applied") is False
+    )
+    print(f"[CHECK 32] {'PASS' if ok else 'FAIL'} - P5 multi-read positive modules remain log-only")
+    return ok
+
+
+def _check_p5_fail_closed():
+    class _ExplodingP5Bot(_FixedEquityBot):
+        def _p5_station_read(self, view):
+            raise RuntimeError("intentional p5 failure")
+
+    p4 = _FixedEquityBot(equity=0.10)
+    bad = _ExplodingP5Bot(equity=0.10)
+    bad.p5_enabled = True
+    view = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        opponents=("V",),
+        hand_id=34001,
+    )
+    a4 = p4.act(view)
+    a_bad = bad.act(view)
+    ok = (
+        a4 == a_bad
+        and bad.p5_error_count == 1
+        and bad.last_decision.get("p5_error_count") == 1
+    )
+    print(f"[CHECK 33] {'PASS' if ok else 'FAIL'} - P5 fail-closed errors preserve Phase 4 action")
+    return ok
+
+
+def _check_p5_zero_data_neutral():
+    profiles = TournamentHybridBot()._profiles
+    stats = [
+        ("vpip", 0.36, 0.24),
+        ("preflop_aggression_rate", 0.18, 0.22),
+        ("postflop_aggression_freq", 0.38, 0.25),
+        ("fold_to_pressure", 0.58, 0.17),
+        ("station_score", 0.60, 0.25),
+        ("blind_fold_to_steal", 0.58, 0.17),
+        ("fold_to_cbet", 0.58, 0.17),
+        ("threebet_rate", 0.16, 0.20),
+        ("fourbet_rate", 0.08, 0.12),
+    ]
+    ok = all(
+        profiles.read_strength("Nobody", stat, threshold=thr, band=band) == 0.0
+        for stat, thr, band in stats
+    )
+    print(f"[CHECK 34] {'PASS' if ok else 'FAIL'} - P5 zero-data reads are neutral")
+    return ok
+
+
 def run():
     PASS = True
     PASS &= _check_registry()
@@ -1083,6 +2309,27 @@ def run():
     PASS &= _check_short_stack()
     PASS &= _check_medium_stack()
     PASS &= _check_determinism_and_preflop_fuzz()
+    PASS &= _check_postflop()
+    PASS &= _check_stack_rank_phase4()
+    PASS &= _check_desperation_not_rank_phase4()
+    PASS &= _check_chipleader_pressure_phase4()
+    PASS &= _check_heads_up_phase4()
+    PASS &= _check_phase4_invariants()
+    PASS &= _check_p5_accumulation_dedup()
+    PASS &= _check_p5_once_per_hand_vpip()
+    PASS &= _check_p5_pressure_state_machine()
+    PASS &= _check_p5_censoring_discipline()
+    PASS &= _check_p5_station_suppression_active()
+    PASS &= _check_p5_neutral_default_reset()
+    PASS &= _check_p5_idempotent_prefix_replay()
+    PASS &= _check_p5_off_log_only_parity()
+    PASS &= _check_p5_log_only_overfolder()
+    PASS &= _check_p5_log_only_passive_tight()
+    PASS &= _check_p5_strict_r2_scope()
+    PASS &= _check_p5_reset_across_tournaments()
+    PASS &= _check_p5_log_only_multi_read_precedence()
+    PASS &= _check_p5_fail_closed()
+    PASS &= _check_p5_zero_data_neutral()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS

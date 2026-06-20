@@ -29,6 +29,8 @@ def create_bot(btype: str) -> BotAdapter:
       final, final_survival
                           TournamentHybridBot survival profile
       final_aggro         TournamentHybridBot aggro profile
+      final_<profile>:p4|telemetry|station|r2|p5
+                          TournamentHybridBot Phase 5 ablation arms
       random             RandomBot
     """
     raw_btype = btype.strip()
@@ -92,10 +94,12 @@ def create_bot(btype: str) -> BotAdapter:
             weights_path = raw_btype.split(":", 1)[1]
         return _wrap(DeepCFRBot(weights_path=weights_path, inference_mode=True))
 
-    if btype in ("final", "final_survival", "final_aggro"):
+    if btype == "final" or btype.startswith(("final_survival", "final_aggro", "final:")):
         from bots.tournament_hybrid_bot import TournamentHybridBot
-        profile = "aggro" if btype == "final_aggro" else "survival"
-        return _wrap(TournamentHybridBot(profile=profile))
+        profile = "aggro" if "aggro" in btype else "survival"
+        bot = TournamentHybridBot(profile=profile)
+        _configure_final_arm(bot, raw_btype)
+        return _wrap(bot)
 
     raise ValueError(f"Unknown bot type: {raw_btype!r}. "
                      "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
@@ -129,6 +133,43 @@ class _PlayerViewAdapter(BotAdapter):
 def _wrap(bot) -> BotAdapter:
     """Wrap a bot object in a BotAdapter."""
     return _PlayerViewAdapter(bot)
+
+
+def _configure_final_arm(bot, raw_btype: str) -> None:
+    """Apply Phase 5 ablation-arm toggles to TournamentHybridBot specs."""
+    spec = raw_btype.strip().lower()
+    if ":" in spec:
+        arm = spec.split(":", 1)[1]
+    else:
+        arm = spec
+        for prefix in ("final_survival_", "final_aggro_", "final_"):
+            if arm.startswith(prefix):
+                arm = arm[len(prefix):]
+                break
+        if arm in ("final", "final_survival", "final_aggro"):
+            arm = "p4"
+    arm = arm.replace("+", "_").replace("-", "_")
+    arm = {
+        "": "p4",
+        "survival": "p4",
+        "aggro": "p4",
+        "p4_telemetry": "telemetry",
+        "telemetry_only": "telemetry",
+        "p4_station_only": "station",
+        "station_only": "station",
+        "p4_strict_r2_only": "r2",
+        "strict_r2_only": "r2",
+        "strict_r2": "r2",
+        "p4_station_r2": "p5",
+        "station_r2": "p5",
+        "station_strict_r2": "p5",
+        "phase5": "p5",
+    }.get(arm, arm)
+
+    bot.p5_enabled = arm in {"telemetry", "station", "r2", "p5"}
+    bot.p5_log_only = arm == "telemetry"
+    bot.p5_station_enabled = arm in {"telemetry", "station", "p5"}
+    bot.p5_r2_enabled = arm in {"telemetry", "r2", "p5"}
 
 
 # ── Player-spec parsing ────────────────────────────────────────────────────────
