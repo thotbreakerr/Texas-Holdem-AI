@@ -2,20 +2,32 @@
 
 Phase 2 adds a real preflop strategy while preserving the Phase 1 safety
 contract: all aggressive sizing goes through legal-action specs and every
-decision is sanitized before it leaves ``act``.  Postflop remains passive.
+decision is sanitized before it leaves ``act``.
+
+Phase 3 adds a postflop module: Monte Carlo equity (``core.equity.equity``)
+compared against pot odds, with per-profile thresholds, value-bet sizing, and
+aggro semi-bluff / bluff lines.  Phase 4 adds tournament-specific stack-rank
+context, small chipEV-first future-edge tax, short-stack desperation, chip-
+leader pressure, and heads-up aggression.  Equity is seeded per decision so
+play is reproducible, and every action still passes through the same legal-
+action sanitizer.
 """
 
 from __future__ import annotations
 
+import math
+import random as _random
 from dataclasses import dataclass
 from typing import Any, Optional
 
 from core.bot_api import Action, PlayerView
+from core.equity import equity as _mc_equity
 
 
 DecisionTrace = dict[str, Any]
 
 _RANKS = "23456789TJQKA"
+_SUITS = "cdhs"
 _RANK_INDEX = {rank: i for i, rank in enumerate(_RANKS)}
 _POSITION_TAGS = {"BTN", "SB", "BB", "UTG", "UTG+1", "UTG1", "MP", "LJ", "HJ", "CO"}
 
@@ -96,6 +108,18 @@ def _hands(*tokens: str) -> frozenset[str]:
     for token in tokens:
         result.update(_expand_token(token))
     return frozenset(result)
+
+
+def _clamp(value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if f < lo:
+        return lo
+    if f > hi:
+        return hi
+    return f
 
 
 _PREMIUM_3BET = _hands("QQ+", "AKs", "AKo")
@@ -293,6 +317,737 @@ _BB_DEFEND_LATE_SMALL = _hands(
 )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4 tournament adjustment tables.
+#
+# The base BB band still chooses the mechanical mode.  These tables only nudge
+# membership/frequencies by at most one tactical gear.  Widths are represented
+# as fractions of the 169 canonical starting-hand keys, not combo-weighted.
+# ---------------------------------------------------------------------------
+_RANGE_DENOM = 169.0
+
+_RANK_BUCKET_WEIGHT = {
+    "chip_leader": 1.00,
+    "top_2": 0.55,
+    "middle": 0.0,
+    "short_stack": 0.0,
+    "hu_leader": 0.0,
+    "hu_trailer": 0.0,
+    "hu_even": 0.0,
+}
+
+_CHIPLEADER_PREFLOP = {
+    "survival": {
+        "early_open": (0.03, 0.010),
+        "middle_open": (0.05, 0.020),
+        "late_open": (0.08, 0.030),
+        "btn_steal": (0.14, 0.050),
+        "sb_steal": (0.16, 0.060),
+        "iso": (0.10, 0.040),
+        "threebet": (0.08, 0.020),
+        "resteal": (0.12, 0.040),
+        "open_jam": (0.08, 0.030),
+    },
+    "aggro": {
+        "early_open": (0.05, 0.020),
+        "middle_open": (0.08, 0.030),
+        "late_open": (0.14, 0.050),
+        "btn_steal": (0.22, 0.080),
+        "sb_steal": (0.25, 0.090),
+        "iso": (0.16, 0.060),
+        "threebet": (0.14, 0.040),
+        "resteal": (0.20, 0.070),
+        "open_jam": (0.12, 0.050),
+    },
+}
+
+_PRESSURE_RFI_EXPANSION = {
+    "early": _hands("44-22", "A9s-A2s", "KTs", "QTs", "JTs", "AJo", "KQo"),
+    "middle": _hands("33-22", "A6s-A2s", "K9s+", "Q9s+", "J9s+", "T9s", "A8o+", "KTo+", "QTo+"),
+    "late": _hands(
+        "A2s+", "K2s+", "Q5s+", "J7s+", "T7s+", "97s+", "86s+",
+        "75s+", "64s+", "A2o+", "K8o+", "Q8o+", "J8o+", "T8o+"
+    ),
+    "sb": _hands(
+        "A2s+", "K2s+", "Q4s+", "J6s+", "T6s+", "96s+", "85s+",
+        "74s+", "63s+", "A2o+", "K7o+", "Q8o+", "J8o+", "T8o+"
+    ),
+    "bb": frozenset(),
+    "heads_up": _hands(
+        "A2s+", "K2s+", "Q4s+", "J6s+", "T6s+", "96s+", "85s+",
+        "74s+", "A2o+", "K7o+", "Q8o+", "J8o+", "T8o+"
+    ),
+}
+
+_PRESSURE_3BET_EXPANSION = {
+    "early": _hands("JJ", "AQs", "AKo"),
+    "middle": _hands("TT", "AJs+", "AQo+", "KQs"),
+    "late": _hands("99+", "ATs+", "AJo+", "KJs+", "KQo", "QJs", "JTs"),
+    "sb": _hands("88+", "A9s+", "ATo+", "KTs+", "KQo", "QTs+", "JTs"),
+    "bb": _hands("77+", "A8s+", "ATo+", "KTs+", "KQo", "QTs+", "JTs", "T9s"),
+    "heads_up": _hands("66+", "A2s+", "A8o+", "K9s+", "KTo+", "QTs+", "JTs", "T9s"),
+}
+
+_PRESSURE_ISO_EXPANSION = _hands(
+    "77-22", "A2s+", "A9o+", "K9s+", "KTo+", "Q9s+", "QTo+",
+    "J9s+", "JTo", "T9s", "98s-76s"
+)
+
+_SHORT_SHOVE_EXPANSION = {
+    "early": _hands("22+", "A2s+", "A8o+", "KTs+", "KQo", "QTs+", "JTs"),
+    "middle": _hands("22+", "A2s+", "A7o+", "K9s+", "KTo+", "Q9s+", "QTo+", "J9s+", "T9s"),
+    "late": _hands(
+        "22+", "A2s+", "A2o+", "K5s+", "K8o+", "Q7s+", "Q9o+",
+        "J7s+", "J9o+", "T7s+", "T9o", "97s+", "86s+", "75s+"
+    ),
+    "sb": _hands(
+        "22+", "A2s+", "A2o+", "K2s+", "K6o+", "Q5s+", "Q8o+",
+        "J6s+", "J8o+", "T6s+", "T8o+", "96s+", "85s+", "74s+"
+    ),
+    "bb": _hands(
+        "22+", "A2s+", "A2o+", "K5s+", "K8o+", "Q7s+", "Q9o+",
+        "J7s+", "J9o+", "T7s+", "T9o", "97s+", "86s+"
+    ),
+    "heads_up": _hands(
+        "22+", "A2s+", "A2o+", "K2s+", "K6o+", "Q5s+", "Q8o+",
+        "J6s+", "J8o+", "T6s+", "T8o+", "96s+", "85s+", "74s+"
+    ),
+}
+
+_SHORT_DESPERATION = {
+    "survival": (
+        (4.0, 0.22, 0.090),
+        (6.0, 0.15, 0.060),
+        (8.0, 0.09, 0.035),
+        (10.0, 0.08, 0.030),
+        (12.0, 0.05, 0.020),
+        (16.0, 0.025, 0.010),
+    ),
+    "aggro": (
+        (4.0, 0.32, 0.120),
+        (6.0, 0.22, 0.080),
+        (8.0, 0.14, 0.050),
+        (10.0, 0.12, 0.040),
+        (12.0, 0.08, 0.030),
+        (16.0, 0.04, 0.015),
+    ),
+}
+
+_SHOVE_CEILINGS = {
+    "survival": {"early": 0.35, "middle": 0.42, "late": 0.75, "sb": 0.90, "bb": 0.75, "heads_up": 0.90},
+    "aggro": {"early": 0.45, "middle": 0.52, "late": 0.90, "sb": 1.00, "bb": 0.90, "heads_up": 1.00},
+}
+
+_RANGE_GEAR_CAPS = {
+    "survival": {"default": (0.25, 0.080), "threebet": (0.25, 0.050), "shove": (0.25, 0.080)},
+    "aggro": {"default": (0.35, 0.120), "threebet": (0.40, 0.080), "shove": (0.35, 0.120)},
+}
+
+_CHIPLEADER_POSTFLOP_MULT = {
+    "survival": {
+        "hu": {"cbet": (1.08, 1.05, 1.00), "bluff": (1.12, 1.08, 1.04), "semi": (1.10, 1.08)},
+        "3way": {"cbet": (1.04, 1.025, 1.00), "bluff": (1.06, 1.04, 1.02), "semi": (1.05, 1.04)},
+        "4plus": {"cbet": (1.02, 1.01, 1.00), "bluff": (1.03, 1.02, 1.01), "semi": (1.02, 1.02)},
+    },
+    "aggro": {
+        "hu": {"cbet": (1.15, 1.10, 1.03), "bluff": (1.25, 1.18, 1.10), "semi": (1.18, 1.14)},
+        "3way": {"cbet": (1.075, 1.05, 1.015), "bluff": (1.125, 1.09, 1.05), "semi": (1.09, 1.07)},
+        "4plus": {"cbet": (1.03, 1.02, 1.01), "bluff": (1.05, 1.04, 1.02), "semi": (1.04, 1.03)},
+    },
+}
+
+_HU_POSTFLOP = {
+    "survival": {
+        "cbet": (1.12, 1.08, 1.03),
+        "bluff": (1.18, 1.12, 1.08),
+        "semi": (1.15, 1.12),
+        "call_cushion": (-0.015, -0.020, -0.025),
+        "value_bet": (-0.010, -0.010, -0.010),
+        "value_raise": (-0.008, -0.008, -0.008),
+    },
+    "aggro": {
+        "cbet": (1.20, 1.15, 1.08),
+        "bluff": (1.30, 1.22, 1.15),
+        "semi": (1.25, 1.18),
+        "call_cushion": (-0.025, -0.030, -0.035),
+        "value_bet": (-0.015, -0.015, -0.020),
+        "value_raise": (-0.012, -0.012, -0.015),
+    },
+}
+
+_FREQ_GEAR_CAPS = {
+    "survival": {"mult": 1.25, "abs": 0.15},
+    "aggro": {"mult": 1.40, "abs": 0.22},
+}
+
+_FREQ_CEILINGS = {
+    "survival": {"cbet": 0.92, "bluff": 0.45, "semi": 0.70},
+    "aggro": {"cbet": 0.96, "bluff": 0.55, "semi": 0.80},
+}
+
+_FUTURE_EDGE_TAX_CAPS = {
+    "survival": {6: 0.020, 5: 0.015, 4: 0.008, 3: 0.003, 2: 0.007},
+    "aggro": {6: 0.006, 5: 0.004, 4: 0.002, 3: 0.0, 2: 0.003},
+}
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 postflop strategy tables.
+#
+# Tournament-tuned defaults.  ``way3`` keys: "hu" (1 live opponent), "3way" (2),
+# "4plus" (3+).
+# ``way2`` keys (sizing): "hu" vs "mw" (multiway).  Street tuples are indexed
+# flop=0, turn=1, river=2.  All equity/odds values are fractions in [0, 1].
+# ---------------------------------------------------------------------------
+_STREET_IDX = {"flop": 0, "turn": 1, "river": 2}
+
+# Equity cushion required ABOVE raw pot odds before calling a bet.
+_CALL_CUSHION = {
+    "aggro": {
+        "hu": (0.04, 0.03, 0.02),
+        "3way": (0.07, 0.06, 0.05),
+        "4plus": (0.10, 0.09, 0.08),
+    },
+    "survival": {
+        "hu": (0.07, 0.06, 0.05),
+        "3way": (0.11, 0.10, 0.09),
+        "4plus": (0.15, 0.14, 0.13),
+    },
+}
+
+# Equity needed to raise a bet (or build a large value line).  "4plus" adds +3pp.
+_VALUE_RAISE = {
+    "aggro": {"hu": (0.65, 0.67, 0.70), "mw": (0.72, 0.75, 0.78)},
+    "survival": {"hu": (0.69, 0.71, 0.74), "mw": (0.76, 0.79, 0.82)},
+}
+
+# Equity needed to value-bet when checked to (to_call == 0).  "4plus" adds +3pp.
+_VALUE_BET = {
+    "aggro": {"hu": (0.57, 0.60, 0.56), "mw": (0.66, 0.68, 0.64)},
+    "survival": {"hu": (0.61, 0.64, 0.60), "mw": (0.70, 0.72, 0.68)},
+}
+
+# Continuation-bet frequency when hero was the preflop aggressor and is checked to.
+_CBET_FREQ = {
+    "aggro": {
+        "hu": (0.70, 0.45, 0.30),
+        "3way": (0.45, 0.28, 0.18),
+        "4plus": (0.30, 0.16, 0.08),
+    },
+    "survival": {
+        "hu": (0.55, 0.30, 0.18),
+        "3way": (0.30, 0.18, 0.10),
+        "4plus": (0.20, 0.10, 0.05),
+    },
+}
+
+# Pure-bluff frequency for non-value, non-semi-bluff hands when checked to.
+_BLUFF_FREQ = {
+    "aggro": {
+        "hu": (0.18, 0.12, 0.22),
+        "3way": (0.08, 0.05, 0.10),
+        "4plus": (0.03, 0.02, 0.04),
+    },
+    "survival": {
+        "hu": (0.06, 0.04, 0.06),
+        "3way": (0.02, 0.01, 0.03),
+        "4plus": (0.0, 0.0, 0.01),
+    },
+}
+
+# Semi-bluff candidate equity band per way, flop (0) and turn (1) only.
+_SEMI_BAND = {
+    "hu": ((0.28, 0.52), (0.18, 0.40)),
+    "3way": ((0.25, 0.48), (0.16, 0.35)),
+    "4plus": ((0.22, 0.44), (0.14, 0.30)),
+}
+
+# Frequency of betting/raising semi-bluff candidates, flop (0) and turn (1).
+_SEMI_FREQ = {
+    "aggro": {"hu": (0.65, 0.50), "3way": (0.45, 0.32), "4plus": (0.25, 0.18)},
+    "survival": {"hu": (0.35, 0.22), "3way": (0.22, 0.12), "4plus": (0.12, 0.06)},
+}
+
+# Bet sizing as a fraction of pot: profile -> category -> way2 -> (flop, turn, river).
+_SIZING = {
+    "aggro": {
+        "value": {"hu": (0.55, 0.70, 0.75), "mw": (0.70, 0.85, 0.85)},
+        "semibluff": {"hu": (0.50, 0.65, 0.65), "mw": (0.60, 0.75, 0.75)},
+        "bluff": {"hu": (0.35, 0.55, 0.75), "mw": (0.45, 0.65, 0.85)},
+    },
+    "survival": {
+        "value": {"hu": (0.45, 0.60, 0.65), "mw": (0.60, 0.75, 0.75)},
+        "semibluff": {"hu": (0.40, 0.50, 0.50), "mw": (0.50, 0.60, 0.60)},
+        "bluff": {"hu": (0.25, 0.35, 0.45), "mw": (0.25, 0.40, 0.50)},
+    },
+}
+
+
+class OpponentProfiles:
+    """Deterministic Phase 5 opponent action counters.
+
+    The engine only exposes per-hand action prefixes, so ingest rebuilds the
+    prefix every time and dedups only the counter increment by ``(hand_id, idx)``.
+    """
+
+    _ACTIONS = {"fold", "check", "call", "bet", "raise"}
+    _PRESSURE_RESPONSES = {"fold", "call", "raise"}
+    _POSTFLOP = {"flop", "turn", "river"}
+
+    _DEFAULT_COUNTERS = {
+        "preflop_action_seen": 0,
+        "vpip_seen": 0,
+        "preflop_raise_seen": 0,
+        "postflop_bet_raise": 0,
+        "postflop_call": 0,
+        "postflop_check": 0,
+        "pressure_fold": 0,
+        "pressure_call": 0,
+        "pressure_raise": 0,
+        "postflop_pressure_fold": 0,
+        "postflop_pressure_call": 0,
+        "postflop_pressure_raise": 0,
+        "large_bet_count": 0,
+        "jam_like_count": 0,
+        "short_jam_like_count": 0,
+        "jam_opportunity_n": 0,
+        "blind_steal_response_n": 0,
+        "blind_fold_to_steal": 0,
+        "fold_to_cbet_n": 0,
+        "fold_to_cbet": 0,
+        "threebet_count": 0,
+        "fourbet_count": 0,
+        "preflop_pressure_action_n": 0,
+    }
+
+    _PRIORS = {
+        "vpip": 0.32,
+        "preflop_aggression_rate": 0.16,
+        "postflop_aggression_freq": 0.33,
+        "fold_to_pressure": 0.45,
+        "station_score": 0.45,
+        "blind_fold_to_steal": 0.45,
+        "fold_to_cbet": 0.45,
+        "threebet_rate": 0.08,
+        "fourbet_rate": 0.03,
+    }
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.profiles: dict[Any, dict[str, int]] = {}
+        self.seen: set[tuple[Any, int]] = set()
+        self.once_flags: set[tuple[Any, Any, str]] = set()
+        self.last_hand_id: int | None = None
+
+    def ingest(self, view: PlayerView) -> None:
+        hand_id = getattr(view, "hand_id", None)
+        hand_int = self._maybe_int(hand_id)
+        if hand_int is not None:
+            if self.last_hand_id is not None and hand_int < self.last_hand_id:
+                self.reset()
+            self.last_hand_id = hand_int
+
+        hero = getattr(view, "me", None)
+        state = self._new_hand_state(view)
+        all_in_pids = set(getattr(view, "all_in_opponents", None) or [])
+        bb = self._infer_big_blind(view)
+        history = list(getattr(view, "history", None) or [])
+        for idx, entry in enumerate(history):
+            if not isinstance(entry, dict):
+                continue
+            classified = self._classify_entry(entry, state, view, all_in_pids, bb)
+            key = (hand_id, idx)
+            if key not in self.seen:
+                self.seen.add(key)
+                pid = classified.get("pid")
+                if pid is not None and pid != hero:
+                    self._update_profile(hand_id, pid, classified)
+            self._apply_entry(entry, state)
+
+    def raw(self, pid: Any) -> dict[str, int]:
+        return dict(self.profiles.get(pid, self._blank_profile()))
+
+    def all_raw(self) -> dict[Any, dict[str, int]]:
+        return {pid: dict(counters) for pid, counters in self.profiles.items()}
+
+    def stat_summary(self, pid: Any, confidence_w: float = 10.0) -> dict[str, Any]:
+        counters = self.profiles.get(pid, self._blank_profile())
+        w = max(0.0, float(confidence_w or 0.0))
+
+        preflop_n = counters["preflop_action_seen"]
+        postflop_aggr_n = (
+            counters["postflop_bet_raise"]
+            + counters["postflop_call"]
+            + counters["postflop_check"]
+        )
+        fold_pressure_n = (
+            counters["pressure_fold"]
+            + counters["pressure_call"]
+            + counters["pressure_raise"]
+        )
+        station_n = (
+            counters["postflop_pressure_call"]
+            + counters["postflop_pressure_raise"]
+        )
+        preflop_pressure_n = counters["preflop_pressure_action_n"]
+
+        summary = {
+            "pid": pid,
+            "preflop_action_seen": preflop_n,
+            "vpip_seen": counters["vpip_seen"],
+            "preflop_raise_seen": counters["preflop_raise_seen"],
+            "postflop_aggression_n": postflop_aggr_n,
+            "pressure_fold_n": fold_pressure_n,
+            "station_response_n": station_n,
+            "pressure_response_n": station_n,
+            "blind_steal_response_n": counters["blind_steal_response_n"],
+            "fold_to_cbet_n": counters["fold_to_cbet_n"],
+            "preflop_pressure_action_n": preflop_pressure_n,
+            "jam_opportunity_n": counters["jam_opportunity_n"],
+            "jam_like_count": counters["jam_like_count"],
+            "short_jam_like_count": counters["short_jam_like_count"],
+            "large_bet_count": counters["large_bet_count"],
+            "vpip_hat": self._p_hat(counters["vpip_seen"], preflop_n, self._PRIORS["vpip"], w),
+            "preflop_aggression_rate_hat": self._p_hat(
+                counters["preflop_raise_seen"],
+                preflop_n,
+                self._PRIORS["preflop_aggression_rate"],
+                w,
+            ),
+            "postflop_aggression_freq_hat": self._p_hat(
+                counters["postflop_bet_raise"],
+                postflop_aggr_n,
+                self._PRIORS["postflop_aggression_freq"],
+                w,
+            ),
+            "fold_to_pressure_hat": self._p_hat(
+                counters["pressure_fold"],
+                fold_pressure_n,
+                self._PRIORS["fold_to_pressure"],
+                w,
+            ),
+            "station_score_hat": self._p_hat(
+                counters["postflop_pressure_call"],
+                station_n,
+                self._PRIORS["station_score"],
+                w,
+            ),
+            "blind_fold_to_steal_hat": self._p_hat(
+                counters["blind_fold_to_steal"],
+                counters["blind_steal_response_n"],
+                self._PRIORS["blind_fold_to_steal"],
+                w,
+            ),
+            "fold_to_cbet_hat": self._p_hat(
+                counters["fold_to_cbet"],
+                counters["fold_to_cbet_n"],
+                self._PRIORS["fold_to_cbet"],
+                w,
+            ),
+            "threebet_rate_hat": self._p_hat(
+                counters["threebet_count"],
+                preflop_pressure_n,
+                self._PRIORS["threebet_rate"],
+                w,
+            ),
+            "fourbet_rate_hat": self._p_hat(
+                counters["fourbet_count"],
+                preflop_pressure_n,
+                self._PRIORS["fourbet_rate"],
+                w,
+            ),
+        }
+        return summary
+
+    def read_strength(
+        self,
+        pid: Any,
+        stat_name: str,
+        *,
+        threshold: float,
+        band: float,
+        confidence_w: float = 10.0,
+    ) -> float:
+        if not self._finite_positive(band):
+            return 0.0
+        summary = self.stat_summary(pid, confidence_w)
+        sample_key = {
+            "vpip": "preflop_action_seen",
+            "preflop_aggression_rate": "preflop_action_seen",
+            "postflop_aggression_freq": "postflop_aggression_n",
+            "fold_to_pressure": "pressure_fold_n",
+            "station_score": "station_response_n",
+            "blind_fold_to_steal": "blind_steal_response_n",
+            "fold_to_cbet": "fold_to_cbet_n",
+            "threebet_rate": "preflop_pressure_action_n",
+            "fourbet_rate": "preflop_pressure_action_n",
+        }.get(stat_name)
+        if sample_key and self._safe_int(summary.get(sample_key)) <= 0:
+            return 0.0
+        p_hat = summary.get(f"{stat_name}_hat")
+        if not self._is_finite(p_hat) or not self._is_finite(threshold):
+            return 0.0
+        return max(0.0, min(1.0, (float(p_hat) - float(threshold)) / float(band)))
+
+    @classmethod
+    def _blank_profile(cls) -> dict[str, int]:
+        return dict(cls._DEFAULT_COUNTERS)
+
+    def _profile_for(self, pid: Any) -> dict[str, int]:
+        if pid not in self.profiles:
+            self.profiles[pid] = self._blank_profile()
+        return self.profiles[pid]
+
+    def _bump_once(self, hand_id: Any, pid: Any, flag: str, counters: dict[str, int], key: str) -> None:
+        once = (hand_id, pid, flag)
+        if once in self.once_flags:
+            return
+        self.once_flags.add(once)
+        counters[key] += 1
+
+    def _update_profile(self, hand_id: Any, pid: Any, data: dict[str, Any]) -> None:
+        counters = self._profile_for(pid)
+        if data.get("preflop_action"):
+            self._bump_once(hand_id, pid, "preflop_action", counters, "preflop_action_seen")
+        if data.get("vpip"):
+            self._bump_once(hand_id, pid, "vpip", counters, "vpip_seen")
+        if data.get("preflop_raise"):
+            self._bump_once(hand_id, pid, "preflop_raise", counters, "preflop_raise_seen")
+
+        if data.get("postflop_bet_raise"):
+            counters["postflop_bet_raise"] += 1
+            counters["jam_opportunity_n"] += 1
+            if data.get("jam_like"):
+                counters["jam_like_count"] += 1
+            elif data.get("short_jam_like"):
+                counters["short_jam_like_count"] += 1
+            elif data.get("large_bet"):
+                counters["large_bet_count"] += 1
+        if data.get("postflop_call"):
+            counters["postflop_call"] += 1
+        if data.get("postflop_check"):
+            counters["postflop_check"] += 1
+
+        if data.get("facing_pressure"):
+            action_type = data.get("type")
+            if action_type in self._PRESSURE_RESPONSES:
+                counters[f"pressure_{action_type}"] += 1
+                if data.get("street") in self._POSTFLOP:
+                    counters[f"postflop_pressure_{action_type}"] += 1
+                if data.get("street") == "preflop":
+                    counters["preflop_pressure_action_n"] += 1
+
+        if data.get("blind_steal_response"):
+            counters["blind_steal_response_n"] += 1
+            if data.get("type") == "fold":
+                counters["blind_fold_to_steal"] += 1
+
+        if data.get("cbet_response"):
+            counters["fold_to_cbet_n"] += 1
+            if data.get("type") == "fold":
+                counters["fold_to_cbet"] += 1
+
+        if data.get("threebet"):
+            counters["threebet_count"] += 1
+        if data.get("fourbet"):
+            counters["fourbet_count"] += 1
+
+    def _new_hand_state(self, view: PlayerView) -> dict[str, Any]:
+        return {
+            "contrib": {},
+            "preflop_raise_count": 0,
+            "preflop_raiser_pid": None,
+            "last_preflop_raiser_pid": None,
+            "first_preflop_raiser_steal": False,
+            "postflop_first_aggressor_pid": None,
+            "postflop_first_aggressor_is_pfr": False,
+            "current_postflop_aggressor_pid": None,
+            "seat_indices": getattr(view, "seat_indices", None) or {},
+        }
+
+    def _classify_entry(
+        self,
+        entry: dict[str, Any],
+        state: dict[str, Any],
+        view: PlayerView,
+        all_in_pids: set[Any],
+        bb: int,
+    ) -> dict[str, Any]:
+        street = str(entry.get("street") or "")
+        action_type = str(entry.get("type") or "")
+        pid = entry.get("pid")
+        to_call_before = self._safe_int(entry.get("to_call_before"))
+        amount = self._safe_int(entry.get("amount"))
+        pot_before = self._safe_int(entry.get("pot_before"))
+        prior_contrib = self._street_contrib(state, street).get(pid, 0)
+        incremental = self._incremental_amount(action_type, amount, prior_contrib)
+
+        preflop = street == "preflop"
+        postflop = street in self._POSTFLOP
+        response = action_type in self._PRESSURE_RESPONSES
+        prior_preflop_raise = state["preflop_raise_count"] > 0
+        facing_pressure = response and to_call_before > 0 and (
+            (postflop) or (preflop and prior_preflop_raise)
+        )
+        postflop_bet_raise = postflop and action_type in {"bet", "raise"}
+        jam_like = False
+        short_jam_like = False
+        if postflop_bet_raise and pid in all_in_pids:
+            risk_bb = incremental / max(1, bb)
+            if risk_bb < 12.0:
+                short_jam_like = True
+            else:
+                jam_like = True
+
+        large_bet = (
+            postflop_bet_raise
+            and not jam_like
+            and not short_jam_like
+            and incremental >= max(8 * max(1, bb), int(round(0.75 * max(1, pot_before))))
+        )
+
+        is_steal_response = (
+            preflop
+            and facing_pressure
+            and state.get("first_preflop_raiser_steal")
+            and action_type in self._PRESSURE_RESPONSES
+        )
+        cbet_response = (
+            postflop
+            and facing_pressure
+            and state.get("postflop_first_aggressor_is_pfr")
+            and action_type in self._PRESSURE_RESPONSES
+        )
+
+        return {
+            "pid": pid,
+            "street": street,
+            "type": action_type,
+            "preflop_action": preflop and action_type in self._ACTIONS,
+            "vpip": preflop and (action_type == "raise" or (action_type == "call" and to_call_before > 0)),
+            "preflop_raise": preflop and action_type == "raise",
+            "facing_pressure": facing_pressure,
+            "postflop_bet_raise": postflop_bet_raise,
+            "postflop_call": postflop and action_type == "call",
+            "postflop_check": postflop and action_type == "check",
+            "large_bet": large_bet,
+            "jam_like": jam_like,
+            "short_jam_like": short_jam_like,
+            "blind_steal_response": is_steal_response,
+            "cbet_response": cbet_response,
+            "threebet": preflop and action_type == "raise" and state["preflop_raise_count"] >= 1,
+            "fourbet": preflop and action_type == "raise" and state["preflop_raise_count"] >= 2,
+        }
+
+    def _apply_entry(self, entry: dict[str, Any], state: dict[str, Any]) -> None:
+        street = str(entry.get("street") or "")
+        action_type = str(entry.get("type") or "")
+        pid = entry.get("pid")
+        if pid is None or action_type not in self._ACTIONS:
+            return
+        amount = self._safe_int(entry.get("amount"))
+        contrib = self._street_contrib(state, street)
+        prior = contrib.get(pid, 0)
+        if action_type == "call":
+            contrib[pid] = prior + max(0, amount)
+        elif action_type in {"bet", "raise"}:
+            contrib[pid] = max(prior, amount)
+
+        if street == "preflop" and action_type == "raise":
+            state["preflop_raise_count"] += 1
+            if state["preflop_raiser_pid"] is None:
+                state["preflop_raiser_pid"] = pid
+                state["first_preflop_raiser_steal"] = self._is_steal_position(state, pid)
+            state["last_preflop_raiser_pid"] = pid
+
+        if street in self._POSTFLOP and action_type in {"bet", "raise"}:
+            if state["postflop_first_aggressor_pid"] is None:
+                state["postflop_first_aggressor_pid"] = pid
+                state["postflop_first_aggressor_is_pfr"] = pid == state.get("last_preflop_raiser_pid")
+            state["current_postflop_aggressor_pid"] = pid
+
+    def _street_contrib(self, state: dict[str, Any], street: str) -> dict[Any, int]:
+        return state["contrib"].setdefault(street, {})
+
+    @staticmethod
+    def _incremental_amount(action_type: str, amount: int, prior_contrib: int) -> int:
+        if action_type == "call":
+            return max(0, amount)
+        if action_type in {"bet", "raise"}:
+            return max(0, amount - max(0, prior_contrib))
+        return 0
+
+    @staticmethod
+    def _is_steal_position(state: dict[str, Any], pid: Any) -> bool:
+        seats = state.get("seat_indices") or {}
+        if not isinstance(seats, dict) or pid not in seats or len(seats) < 2:
+            return False
+        # Six-max order in this codebase is BTN, SB, BB, UTG, UTG+1, MP.  A
+        # late-position steal sample is enough for log-only telemetry.
+        try:
+            idx = int(seats.get(pid))
+        except (TypeError, ValueError):
+            return False
+        return idx in {0, max(0, len(seats) - 1)}
+
+    @classmethod
+    def _p_hat(cls, k: int, n: int, p0: float, w: float) -> float:
+        k = max(0, cls._safe_int(k))
+        n = max(0, cls._safe_int(n))
+        if not cls._is_finite(p0) or not cls._is_finite(w):
+            return 0.0
+        p0 = max(0.0, min(1.0, float(p0)))
+        w = max(0.0, float(w))
+        denom = n + w
+        if denom <= 0.0:
+            return p0
+        value = (k + p0 * w) / denom
+        return value if cls._is_finite(value) else 0.0
+
+    @classmethod
+    def _infer_big_blind(cls, view: PlayerView) -> int:
+        min_raise = cls._safe_int(getattr(view, "min_raise", 0))
+        if min_raise > 0:
+            return max(1, min_raise)
+        pot = cls._safe_int(getattr(view, "pot", 0))
+        if pot > 0:
+            return max(1, int(round(pot / 1.5)))
+        for entry in getattr(view, "history", None) or []:
+            if not isinstance(entry, dict):
+                continue
+            to_call = cls._safe_int(entry.get("to_call_before"))
+            if to_call > 0:
+                return max(1, to_call)
+        return 10
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _maybe_int(cls, value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _finite_positive(cls, value: Any) -> bool:
+        return cls._is_finite(value) and float(value) > 0.0
+
+
 @dataclass(frozen=True)
 class ProfileConfig:
     name: str
@@ -318,11 +1073,22 @@ class ProfileConfig:
     short_stack_bb_threshold: Optional[int] = None
     medium_band_top_bb: int = 25
     bubble_factor: Optional[float] = None
+    future_edge_tax_scale: float = 1.0
+    chipleader_pressure_scale: float = 1.0
+    desperation_scale: float = 1.0
+    hu_aggression_scale: float = 1.0
 
     # Opponent module stubs.  Phase 5 will add memory and exploitation hooks.
     opponent_model_key: Optional[str] = None
     exploit_adjustment: float = 0.0
     memory_hands: Optional[int] = None
+    p5_enabled: bool = False
+    p5_log_only: bool = False
+    p5_station_enabled: bool = True
+    p5_r2_enabled: bool = True
+    station_suppression_scale: float = 0.55
+    spewy_tax_relief: float = 0.50
+    p5_confidence_w: float = 10.0
 
 
 SURVIVAL_CONFIG = ProfileConfig(
@@ -338,6 +1104,10 @@ SURVIVAL_CONFIG = ProfileConfig(
         "heads_up": 15,
     },
     medium_band_top_bb=25,
+    future_edge_tax_scale=1.0,
+    chipleader_pressure_scale=0.60,
+    desperation_scale=1.0,
+    hu_aggression_scale=1.0,
 )
 
 AGGRO_CONFIG = ProfileConfig(
@@ -356,6 +1126,10 @@ AGGRO_CONFIG = ProfileConfig(
     },
     medium_band_top_bb=25,
     exploit_adjustment=0.10,
+    future_edge_tax_scale=0.70,
+    chipleader_pressure_scale=1.0,
+    desperation_scale=1.15,
+    hu_aggression_scale=1.10,
 )
 
 _PROFILE_CONFIGS = {
@@ -377,17 +1151,58 @@ class TournamentHybridBot:
         self.profile = self.config.name
         self.last_decision: DecisionTrace | None = None
         self._bb_cache: dict[Any, int] = {}
+        self._rank_cache: dict[Any, DecisionTrace] = {}
         self._pending_preflop_trace: DecisionTrace = {}
+        self._profiles = OpponentProfiles()
+        self.p5_enabled = bool(self.config.p5_enabled)
+        self.p5_log_only = bool(self.config.p5_log_only)
+        self.p5_station_enabled = bool(self.config.p5_station_enabled)
+        self.p5_r2_enabled = bool(self.config.p5_r2_enabled)
+        self.station_suppression_scale = float(self.config.station_suppression_scale)
+        self.spewy_tax_relief = float(self.config.spewy_tax_relief)
+        self.p5_confidence_w = float(self.config.p5_confidence_w)
+        self.p5_error_count = 0
+        self.p5_decision_count = 0
+        self.p5_station_read_fire_count = 0
+        self.p5_r2_read_fire_count = 0
+        self._p5_trace_updates: DecisionTrace = {}
+
+        # Adaptive Monte Carlo budget for postflop equity.  Defaults are sized
+        # for fast iterated evaluation; raise ``postflop_sim_cap`` (and the
+        # big/all-in tiers) on match day where heavier compute is affordable.
+        self.postflop_base_sims = 200
+        self.postflop_big_sims = 1200
+        self.postflop_allin_sims = 2500
+        self.postflop_sim_cap = 2500
+
+        # A/B override for the future-edge tax (Phase 4 plan §12 R7). When set it
+        # is a hard ceiling on the per-decision tax cap; 0.0 disables the tax
+        # entirely so eval can isolate whether the tax earns its keep against a
+        # pure-chipEV arm.  ``None`` keeps the built-in per-player caps.
+        self.future_edge_tax_cap_override: float | None = None
 
     def reset_memory(self):
-        """Tournament boundary hook; real opponent memory arrives in Phase 5."""
+        """Tournament boundary hook for cached state and Phase 5 profiles."""
         self.last_decision = None
         self._bb_cache.clear()
+        self._rank_cache.clear()
         self._pending_preflop_trace = {}
+        self._profiles.reset()
+        self.p5_error_count = 0
+        self.p5_decision_count = 0
+        self.p5_station_read_fire_count = 0
+        self.p5_r2_read_fire_count = 0
+        self._p5_trace_updates = {}
         return None
 
     def act(self, view: PlayerView) -> Action:
         """Return a safe action and populate ``last_decision``."""
+        self._p5_trace_updates = self._p5_base_trace()
+        try:
+            self._p5_ingest(view)
+        except Exception as exc:
+            self._p5_record_error("ingest", exc)
+
         context: dict[str, Any]
         context_failed = False
         try:
@@ -428,6 +1243,18 @@ class TournamentHybridBot:
                 reason = self._pending_preflop_trace.get("reason", "preflop strategy")
             else:
                 reason = self._pending_preflop_trace.get("reason", "preflop passive fallback")
+        elif getattr(view, "street", None) in _STREET_IDX and not context_failed:
+            try:
+                proposed = self._postflop_action(view, context)
+            except Exception as exc:  # Defensive boundary mirrors preflop.
+                proposed = self._fold_or_check(view)
+                self._pending_preflop_trace.update({
+                    "branch": "postflop_exception",
+                    "reason": str(exc),
+                })
+            if proposed is not None:
+                path = "postflop"
+                reason = self._pending_preflop_trace.get("reason", "postflop strategy")
 
         if proposed is None:
             proposed = self._fold_or_check(view) if context_failed else self._safe_passive(view)
@@ -451,6 +1278,10 @@ class TournamentHybridBot:
             "reason": reason,
             "context": context,
         })
+        self._p5_trace_log_only_reads(view)
+        self._p5_trace_updates["p5_error_count"] = self.p5_error_count
+        trace.update(self._p5_trace_updates)
+        self._p5_update_telemetry(trace)
         self.last_decision = trace
         return action
 
@@ -460,14 +1291,366 @@ class TournamentHybridBot:
             "position_category": None,
             "inferred_bb": None,
             "eff_bb": None,
+            "hero_bb": None,
             "band": None,
             "raises_faced": None,
             "branch": None,
             "range_hit": False,
+            "base_range_hit": False,
+            "spot_type": None,
+            "pure_chipEV_action": None,
+            "phase4_action": None,
+            "future_edge_tax": 0.0,
         }
 
     def _trace_preflop(self, **updates: Any) -> None:
         self._pending_preflop_trace.update(updates)
+
+    # ------------------------------------------------------------------
+    # Phase 5: opponent tendencies substrate and guarded exploits.
+    # ------------------------------------------------------------------
+    def _p5_base_trace(self) -> DecisionTrace:
+        return {
+            "p5_enabled": bool(self.p5_enabled),
+            "p5_log_only": bool(self.p5_log_only),
+            "p5_active": self._p5_active(),
+            "p5_station_enabled": bool(getattr(self, "p5_station_enabled", True)),
+            "p5_r2_enabled": bool(getattr(self, "p5_r2_enabled", True)),
+            "p5_error_count": self.p5_error_count,
+            "p5_station_applied": False,
+            "p5_station_pid": None,
+            "p5_station_strength": 0.0,
+            "p5_station_delta": 0.0,
+            "p5_r2_relief_applied": False,
+            "p5_r2_confirmed_spewy": False,
+            "p5_r2_aggressor": None,
+        }
+
+    def _p5_ingest(self, view: PlayerView) -> None:
+        self._profiles.ingest(view)
+
+    def _p5_record_error(self, label: str, exc: Exception | str) -> None:
+        self.p5_error_count += 1
+        self._p5_trace_updates.update({
+            "p5_error_count": self.p5_error_count,
+            "p5_last_error": f"{label}: {exc}",
+        })
+
+    def _p5_active(self) -> bool:
+        return bool(getattr(self, "p5_enabled", False)) and not bool(getattr(self, "p5_log_only", False))
+
+    def _p5_confidence_w(self) -> float:
+        try:
+            w = float(getattr(self, "p5_confidence_w", self.config.p5_confidence_w))
+        except (TypeError, ValueError):
+            self._p5_record_error("confidence_w", "non-finite confidence weight")
+            return 10.0
+        if not math.isfinite(w) or w < 0.0:
+            self._p5_record_error("confidence_w", "non-finite confidence weight")
+            return 10.0
+        return w
+
+    def _p5_sorted_pids(self, view: PlayerView, pids: list[Any] | tuple[Any, ...] | None = None) -> list[Any]:
+        if pids is None:
+            pids = list(getattr(view, "acting_opponents", None) or getattr(view, "opponents", None) or [])
+        seats = getattr(view, "seat_indices", None) or {}
+
+        def sort_key(pid: Any) -> tuple[int, str]:
+            try:
+                seat = int(seats.get(pid))
+            except (AttributeError, TypeError, ValueError):
+                seat = 10**9
+            return (seat, str(pid))
+
+        return sorted([pid for pid in pids if pid is not None and pid != getattr(view, "me", None)], key=sort_key)
+
+    @staticmethod
+    def _p5_finite(value: Any) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def _p5_clamp(cls, value: Any, lo: float = 0.0, hi: float = 1.0) -> float:
+        if not cls._p5_finite(value):
+            return lo
+        f = float(value)
+        if f < lo:
+            return lo
+        if f > hi:
+            return hi
+        return f
+
+    def _p5_read_strength(
+        self,
+        pid: Any,
+        stat_name: str,
+        *,
+        threshold: float,
+        band: float,
+    ) -> float:
+        if not self._p5_finite(band) or float(band) <= 0.0:
+            self._p5_record_error(f"{stat_name}_band", "non-positive band")
+            return 0.0
+        strength = self._profiles.read_strength(
+            pid,
+            stat_name,
+            threshold=threshold,
+            band=band,
+            confidence_w=self._p5_confidence_w(),
+        )
+        if not self._p5_finite(strength):
+            self._p5_record_error(f"{stat_name}_strength", "non-finite strength")
+            return 0.0
+        return self._p5_clamp(strength)
+
+    def _p5_station_read(self, view: PlayerView) -> dict[str, Any]:
+        best: dict[str, Any] = {
+            "pid": None,
+            "strength": 0.0,
+            "station_score_hat": OpponentProfiles._PRIORS["station_score"],
+            "pressure_response_n": 0,
+            "guard": False,
+        }
+        for pid in self._p5_sorted_pids(view):
+            stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
+            n = self._safe_int(stats.get("pressure_response_n"))
+            strength = self._p5_read_strength(pid, "station_score", threshold=0.60, band=0.25)
+            guard = n >= 4 and strength > 0.0
+            score = float(stats.get("station_score_hat", 0.0) or 0.0)
+            if guard and (strength, score, str(pid)) > (
+                best["strength"],
+                float(best.get("station_score_hat", 0.0) or 0.0),
+                str(best.get("pid")),
+            ):
+                best = {
+                    "pid": pid,
+                    "strength": strength,
+                    "station_score_hat": score,
+                    "pressure_response_n": n,
+                    "guard": True,
+                }
+        return best
+
+    def _p5_station_frequency(self, view: PlayerView, knob_name: str, freq: float) -> float:
+        try:
+            read = self._p5_station_read(view)
+            strength = float(read.get("strength", 0.0) or 0.0)
+            scale = self._p5_clamp(getattr(self, "station_suppression_scale", 0.55), 0.0, 1.0)
+            if knob_name == "cbet":
+                target_scale = 1.0 - (1.0 - scale) * 0.50
+            elif knob_name == "bluff":
+                target_scale = scale
+            else:
+                target_scale = 1.0
+            mult = 1.0 - (1.0 - target_scale) * strength
+            proposed = self._p5_clamp(float(freq) * mult, 0.0, 1.0)
+            delta = proposed - float(freq)
+            applied = (
+                bool(read.get("guard"))
+                and self._p5_active()
+                and bool(getattr(self, "p5_station_enabled", True))
+                and knob_name in {"cbet", "bluff"}
+            )
+            would_apply = bool(read.get("guard")) and knob_name in {"cbet", "bluff"}
+            self._p5_trace_updates.update({
+                "p5_station_pid": read.get("pid"),
+                "p5_station_score_hat": round(float(read.get("station_score_hat", 0.0) or 0.0), 4),
+                "p5_station_pressure_response_n": self._safe_int(read.get("pressure_response_n")),
+                "p5_station_strength": round(strength, 4),
+                "p5_station_knob": knob_name,
+                "p5_station_scale": round(target_scale, 4),
+                "p5_station_delta": round(delta, 4),
+                "p5_station_proposed_freq": round(proposed, 4),
+                "p5_station_would_apply": would_apply,
+                "p5_station_applied": applied,
+            })
+            return proposed if applied else freq
+        except Exception as exc:
+            self._p5_record_error("station_suppression", exc)
+            return freq
+
+    def _p5_current_postflop_aggressor(self, view: PlayerView) -> Any:
+        aggressor = None
+        for entry in getattr(view, "history", None) or []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("street") in _STREET_IDX
+                and entry.get("type") in {"bet", "raise"}
+            ):
+                aggressor = entry.get("pid")
+        return aggressor
+
+    def _p5_confirmed_spewy(self, pid: Any) -> tuple[bool, DecisionTrace]:
+        stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
+        vpip_ok = float(stats.get("vpip_hat", 0.0) or 0.0) >= 0.36
+        pfr_ok = float(stats.get("preflop_aggression_rate_hat", 0.0) or 0.0) >= 0.18
+        post_ok = float(stats.get("postflop_aggression_freq_hat", 0.0) or 0.0) >= 0.38
+        looseness = bool(vpip_ok and pfr_ok and post_ok)
+        jam_n = self._safe_int(stats.get("jam_opportunity_n"))
+        jam_count = self._safe_int(stats.get("jam_like_count"))
+        large_count = self._safe_int(stats.get("large_bet_count"))
+        short_jam = self._safe_int(stats.get("short_jam_like_count"))
+        confirmed = (
+            jam_n >= 3
+            and looseness
+            and (jam_count >= 2 or large_count >= 3)
+            and short_jam == 0
+        )
+        trace = {
+            "p5_r2_vpip_hat": round(float(stats.get("vpip_hat", 0.0) or 0.0), 4),
+            "p5_r2_preflop_aggr_hat": round(float(stats.get("preflop_aggression_rate_hat", 0.0) or 0.0), 4),
+            "p5_r2_postflop_aggr_hat": round(float(stats.get("postflop_aggression_freq_hat", 0.0) or 0.0), 4),
+            "p5_r2_looseness_conjunction": looseness,
+            "p5_r2_jam_opportunity_n": jam_n,
+            "p5_r2_jam_like_count": jam_count,
+            "p5_r2_large_bet_count": large_count,
+            "p5_r2_short_jam_like_count": short_jam,
+            "p5_r2_confirmed_spewy": confirmed,
+        }
+        return confirmed, trace
+
+    def _p5_relieve_future_tax(
+        self,
+        view: PlayerView,
+        tax: float,
+        *,
+        eq: float,
+        pot_odds: float,
+        all_in_call: bool,
+    ) -> float:
+        try:
+            if tax <= 0.0 or not all_in_call or getattr(view, "street", None) not in _STREET_IDX:
+                return tax
+            aggressor = self._p5_current_postflop_aggressor(view)
+            all_in = set(getattr(view, "all_in_opponents", None) or [])
+            live_villains = self._p5_sorted_pids(
+                view,
+                [
+                    pid for pid in (getattr(view, "opponents", None) or [])
+                    if pid != getattr(view, "me", None)
+                ],
+            )
+            heads_up_shover = len(live_villains) == 1 and aggressor in live_villains and aggressor in all_in
+            chip_ev_ok = self._p5_finite(eq) and self._p5_finite(pot_odds) and float(eq) >= float(pot_odds)
+            confirmed = False
+            spewy_trace: DecisionTrace = {}
+            if aggressor is not None:
+                confirmed, spewy_trace = self._p5_confirmed_spewy(aggressor)
+            relief = self._p5_clamp(getattr(self, "spewy_tax_relief", 0.50), 0.0, 1.0)
+            would_apply = bool(heads_up_shover and chip_ev_ok and confirmed)
+            applied = bool(
+                heads_up_shover
+                and chip_ev_ok
+                and confirmed
+                and self._p5_active()
+                and bool(getattr(self, "p5_r2_enabled", True))
+            )
+            proposed_tax = round(max(0.0, float(tax) * (1.0 - relief)), 4)
+            self._p5_trace_updates.update({
+                "p5_r2_aggressor": aggressor,
+                "p5_r2_heads_up_shover": heads_up_shover,
+                "p5_r2_chip_ev_ok": bool(chip_ev_ok),
+                "p5_r2_relief": round(relief, 4),
+                "p5_r2_tax_before": round(float(tax), 4),
+                "p5_r2_tax_after_proposed": proposed_tax,
+                "p5_r2_would_apply": would_apply,
+                "p5_r2_relief_applied": applied,
+                **spewy_trace,
+            })
+            return proposed_tax if applied else tax
+        except Exception as exc:
+            self._p5_record_error("r2_tax_relief", exc)
+            return tax
+
+    def _p5_trace_log_only_reads(self, view: PlayerView) -> None:
+        try:
+            pids = self._p5_sorted_pids(view)
+            if not pids:
+                self._p5_trace_updates.update({
+                    "p5_overfolder_delta_log_only": 0.0,
+                    "p5_passive_tight_delta_log_only": 0.0,
+                    "p5_station_value_delta_log_only": 0.0,
+                    "p5_aggro_second_gear_delta_log_only": 0.0,
+                })
+                return
+
+            best_over = (0.0, None)
+            best_passive = (0.0, None)
+            best_value = (0.0, None)
+            best_aggro = (0.0, None)
+            for pid in pids:
+                over = 0.15 * self._p5_read_strength(pid, "fold_to_pressure", threshold=0.58, band=0.17)
+                station = 0.020 * self._p5_read_strength(pid, "station_score", threshold=0.60, band=0.25)
+                aggro = 0.12 * self._p5_read_strength(pid, "postflop_aggression_freq", threshold=0.52, band=0.20)
+                stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
+                vpip_hat = float(stats.get("vpip_hat", 0.0) or 0.0)
+                post_hat = float(stats.get("postflop_aggression_freq_hat", 0.0) or 0.0)
+                passive = 0.010 if (
+                    stats.get("preflop_action_seen", 0) > 0
+                    and stats.get("postflop_aggression_n", 0) > 0
+                    and vpip_hat <= 0.24
+                    and post_hat <= 0.24
+                ) else 0.0
+                if over > best_over[0]:
+                    best_over = (over, pid)
+                if passive > best_passive[0]:
+                    best_passive = (passive, pid)
+                if station > best_value[0]:
+                    best_value = (station, pid)
+                if aggro > best_aggro[0]:
+                    best_aggro = (aggro, pid)
+
+            self._p5_trace_updates.update({
+                "p5_overfolder_pid": best_over[1],
+                "p5_overfolder_delta_log_only": round(best_over[0], 4),
+                "p5_passive_tight_pid": best_passive[1],
+                "p5_passive_tight_delta_log_only": round(best_passive[0], 4),
+                "p5_station_value_pid": best_value[1],
+                "p5_station_value_delta_log_only": round(best_value[0], 4),
+                "p5_aggro_second_gear_pid": best_aggro[1],
+                "p5_aggro_second_gear_delta_log_only": round(best_aggro[0], 4),
+            })
+        except Exception as exc:
+            self._p5_record_error("log_only_reads", exc)
+
+    def _p5_update_telemetry(self, trace: DecisionTrace) -> None:
+        self.p5_decision_count += 1
+        if trace.get("p5_station_would_apply"):
+            self.p5_station_read_fire_count += 1
+        if trace.get("p5_r2_would_apply"):
+            self.p5_r2_read_fire_count += 1
+
+    def p5_telemetry_summary(self) -> DecisionTrace:
+        villains = {}
+        for pid in self._p5_sorted_pids(
+            type("_P5View", (), {"opponents": list(self._profiles.profiles), "me": None, "seat_indices": {}})()
+        ):
+            stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
+            villains[pid] = {
+                "preflop_action_seen": stats.get("preflop_action_seen", 0),
+                "postflop_aggression_n": stats.get("postflop_aggression_n", 0),
+                "station_response_n": stats.get("station_response_n", 0),
+                "pressure_fold_n": stats.get("pressure_fold_n", 0),
+                "jam_opportunity_n": stats.get("jam_opportunity_n", 0),
+                "jam_like_count": stats.get("jam_like_count", 0),
+                "large_bet_count": stats.get("large_bet_count", 0),
+                "short_jam_like_count": stats.get("short_jam_like_count", 0),
+            }
+        decisions = max(1, self.p5_decision_count)
+        return {
+            "p5_decisions": self.p5_decision_count,
+            "p5_station_read_fire_count": self.p5_station_read_fire_count,
+            "p5_r2_read_fire_count": self.p5_r2_read_fire_count,
+            "p5_any_active_read_fire_rate": (
+                (self.p5_station_read_fire_count + self.p5_r2_read_fire_count) / decisions
+            ),
+            "p5_station_read_fire_rate": self.p5_station_read_fire_count / decisions,
+            "p5_r2_read_fire_rate": self.p5_r2_read_fire_count / decisions,
+            "p5_error_count": self.p5_error_count,
+            "p5_villain_samples": villains,
+        }
 
     def _preflop_action(self, view: PlayerView, context: dict[str, Any]) -> Action | None:
         key = self._hand_key_from_view(view)
@@ -477,6 +1660,7 @@ class TournamentHybridBot:
         category = self._classify_position(position, n_players)
         strategy_category = self._strategy_category(category, n_players)
         eff_bb = self._eff_bb(view, context)
+        hero_bb = float(context.get("hero_bb", eff_bb) or eff_bb)
         raises = self._count_raises(view)
         limpers = self._count_limpers(view)
         threshold = self._shove_threshold(category, n_players)
@@ -487,10 +1671,14 @@ class TournamentHybridBot:
             position_category=category,
             inferred_bb=bb,
             eff_bb=eff_bb,
+            hero_bb=round(hero_bb, 3),
             band=band,
             raises_faced=raises,
             branch="no_cards",
             range_hit=False,
+            rank_ctx=context.get("rank_ctx"),
+            players_left=(context.get("rank_ctx") or {}).get("players_left", n_players),
+            future_edge_tax=0.0,
             reason="missing or invalid hole cards",
         )
         if not key:
@@ -498,14 +1686,14 @@ class TournamentHybridBot:
 
         if band == "short":
             return self._short_stack_action(
-                view, key, strategy_category, n_players, raises, limpers
+                view, key, strategy_category, n_players, raises, limpers, context, hero_bb, eff_bb
             )
         if band == "medium":
             return self._medium_stack_action(
-                view, key, strategy_category, category, n_players, raises, limpers, bb
+                view, key, strategy_category, category, n_players, raises, limpers, bb, context, hero_bb, eff_bb
             )
         return self._deep_stack_action(
-            view, key, strategy_category, category, n_players, raises, limpers, bb, eff_bb
+            view, key, strategy_category, category, n_players, raises, limpers, bb, eff_bb, context, hero_bb
         )
 
     def _short_stack_action(
@@ -516,22 +1704,61 @@ class TournamentHybridBot:
         n_players: int,
         raises: int,
         limpers: int,
+        context: dict[str, Any],
+        hero_bb: float,
+        eff_bb: int,
     ) -> Action:
         if self._facing_all_in(view, raises):
             all_in_cat = self._all_in_aggressor_category(view, n_players, raises)
             call_range = _CALL_SHOVE_RANGES[self.config.name].get(all_in_cat, frozenset())
             hit = key in call_range
             self._trace_preflop(branch=f"short_call_off_vs_{all_in_cat}", range_hit=hit,
+                                base_range_hit=hit,
+                                spot_type="all_in_call",
+                                pure_chipEV_action="call" if hit else "fold",
+                                phase4_action="call" if hit else "fold",
+                                future_edge_tax=0.0,
+                                **self._stack_state_trace(
+                                    view, context, hero_bb, eff_bb,
+                                    short_weight=self._short_weight(hero_bb),
+                                ),
                                 reason="short stack facing all-in")
             return self._call_or_fold(view) if hit else self._fold_or_check(view)
 
         shove_range = _SHORT_SHOVE_RANGES[self.config.name].get(strategy_category, frozenset())
-        hit = key in shove_range
+        short_nudge = self._short_desperation_nudge(view, hero_bb)
+        ceiling = {
+            "family": "shove",
+            "max_pct": _SHOVE_CEILINGS.get(self.config.name, _SHOVE_CEILINGS["survival"]).get(strategy_category, 1.0),
+        }
+        hit, range_trace = self._range_hit_with_nudges(
+            view,
+            key,
+            shove_range,
+            _SHORT_SHOVE_EXPANSION.get(strategy_category, frozenset()),
+            "short_shove",
+            [short_nudge],
+            ceiling,
+        )
         branch = "short_shove" if raises or limpers else "short_open_shove"
         self._trace_preflop(
             branch=branch,
-            range_hit=hit,
+            **range_trace,
             target_total=self._jam_total(view) if hit else None,
+            spot_type="shove" if raises or limpers else "open_shove",
+            pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+            phase4_action="raise" if hit else "fold",
+            future_edge_tax=0.0,
+            urgency_bonus=self._urgency_bonus(hero_bb),
+            short_desperation_nudge={
+                "rel": round(short_nudge.get("rel", 0.0), 4),
+                "abs": round(short_nudge.get("abs", 0.0), 4),
+                "weight": round(short_nudge.get("weight", 0.0), 4),
+            },
+            **self._stack_state_trace(
+                view, context, hero_bb, eff_bb,
+                short_weight=self._short_weight(hero_bb),
+            ),
             reason="short stack shove/fold",
         )
         if hit:
@@ -548,12 +1775,21 @@ class TournamentHybridBot:
         raises: int,
         limpers: int,
         bb: int,
+        context: dict[str, Any],
+        hero_bb: float,
+        eff_bb: int,
     ) -> Action:
         if self._facing_all_in(view, raises):
             all_in_cat = self._all_in_aggressor_category(view, n_players, raises)
             call_range = _CALL_SHOVE_RANGES[self.config.name].get(all_in_cat, frozenset())
             hit = key in call_range
             self._trace_preflop(branch=f"medium_call_off_vs_{all_in_cat}", range_hit=hit,
+                                base_range_hit=hit,
+                                spot_type="all_in_call",
+                                pure_chipEV_action="call" if hit else "fold",
+                                phase4_action="call" if hit else "fold",
+                                future_edge_tax=0.0,
+                                **self._stack_state_trace(view, context, hero_bb, eff_bb),
                                 reason="medium stack facing all-in")
             return self._call_or_fold(view) if hit else self._fold_or_check(view)
 
@@ -562,7 +1798,13 @@ class TournamentHybridBot:
             self._trace_preflop(
                 branch="medium_vs_3bet_jam",
                 range_hit=hit,
+                base_range_hit=hit,
                 target_total=self._jam_total(view) if hit else None,
+                spot_type="shove",
+                pure_chipEV_action="raise" if hit else "fold",
+                phase4_action="raise" if hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb),
                 reason="medium stack never 3bet-then-folds",
             )
             return self._safe_aggressive(view, self._jam_total(view)) if hit else self._fold_or_check(view)
@@ -570,54 +1812,150 @@ class TournamentHybridBot:
         if raises == 1:
             opener_cat = self._opener_category(view, n_players)
             resteal_range = _RESTEAL_RANGES[self.config.name].get(opener_cat, _RESTEAL_RANGES[self.config.name]["middle"])
-            hit = key in resteal_range
             if opener_cat in ("early", "middle"):
-                hit = key in _RESTEAL_RANGES[self.config.name][opener_cat]
+                resteal_range = _RESTEAL_RANGES[self.config.name][opener_cat]
+            pressure = self._pressure_weight(
+                view,
+                context.get("rank_ctx") or self._rank_context(view),
+                hero_bb,
+                eff_bb,
+                [self._opener_pid(view)],
+            )
+            nudge = self._pressure_nudge(self.config.name, "resteal", pressure, "threebet")
+            hit, range_trace = self._range_hit_with_nudges(
+                view,
+                key,
+                resteal_range,
+                _PRESSURE_3BET_EXPANSION.get(opener_cat, frozenset()),
+                f"medium_resteal_{opener_cat}",
+                [nudge],
+                {"family": "threebet", "max_pct": 1.0},
+            )
             self._trace_preflop(
                 branch=f"medium_resteal_vs_{opener_cat}",
-                range_hit=hit,
+                **range_trace,
                 target_total=self._jam_total(view) if hit else None,
+                spot_type="resteal",
+                pressure_weight=round(pressure, 4),
+                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+                phase4_action="raise" if hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                 reason="medium stack resteal jam or fold",
             )
             return self._safe_aggressive(view, self._jam_total(view)) if hit else self._fold_or_check(view)
 
         if limpers:
-            iso_range = _ISO_VALUE_SHORT if self._eff_bb(view, self._context(view)) <= 15 else _ISO_VALUE
-            hit = key in iso_range
+            iso_range = _ISO_VALUE_SHORT if eff_bb <= 15 else _ISO_VALUE
+            pressure = self._pressure_weight(
+                view,
+                context.get("rank_ctx") or self._rank_context(view),
+                hero_bb,
+                eff_bb,
+                self._limper_pids(view),
+            )
+            nudge = self._pressure_nudge(self.config.name, "iso", pressure)
+            hit, range_trace = self._range_hit_with_nudges(
+                view, key, iso_range, _PRESSURE_ISO_EXPANSION,
+                "medium_iso", [nudge], {"family": "default", "max_pct": 1.0},
+            )
             self._trace_preflop(
                 branch="medium_iso_limpers",
-                range_hit=hit,
-                target_total=self._jam_total(view) if hit and self._eff_bb(view, self._context(view)) <= 15 else None,
+                **range_trace,
+                target_total=self._jam_total(view) if hit and eff_bb <= 15 else None,
+                spot_type="iso",
+                pressure_weight=round(pressure, 4),
+                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+                phase4_action="raise" if hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                 reason="medium stack iso against limpers",
             )
             if not hit:
                 return self._check_or_fold(view) if category == "bb" else self._fold_or_check(view)
-            if self._eff_bb(view, self._context(view)) <= 15:
+            if eff_bb <= 15:
                 return self._safe_aggressive(view, self._jam_total(view))
-            target = self._iso_total(bb, self._eff_bb(view, self._context(view)), category, limpers)
+            target = self._iso_total(bb, eff_bb, category, limpers)
             self._trace_preflop(target_total=target)
             return self._safe_aggressive(view, target)
 
         open_jam_range = _MEDIUM_OPEN_JAM.get(self.config.name, {}).get(strategy_category, frozenset())
-        can_open_jam = strategy_category in ("late", "sb", "heads_up") and key in open_jam_range
+        pressure = self._pressure_weight(
+            view,
+            context.get("rank_ctx") or self._rank_context(view),
+            hero_bb,
+            eff_bb,
+            getattr(view, "acting_opponents", None) or getattr(view, "opponents", None) or [],
+        )
+        jam_nudges = []
+        if pressure > 0.0:
+            jam_nudges.append(self._pressure_nudge(self.config.name, "open_jam", pressure, "shove"))
+        if hero_bb <= 16.0:
+            jam_nudges.append(self._short_desperation_nudge(view, hero_bb))
+        jam_hit, jam_trace = self._range_hit_with_nudges(
+            view,
+            key,
+            open_jam_range,
+            _SHORT_SHOVE_EXPANSION.get(strategy_category, frozenset()),
+            "medium_open_jam",
+            jam_nudges,
+            {
+                "family": "shove",
+                "max_pct": _SHOVE_CEILINGS.get(self.config.name, _SHOVE_CEILINGS["survival"]).get(strategy_category, 1.0),
+            },
+        )
+        can_open_jam = strategy_category in ("late", "sb", "heads_up") and jam_hit
         if can_open_jam:
             self._trace_preflop(
                 branch="medium_open_jam",
-                range_hit=True,
+                **jam_trace,
                 target_total=self._jam_total(view),
+                spot_type="open_jam",
+                pressure_weight=round(pressure, 4),
+                pure_chipEV_action="raise" if jam_trace.get("base_range_hit") else "fold",
+                phase4_action="raise",
+                future_edge_tax=0.0,
+                urgency_bonus=self._urgency_bonus(hero_bb),
+                **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                 reason="medium late-position open jam",
             )
             return self._safe_aggressive(view, self._jam_total(view))
 
         rfi_range = _RFI_RANGES[self.config.name].get(strategy_category, frozenset())
-        hit = key in rfi_range
+        rfi_nudges = []
+        if pressure > 0.0:
+            rfi_nudges.append(self._pressure_nudge(
+                self.config.name,
+                self._rfi_pressure_spot(view, category, strategy_category),
+                pressure,
+            ))
+        if hero_bb <= 16.0:
+            transition = self._short_desperation_nudge(view, hero_bb)
+            transition["family"] = "default"
+            rfi_nudges.append(transition)
+        hit, range_trace = self._range_hit_with_nudges(
+            view,
+            key,
+            rfi_range,
+            _PRESSURE_RFI_EXPANSION.get(strategy_category, _PRESSURE_RFI_EXPANSION.get(category, frozenset())),
+            "medium_rfi",
+            rfi_nudges,
+            {"family": "default", "max_pct": 1.0},
+        )
         self._trace_preflop(
             branch="medium_rfi",
-            range_hit=hit,
+            **range_trace,
+            spot_type="steal" if category in ("late", "sb") else "open",
+            pressure_weight=round(pressure, 4),
+            pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+            phase4_action="raise" if hit else "fold",
+            future_edge_tax=0.0,
+            urgency_bonus=self._urgency_bonus(hero_bb),
+            **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
             reason="medium stack open/fold",
         )
         if hit and self._can_open_from_here(view, category, n_players, bb):
-            target = self._open_total(bb, self._eff_bb(view, self._context(view)), category, n_players)
+            target = self._open_total(bb, eff_bb, category, n_players)
             self._trace_preflop(target_total=target)
             return self._safe_aggressive(view, target)
         return self._check_or_fold(view) if category == "bb" else self._fold_or_check(view)
@@ -633,6 +1971,8 @@ class TournamentHybridBot:
         limpers: int,
         bb: int,
         eff_bb: int,
+        context: dict[str, Any],
+        hero_bb: float,
     ) -> Action:
         if raises >= 3:
             core_hit = key in _VS_4BET_CORE
@@ -642,7 +1982,13 @@ class TournamentHybridBot:
             self._trace_preflop(
                 branch="deep_vs_4bet",
                 range_hit=hit,
+                base_range_hit=hit,
                 target_total=target if hit else None,
+                spot_type="4bet_continue",
+                pure_chipEV_action="raise" if hit else "fold",
+                phase4_action="raise" if hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb),
                 reason="deep stack 4bet continue",
             )
             return self._safe_aggressive(view, target) if hit else self._fold_or_check(view)
@@ -655,7 +2001,13 @@ class TournamentHybridBot:
                 self._trace_preflop(
                     branch="deep_vs_3bet_value",
                     range_hit=True,
+                    base_range_hit=True,
                     target_total=target,
+                    spot_type="4bet_value",
+                    pure_chipEV_action="raise",
+                    phase4_action="raise",
+                    future_edge_tax=0.0,
+                    **self._stack_state_trace(view, context, hero_bb, eff_bb),
                     reason="premium 4bet or jam versus 3bet",
                 )
                 return self._safe_aggressive(view, target)
@@ -663,6 +2015,12 @@ class TournamentHybridBot:
             self._trace_preflop(
                 branch="deep_vs_3bet_flat" if flat_hit else "deep_vs_3bet_fold",
                 range_hit=flat_hit,
+                base_range_hit=flat_hit,
+                spot_type="vs_3bet",
+                pure_chipEV_action="call" if flat_hit else "fold",
+                phase4_action="call" if flat_hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb),
                 reason="flat narrow range versus 3bet",
             )
             return self._call_or_fold(view) if flat_hit else self._fold_or_check(view)
@@ -670,14 +2028,37 @@ class TournamentHybridBot:
         if raises == 1:
             opener_cat = self._opener_category(view, n_players)
             value_range = _VALUE_3BET_RANGES[self.config.name].get(opener_cat, _PREMIUM_3BET)
-            if key in value_range:
+            pressure = self._pressure_weight(
+                view,
+                context.get("rank_ctx") or self._rank_context(view),
+                hero_bb,
+                eff_bb,
+                [self._opener_pid(view)],
+            )
+            nudge = self._pressure_nudge(self.config.name, "threebet", pressure, "threebet")
+            threebet_hit, range_trace = self._range_hit_with_nudges(
+                view,
+                key,
+                value_range,
+                _PRESSURE_3BET_EXPANSION.get(opener_cat, frozenset()),
+                f"deep_threebet_{opener_cat}",
+                [nudge],
+                {"family": "threebet", "max_pct": 1.0},
+            )
+            if threebet_hit:
                 target = self._threebet_total(view, bb, opener_cat, category)
                 if eff_bb <= 30 or self._commits_fraction(view, target, 0.30):
                     target = self._jam_total(view)
                 self._trace_preflop(
                     branch=f"deep_value_3bet_vs_{opener_cat}",
-                    range_hit=True,
+                    **range_trace,
                     target_total=target,
+                    spot_type="3bet",
+                    pressure_weight=round(pressure, 4),
+                    pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+                    phase4_action="raise",
+                    future_edge_tax=0.0,
+                    **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                     reason="value 3bet versus open",
                 )
                 return self._safe_aggressive(view, target)
@@ -691,18 +2072,51 @@ class TournamentHybridBot:
             self._trace_preflop(
                 branch=f"deep_flat_vs_{opener_cat}" if flat_hit else f"deep_fold_vs_{opener_cat}",
                 range_hit=flat_hit,
+                base_range_hit=flat_hit,
+                spot_type="flat_vs_open",
+                pressure_weight=round(pressure, 4),
+                pure_chipEV_action="call" if flat_hit else "fold",
+                phase4_action="call" if flat_hit else "fold",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                 reason="flat call-set versus open",
             )
             return self._call_or_fold(view) if flat_hit else self._fold_or_check(view)
 
         if limpers:
-            return self._limped_pot_action(view, key, category, bb, limpers, eff_bb)
+            return self._limped_pot_action(view, key, category, bb, limpers, eff_bb, context, hero_bb)
 
         rfi_range = _RFI_RANGES[self.config.name].get(strategy_category, frozenset())
-        hit = key in rfi_range
+        pressure = self._pressure_weight(
+            view,
+            context.get("rank_ctx") or self._rank_context(view),
+            hero_bb,
+            eff_bb,
+            getattr(view, "acting_opponents", None) or getattr(view, "opponents", None) or [],
+        )
+        nudge = self._pressure_nudge(
+            self.config.name,
+            self._rfi_pressure_spot(view, category, strategy_category),
+            pressure,
+        )
+        hit, range_trace = self._range_hit_with_nudges(
+            view,
+            key,
+            rfi_range,
+            _PRESSURE_RFI_EXPANSION.get(strategy_category, _PRESSURE_RFI_EXPANSION.get(category, frozenset())),
+            "deep_rfi",
+            [nudge],
+            {"family": "default", "max_pct": 1.0},
+        )
         self._trace_preflop(
             branch="deep_rfi",
-            range_hit=hit,
+            **range_trace,
+            spot_type="steal" if category in ("late", "sb") else "open",
+            pressure_weight=round(pressure, 4),
+            pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+            phase4_action="raise" if hit else "fold",
+            future_edge_tax=0.0,
+            **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
             reason="deep stack open/fold",
         )
         if hit and self._can_open_from_here(view, category, n_players, bb):
@@ -719,16 +2133,41 @@ class TournamentHybridBot:
         bb: int,
         limpers: int,
         eff_bb: int,
+        context: dict[str, Any],
+        hero_bb: float,
     ) -> Action:
-        iso_hit = key in _ISO_VALUE
+        pressure = self._pressure_weight(
+            view,
+            context.get("rank_ctx") or self._rank_context(view),
+            hero_bb,
+            eff_bb,
+            self._limper_pids(view),
+        )
+        base_iso = _ISO_VALUE
         if eff_bb <= 15:
-            iso_hit = key in _ISO_VALUE_SHORT
+            base_iso = _ISO_VALUE_SHORT
+        nudge = self._pressure_nudge(self.config.name, "iso", pressure)
+        iso_hit, range_trace = self._range_hit_with_nudges(
+            view,
+            key,
+            base_iso,
+            _PRESSURE_ISO_EXPANSION,
+            "deep_iso",
+            [nudge],
+            {"family": "default", "max_pct": 1.0},
+        )
         if iso_hit:
             target = self._jam_total(view) if eff_bb <= 15 else self._iso_total(bb, eff_bb, category, limpers)
             self._trace_preflop(
                 branch="deep_iso_limpers",
-                range_hit=True,
+                **range_trace,
                 target_total=target,
+                spot_type="iso",
+                pressure_weight=round(pressure, 4),
+                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
+                phase4_action="raise",
+                future_edge_tax=0.0,
+                **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
                 reason="value iso versus limpers",
             )
             return self._safe_aggressive(view, target)
@@ -737,6 +2176,13 @@ class TournamentHybridBot:
         self._trace_preflop(
             branch="deep_overlimp" if overlimp_hit else "deep_limped_fold_or_check",
             range_hit=overlimp_hit,
+            base_range_hit=overlimp_hit,
+            spot_type="overlimp",
+            pressure_weight=round(pressure, 4),
+            pure_chipEV_action="call" if overlimp_hit else "fold",
+            phase4_action="call" if overlimp_hit else "fold",
+            future_edge_tax=0.0,
+            **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
             reason="speculative overlimp or blind check",
         )
         if overlimp_hit:
@@ -744,6 +2190,974 @@ class TournamentHybridBot:
         if category == "bb":
             return self._check_or_fold(view)
         return self._fold_or_check(view)
+
+    # ------------------------------------------------------------------
+    # Phase 3: postflop equity and pot odds.
+    # ------------------------------------------------------------------
+    def _postflop_action(self, view: PlayerView, context: dict[str, Any]) -> Action | None:
+        street = getattr(view, "street", None)
+        if street not in _STREET_IDX:
+            return None
+
+        hole = getattr(view, "hole_cards", None) or []
+        board = getattr(view, "board", None) or []
+        legal = self._legal_types(view)
+        n_opp = max(1, len(getattr(view, "opponents", None) or []))
+        pot = self._safe_int(getattr(view, "pot", 0))
+        to_call = self._safe_int(getattr(view, "to_call", 0))
+        si = _STREET_IDX[street]
+        way3 = "hu" if n_opp == 1 else ("3way" if n_opp == 2 else "4plus")
+        way2 = "hu" if n_opp == 1 else "mw"
+        profile = self.config.name
+
+        self._trace_preflop(
+            branch="postflop", street=street, n_opp=n_opp,
+            reason="postflop equity vs pot odds",
+        )
+
+        if not self._valid_postflop_cards(street, hole, board):
+            self._trace_preflop(branch="postflop_no_cards", reason="missing or invalid postflop cards")
+            return self._fold_or_check(view)
+
+        sims = self._sim_budget(view, pot, to_call, n_opp)
+        eq = self._postflop_equity(view, hole, board, n_opp, sims)
+        if eq is None:
+            self._trace_preflop(branch="postflop_equity_error", reason="postflop equity unavailable")
+            return self._fold_or_check(view)
+        self._trace_preflop(equity=round(eq, 4), sims=sims)
+
+        if to_call > 0:
+            return self._postflop_vs_bet(
+                view, eq, pot, to_call, profile, way3, way2, si, n_opp, context, hole, board, legal
+            )
+        return self._postflop_open(
+            view, eq, pot, profile, way3, way2, si, n_opp, context, hole, board, legal
+        )
+
+    def _postflop_vs_bet(
+        self,
+        view: PlayerView,
+        eq: float,
+        pot: int,
+        to_call: int,
+        profile: str,
+        way3: str,
+        way2: str,
+        si: int,
+        n_opp: int,
+        context: dict[str, Any],
+        hole: list,
+        board: list,
+        legal: set[str],
+    ) -> Action:
+        stacks = getattr(view, "stacks", None) or {}
+        hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        call_cost = min(max(0, to_call), max(0, hero_stack)) if hero_stack > 0 else max(0, to_call)
+        denom = pot + call_cost
+        pot_odds = (call_cost / denom) if denom > 0 else 0.0
+        hero_bb = float(context.get("hero_bb", 0.0) or 0.0)
+        if hero_bb <= 0.0:
+            hero_bb = hero_stack / max(1, self._infer_big_blind(view))
+        eff_bb = self._eff_bb(view, context)
+        rank_ctx = context.get("rank_ctx") or self._rank_context(view)
+        players_left = max(2, self._safe_int(rank_ctx.get("players_left")) or self._table_size(view, context))
+        all_in_call = hero_stack > 0 and to_call >= hero_stack
+        commit_frac = (call_cost / max(1, hero_stack)) if hero_stack > 0 else 0.0
+        future_tax = self._future_edge_tax(
+            view,
+            context,
+            hero_bb,
+            eff_bb,
+            commit_frac,
+            players_left,
+            rank_ctx,
+            is_all_in_call=all_in_call,
+        )
+        future_tax = self._p5_relieve_future_tax(
+            view,
+            future_tax,
+            eq=eq,
+            pot_odds=pot_odds,
+            all_in_call=all_in_call,
+        )
+        base_cushion = _CALL_CUSHION.get(profile, _CALL_CUSHION["survival"])[way3][si]
+        hu_weight = self._heads_up_weight(eff_bb) if players_left == 2 else 0.0
+        cushion_deltas: list[dict[str, float]] = []
+        if players_left == 2 and not all_in_call:
+            cushion_deltas.append({
+                "delta": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])["call_cushion"][si],
+                "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+            })
+        cushion = self._apply_call_cushion(base_cushion, cushion_deltas, profile)
+        base_call_req = pot_odds + base_cushion
+        call_req = pot_odds + cushion + future_tax
+        pressure = self._pressure_weight(
+            view,
+            rank_ctx,
+            hero_bb,
+            eff_bb,
+            getattr(view, "opponents", None) or [],
+        )
+        self._trace_preflop(
+            pot_odds=round(pot_odds, 4),
+            pure_chipEV_threshold=round(pot_odds, 4),
+            threshold_before=round(base_call_req, 4),
+            threshold_after=round(call_req, 4),
+            call_cushion_before=round(base_cushion, 4),
+            call_cushion_after=round(cushion, 4),
+            call_req=round(call_req, 4),
+            future_edge_tax=round(future_tax, 4),
+            commit_tax=round(future_tax, 4),
+            spot_type="all_in_call" if all_in_call else "postflop_call",
+            pure_chipEV_action="call" if eq >= pot_odds else "fold",
+            phase3_action="call" if eq >= base_call_req else "fold",
+            pressure_weight=round(pressure, 4),
+            heads_up_weight=round(hu_weight, 4),
+            players_left=players_left,
+            **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure, hu_weight=hu_weight, commit_frac=commit_frac),
+        )
+
+        can_raise = "raise" in legal and self._first_aggressive_spec(view) is not None
+        base_value_raise = self._value_raise_thr(profile, way3, si)
+        value_deltas: list[dict[str, float]] = []
+        if players_left == 2:
+            value_deltas.append({
+                "delta": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])["value_raise"][si],
+                "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+            })
+        value_raise_thr = self._apply_value_threshold(base_value_raise, value_deltas, profile, True)
+        self._trace_preflop(
+            value_threshold_before=round(base_value_raise, 4),
+            value_threshold_after=round(value_raise_thr, 4),
+        )
+
+        if can_raise and eq >= value_raise_thr:
+            target = self._raise_total(pot, to_call, self._sizing(profile, "value", way2, si))
+            self._trace_preflop(branch="postflop_value_raise", target_total=target,
+                                phase4_action="raise",
+                                reason="raise made hand for value")
+            return self._safe_aggressive(view, target)
+
+        if can_raise and si <= 1:
+            lo, hi = _SEMI_BAND[way3][si]
+            if lo <= eq <= hi:
+                base_freq = _SEMI_FREQ.get(profile, _SEMI_FREQ["survival"])[way3][si] \
+                    * self._draw_mult(hole, board)
+                mults = []
+                mults.append({
+                    "mult": _CHIPLEADER_POSTFLOP_MULT.get(profile, _CHIPLEADER_POSTFLOP_MULT["survival"])[way3]["semi"][si],
+                    "weight": pressure,
+                })
+                if players_left == 2:
+                    mults.append({
+                        "mult": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])["semi"][si],
+                        "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+                    })
+                freq = self._apply_freq_nudges(base_freq, mults, profile, "semi")
+                self._trace_preflop(freq_before=round(base_freq, 4), freq_after=round(freq, 4))
+                if self._freq_gate(view, "semibluff_raise", freq):
+                    target = self._raise_total(pot, to_call,
+                                               self._sizing(profile, "semibluff", way2, si))
+                    self._trace_preflop(branch="postflop_semibluff_raise", target_total=target,
+                                        phase4_action="raise",
+                                        reason="semi-bluff raise with draw")
+                    return self._safe_aggressive(view, target)
+
+        if eq >= call_req:
+            self._trace_preflop(branch="postflop_call", phase4_action="call",
+                                reason="equity meets the price")
+            return self._call_or_fold(view)
+
+        self._trace_preflop(branch="postflop_fold", phase4_action="fold",
+                            reason="equity below the price")
+        return self._fold_or_check(view)
+
+    def _postflop_open(
+        self,
+        view: PlayerView,
+        eq: float,
+        pot: int,
+        profile: str,
+        way3: str,
+        way2: str,
+        si: int,
+        n_opp: int,
+        context: dict[str, Any],
+        hole: list,
+        board: list,
+        legal: set[str],
+    ) -> Action:
+        can_bet = self._first_aggressive_spec(view) is not None
+        hero_stack = self._safe_int((getattr(view, "stacks", None) or {}).get(getattr(view, "me", None), 0))
+        hero_bb = float(context.get("hero_bb", 0.0) or 0.0)
+        if hero_bb <= 0.0:
+            hero_bb = hero_stack / max(1, self._infer_big_blind(view))
+        eff_bb = self._eff_bb(view, context)
+        rank_ctx = context.get("rank_ctx") or self._rank_context(view)
+        players_left = max(2, self._safe_int(rank_ctx.get("players_left")) or self._table_size(view, context))
+        pressure = self._pressure_weight(
+            view,
+            rank_ctx,
+            hero_bb,
+            eff_bb,
+            getattr(view, "opponents", None) or [],
+        )
+        hu_weight = self._heads_up_weight(eff_bb) if players_left == 2 else 0.0
+        base_value_thr = self._value_bet_thr(profile, way3, si)
+        value_deltas: list[dict[str, float]] = []
+        if players_left == 2:
+            value_deltas.append({
+                "delta": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])["value_bet"][si],
+                "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+            })
+        value_thr = self._apply_value_threshold(base_value_thr, value_deltas, profile, False)
+        self._trace_preflop(
+            players_left=players_left,
+            pressure_weight=round(pressure, 4),
+            heads_up_weight=round(hu_weight, 4),
+            value_threshold_before=round(base_value_thr, 4),
+            value_threshold_after=round(value_thr, 4),
+            threshold_before=round(base_value_thr, 4),
+            threshold_after=round(value_thr, 4),
+            future_edge_tax=0.0,
+            **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure, hu_weight=hu_weight),
+        )
+
+        if can_bet and eq >= value_thr:
+            target = self._bet_total(pot, self._sizing(profile, "value", way2, si))
+            self._trace_preflop(branch="postflop_value_bet", target_total=target,
+                                spot_type="value_bet",
+                                pure_chipEV_action="bet" if eq >= base_value_thr else "check",
+                                phase4_action="bet",
+                                reason="value bet made hand")
+            return self._safe_aggressive(view, target)
+
+        if can_bet and si <= 1:
+            lo, hi = _SEMI_BAND[way3][si]
+            if lo <= eq <= hi:
+                base_freq = _SEMI_FREQ.get(profile, _SEMI_FREQ["survival"])[way3][si] \
+                    * self._draw_mult(hole, board)
+                mults = [{
+                    "mult": _CHIPLEADER_POSTFLOP_MULT.get(profile, _CHIPLEADER_POSTFLOP_MULT["survival"])[way3]["semi"][si],
+                    "weight": pressure,
+                }]
+                if players_left == 2:
+                    mults.append({
+                        "mult": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])["semi"][si],
+                        "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+                    })
+                freq = self._apply_freq_nudges(base_freq, mults, profile, "semi")
+                self._trace_preflop(
+                    spot_type="semibluff",
+                    pure_chipEV_action="bet" if self._freq_gate(view, "semibluff_bet", base_freq) else "check",
+                    freq_before=round(base_freq, 4),
+                    freq_after=round(freq, 4),
+                )
+                if self._freq_gate(view, "semibluff_bet", freq):
+                    target = self._bet_total(pot, self._sizing(profile, "semibluff", way2, si))
+                    self._trace_preflop(branch="postflop_semibluff_bet", target_total=target,
+                                        phase4_action="bet",
+                                        reason="semi-bluff bet with draw")
+                    return self._safe_aggressive(view, target)
+
+        if can_bet and eq < value_thr:
+            is_pfr = self._last_preflop_raiser(view) == getattr(view, "me", None)
+            if is_pfr:
+                base_freq = _CBET_FREQ.get(profile, _CBET_FREQ["survival"])[way3][si]
+                knob = "cbet"
+            else:
+                base_freq = _BLUFF_FREQ.get(profile, _BLUFF_FREQ["survival"])[way3][si]
+                knob = "bluff"
+            mults = [{
+                "mult": _CHIPLEADER_POSTFLOP_MULT.get(profile, _CHIPLEADER_POSTFLOP_MULT["survival"])[way3][knob][si],
+                "weight": pressure,
+            }]
+            if players_left == 2:
+                mults.append({
+                    "mult": _HU_POSTFLOP.get(profile, _HU_POSTFLOP["survival"])[knob][si],
+                    "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
+                })
+            adjusted_freq = self._apply_freq_nudges(base_freq, mults, profile, knob)
+            board_mult = self._board_bluff_mult(board, n_opp)
+            base_final_freq = base_freq * board_mult
+            freq = adjusted_freq * board_mult
+            freq = self._p5_station_frequency(view, knob, freq)
+            base_gate = self._freq_gate(view, "bluff", base_final_freq)
+            self._trace_preflop(
+                spot_type="cbet" if is_pfr else "bluff",
+                pure_chipEV_action="bet" if base_gate else "check",
+                freq_before=round(base_final_freq, 4),
+                freq_after=round(freq, 4),
+            )
+            if self._freq_gate(view, "bluff", freq):
+                target = self._bet_total(pot, self._sizing(profile, "bluff", way2, si))
+                self._trace_preflop(branch="postflop_cbet" if is_pfr else "postflop_bluff",
+                                    target_total=target, phase4_action="bet",
+                                    reason="bluff / continuation bet")
+                return self._safe_aggressive(view, target)
+
+        self._trace_preflop(branch="postflop_check", phase4_action="check",
+                            reason="check, no profitable bet")
+        return self._check_or_fold(view)
+
+    def _postflop_equity(self, view: PlayerView, hole: list, board: list,
+                         n_opp: int, sims: int) -> float | None:
+        """Seeded Monte Carlo equity so the same spot is reproducible.
+
+        The global ``random`` state is saved and restored so the engine's own
+        RNG stream is never disturbed by our seeding.
+        """
+        seed = self._stable_hash(view, "equity") & 0x7FFFFFFF
+        state = _random.getstate()
+        try:
+            _random.seed(seed)
+            return float(_mc_equity(hole, board, max(1, n_opp), n_sims=max(1, int(sims))))
+        except Exception:
+            return None
+        finally:
+            _random.setstate(state)
+
+    @staticmethod
+    def _valid_postflop_cards(street: str, hole: list, board: list) -> bool:
+        expected_board = {"flop": 3, "turn": 4, "river": 5}.get(street)
+        if expected_board is None:
+            return False
+        if len(hole or []) != 2 or len(board or []) != expected_board:
+            return False
+        seen: set[tuple[str, str]] = set()
+        for card in list(hole or []) + list(board or []):
+            try:
+                rank, suit = card[0], card[1]
+            except (TypeError, IndexError):
+                return False
+            if rank not in _RANK_INDEX or suit not in _SUITS:
+                return False
+            key = (rank, suit)
+            if key in seen:
+                return False
+            seen.add(key)
+        return True
+
+    def _sim_budget(self, view: PlayerView, pot: int, to_call: int, n_opp: int) -> int:
+        stacks = getattr(view, "stacks", None) or {}
+        hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        cap = self.postflop_sim_cap
+        if hero_stack > 0:
+            if to_call >= hero_stack or to_call >= 0.35 * hero_stack:
+                return min(cap, self.postflop_allin_sims)
+            if to_call >= 0.20 * hero_stack:
+                return min(cap, self.postflop_big_sims)
+        bb = max(1, self._infer_big_blind(view))
+        if pot >= 12 * bb:
+            return min(cap, self.postflop_big_sims)
+        return min(cap, self.postflop_base_sims)
+
+    # ------------------------------------------------------------------
+    # Phase 4: tournament stack context and bounded nudges.
+    # ------------------------------------------------------------------
+    def _rank_context(self, view: PlayerView) -> DecisionTrace:
+        hand_id = getattr(view, "hand_id", None)
+        if hand_id is not None and hand_id in self._rank_cache:
+            return dict(self._rank_cache[hand_id])
+
+        ctx = self._rank_context_uncached(view)
+        if hand_id is not None:
+            self._rank_cache[hand_id] = dict(ctx)
+        return ctx
+
+    def _rank_context_uncached(self, view: PlayerView) -> DecisionTrace:
+        stacks = getattr(view, "stacks", None) or {}
+        hero = getattr(view, "me", None)
+        hero_stack = self._safe_int(stacks.get(hero, 0))
+        all_in_opponents = set(getattr(view, "all_in_opponents", None) or [])
+        alive: list[tuple[Any, int]] = []
+        seen_alive: set[Any] = set()
+        for pid, stack in stacks.items():
+            stack_value = self._safe_int(stack)
+            if stack_value > 0 or pid in all_in_opponents:
+                alive.append((pid, stack_value))
+                seen_alive.add(pid)
+        for pid in all_in_opponents:
+            if pid not in seen_alive:
+                alive.append((pid, 0))
+                seen_alive.add(pid)
+        if hero_stack > 0 and hero not in seen_alive:
+            alive.append((hero, hero_stack))
+        if not alive:
+            return {
+                "bucket": "middle",
+                "rank": 1,
+                "raw_rank": 1,
+                "players_left": 1,
+                "hero_stack": hero_stack,
+                "avg_stack": max(1, hero_stack),
+                "avg_ratio": 1.0,
+                "median_ratio": 1.0,
+                "leader_ratio": 1.0,
+                "chip_share": 1.0,
+                "cover_count": 0,
+                "cover_ratio": 0.0,
+            }
+
+        amounts = sorted((stack for _, stack in alive), reverse=True)
+        players_left = len(amounts)
+        total = max(1, sum(amounts))
+        avg = total / players_left
+        median = amounts[players_left // 2] if players_left % 2 else (
+            (amounts[players_left // 2 - 1] + amounts[players_left // 2]) / 2.0
+        )
+        leader = max(1, amounts[0])
+        second = amounts[1] if players_left > 1 else amounts[0]
+        tie_tol = 0.05
+        raw_rank = 1 + sum(1 for stack in amounts if stack > hero_stack)
+        rank = 1 + sum(1 for stack in amounts if stack > hero_stack * (1.0 + tie_tol))
+        opponents = [
+            (pid, stack)
+            for pid, stack in alive
+            if pid != hero
+        ]
+        cover_count = sum(1 for _, stack in opponents if hero_stack > stack)
+        opp_count = max(1, players_left - 1)
+        avg_ratio = hero_stack / avg if avg > 0 else 1.0
+        median_ratio = hero_stack / median if median > 0 else 1.0
+        leader_ratio = hero_stack / leader if leader > 0 else 1.0
+        chip_share = hero_stack / total if total > 0 else 0.0
+        cover_ratio = cover_count / opp_count
+
+        if players_left == 2:
+            villain_stack = opponents[0][1] if opponents else hero_stack
+            if abs(hero_stack - villain_stack) <= max(hero_stack, villain_stack) * tie_tol:
+                bucket = "hu_even"
+            elif hero_stack > villain_stack:
+                bucket = "hu_leader"
+            else:
+                bucket = "hu_trailer"
+        else:
+            lead_avg_cut = 1.10 if players_left <= 3 else 1.20
+            ahead_second = hero_stack >= second * 1.05 if players_left > 1 else True
+            if rank == 1 and avg_ratio >= lead_avg_cut and ahead_second:
+                bucket = "chip_leader"
+            elif rank <= 2 and (avg_ratio >= 0.95 or cover_count >= (opp_count + 1) // 2):
+                bucket = "top_2"
+            else:
+                if players_left <= 3:
+                    short_rank = rank == players_left and (
+                        avg_ratio <= 0.80 or leader_ratio <= 0.65
+                    )
+                elif players_left == 4:
+                    short_rank = rank == 4 and (
+                        avg_ratio <= 0.75 or median_ratio <= 0.70 or leader_ratio <= 0.35
+                    )
+                else:
+                    short_rank = rank >= players_left - 1 and (
+                        avg_ratio <= 0.75 or median_ratio <= 0.70 or leader_ratio <= 0.35
+                    )
+                bucket = "short_stack" if short_rank else "middle"
+
+        return {
+            "bucket": bucket,
+            "rank": rank,
+            "raw_rank": raw_rank,
+            "players_left": players_left,
+            "hero_stack": hero_stack,
+            "avg_stack": round(avg, 3),
+            "avg_ratio": round(avg_ratio, 4),
+            "median_ratio": round(median_ratio, 4),
+            "leader_ratio": round(leader_ratio, 4),
+            "chip_share": round(chip_share, 4),
+            "cover_count": cover_count,
+            "cover_ratio": round(cover_ratio, 4),
+        }
+
+    @staticmethod
+    def _rank_weight(hero_bb: float, eff_bb: float) -> float:
+        return _clamp((min(float(hero_bb), float(eff_bb)) - 10.0) / 20.0)
+
+    @staticmethod
+    def _cover_weight(hero_stack: int, villain_stacks: list[int]) -> float:
+        live = [max(0, int(stack)) for stack in villain_stacks if int(stack) > 0]
+        if not live or hero_stack <= 0:
+            return 0.0
+        covered = sum(1 for stack in live if hero_stack > stack)
+        ratio = covered / len(live)
+        if ratio >= 1.0:
+            return 1.0
+        if ratio >= 2.0 / 3.0:
+            return 0.70
+        if ratio >= 0.50:
+            return 0.40
+        return 0.0
+
+    def _pressure_weight(
+        self,
+        view: PlayerView,
+        rank_ctx: dict[str, Any],
+        hero_bb: float,
+        eff_bb: float,
+        relevant_villains: list[Any] | tuple[Any, ...] | None = None,
+    ) -> float:
+        if hero_bb <= 12.0:
+            return 0.0
+        bucket = str(rank_ctx.get("bucket", "middle"))
+        bucket_weight = _RANK_BUCKET_WEIGHT.get(bucket, 0.0)
+        if bucket_weight <= 0.0:
+            return 0.0
+
+        stacks = getattr(view, "stacks", None) or {}
+        hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        villains = list(relevant_villains or getattr(view, "acting_opponents", None) or getattr(view, "opponents", None) or [])
+        villain_stacks = [
+            self._safe_int(stacks.get(pid, 0))
+            for pid in villains
+            if pid != getattr(view, "me", None) and self._safe_int(stacks.get(pid, 0)) > 0
+        ]
+        if not villain_stacks:
+            villain_stacks = [
+                self._safe_int(stack)
+                for pid, stack in stacks.items()
+                if pid != getattr(view, "me", None) and self._safe_int(stack) > 0
+            ]
+        cover = self._cover_weight(hero_stack, villain_stacks)
+        if cover <= 0.0:
+            return 0.0
+
+        players_left = max(2, self._safe_int(rank_ctx.get("players_left")) or self._table_size(view))
+        avg_share = 1.0 / players_left
+        chip_share = float(rank_ctx.get("chip_share", 0.0) or 0.0)
+        chip_share_weight = _clamp((chip_share - avg_share) / max(avg_share, 0.01))
+        if bucket == "top_2":
+            chip_share_weight = max(chip_share_weight, 0.35)
+
+        bb = max(1, self._infer_big_blind(view))
+        covered_short = any(hero_stack > stack and (stack / bb) <= 12.0 for stack in villain_stacks)
+        depth_gate = self._rank_weight(hero_bb, eff_bb)
+        if covered_short:
+            depth_gate = max(depth_gate, 0.65)
+
+        max_villain = max(villain_stacks) if villain_stacks else 0
+        cover_margin = _clamp(((hero_stack / max(1, max_villain)) - 1.0) / 0.75)
+        cover_quality = max(0.45, cover_margin) if hero_stack > max_villain else cover
+        scale = float(self.config.chipleader_pressure_scale or 1.0)
+        return _clamp(bucket_weight * cover * cover_quality * depth_gate * max(chip_share_weight, 0.30) * scale)
+
+    @staticmethod
+    def _short_weight(hero_bb: float) -> float:
+        hero_bb = float(hero_bb)
+        if hero_bb <= 4.0:
+            return 1.0
+        if hero_bb >= 16.0:
+            return 0.0
+        return _clamp((16.0 - hero_bb) / 12.0)
+
+    @staticmethod
+    def _heads_up_weight(eff_bb: float) -> float:
+        return _clamp((float(eff_bb) - 8.0) / 17.0)
+
+    def _urgency_bonus(self, hero_bb: float) -> float:
+        # Telemetry-only in Phase 4 preflop; range widening is the mechanism.
+        max_bonus = 0.020 if self.config.name == "survival" else 0.030
+        return round(max_bonus * self._short_weight(hero_bb), 4)
+
+    def _m_ratio(self, view: PlayerView, hero_stack: int | None = None) -> float:
+        bb = max(1, self._infer_big_blind(view))
+        if hero_stack is None:
+            stacks = getattr(view, "stacks", None) or {}
+            hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        return hero_stack / max(1.0, 1.5 * bb)
+
+    @staticmethod
+    def _hands_until_blind_up(view: PlayerView) -> int:
+        schedule = getattr(view, "blind_increase_every", None)
+        if schedule is None:
+            schedule = 50
+        try:
+            schedule = int(schedule)
+        except (TypeError, ValueError):
+            schedule = 50
+        if schedule <= 0:
+            return 10**9
+        try:
+            hand_id = int(getattr(view, "hand_id", 0) or 0)
+        except (TypeError, ValueError):
+            return schedule
+        remainder = hand_id % schedule
+        return schedule if remainder == 0 else schedule - remainder
+
+    def _short_desperation_nudge(self, view: PlayerView, hero_bb: float) -> dict[str, float]:
+        rows = _SHORT_DESPERATION.get(self.config.name, _SHORT_DESPERATION["survival"])
+        rel = 0.0
+        abs_pp = 0.0
+        for top, row_rel, row_abs in rows:
+            if hero_bb <= top:
+                rel = row_rel
+                abs_pp = row_abs
+                break
+        if rel <= 0.0 and abs_pp <= 0.0:
+            return {"rel": 0.0, "abs": 0.0, "weight": 0.0, "family": "shove"}
+
+        stacks = getattr(view, "stacks", None) or {}
+        hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        m_ratio = self._m_ratio(view, hero_stack)
+        m_factor = 1.15 if m_ratio <= 4.0 else (1.08 if m_ratio <= 6.0 else 1.0)
+        clock = self._hands_until_blind_up(view)
+        clock_factor = 1.20 if clock <= 5 else (1.10 if clock <= 10 else 1.0)
+        scale = float(self.config.desperation_scale or 1.0)
+        weight = _clamp(self._short_weight(hero_bb) * m_factor * clock_factor * scale, 0.0, 1.25)
+        return {"rel": rel, "abs": abs_pp, "weight": weight, "family": "shove"}
+
+    def _apply_range_nudges(
+        self,
+        base_pct: float,
+        nudges: list[dict[str, float]] | tuple[dict[str, float], ...],
+        profile: str,
+        ceiling: Any,
+    ) -> float:
+        family = "default"
+        max_pct = 1.0
+        if isinstance(ceiling, dict):
+            family = str(ceiling.get("family", family))
+            max_pct = float(ceiling.get("max_pct", max_pct))
+        elif isinstance(ceiling, str):
+            family = ceiling
+        elif ceiling is not None:
+            try:
+                max_pct = float(ceiling)
+            except (TypeError, ValueError):
+                max_pct = 1.0
+
+        raw_delta = 0.0
+        for nudge in nudges or []:
+            if not isinstance(nudge, dict):
+                continue
+            rel = max(0.0, float(nudge.get("rel", 0.0) or 0.0))
+            abs_pp = max(0.0, float(nudge.get("abs", 0.0) or 0.0))
+            weight = max(0.0, float(nudge.get("weight", 1.0) or 0.0))
+            raw_delta += min(max(0.0, base_pct) * rel, abs_pp) * weight
+            family = str(nudge.get("family", family))
+
+        cap_rel, cap_abs = _RANGE_GEAR_CAPS.get(profile, _RANGE_GEAR_CAPS["survival"]).get(
+            family,
+            _RANGE_GEAR_CAPS.get(profile, _RANGE_GEAR_CAPS["survival"])["default"],
+        )
+        capped_delta = min(raw_delta, max(0.0, base_pct) * cap_rel, cap_abs)
+        return _clamp(max(0.0, base_pct) + capped_delta, 0.0, max(0.0, min(1.0, max_pct)))
+
+    def _apply_freq_nudges(
+        self,
+        base_freq: float,
+        mults: list[dict[str, float]] | tuple[dict[str, float], ...],
+        profile: str,
+        knob_name: str,
+    ) -> float:
+        freq = _clamp(base_freq)
+        for mult in mults or []:
+            if not isinstance(mult, dict):
+                continue
+            target_mult = float(mult.get("mult", 1.0) or 1.0)
+            weight = max(0.0, float(mult.get("weight", 1.0) or 0.0))
+            freq *= max(0.0, 1.0 + (target_mult - 1.0) * weight)
+        caps = _FREQ_GEAR_CAPS.get(profile, _FREQ_GEAR_CAPS["survival"])
+        ceiling = _FREQ_CEILINGS.get(profile, _FREQ_CEILINGS["survival"]).get(knob_name, 1.0)
+        max_freq = min(base_freq * caps["mult"], base_freq + caps["abs"], ceiling)
+        return _clamp(freq, 0.0, max_freq)
+
+    def _apply_call_cushion(
+        self,
+        base: float,
+        deltas: list[dict[str, float]] | tuple[dict[str, float], ...],
+        profile: str,
+    ) -> float:
+        value = float(base)
+        for delta in deltas or []:
+            if not isinstance(delta, dict):
+                continue
+            value += float(delta.get("delta", 0.0) or 0.0) * max(0.0, float(delta.get("weight", 1.0) or 0.0))
+        max_reduction = 0.035 if profile == "aggro" else 0.025
+        max_increase = 0.020
+        return _clamp(value, max(0.0, base - max_reduction), min(0.30, base + max_increase))
+
+    def _apply_value_threshold(
+        self,
+        base: float,
+        deltas: list[dict[str, float]] | tuple[dict[str, float], ...],
+        profile: str,
+        is_raise: bool,
+    ) -> float:
+        value = float(base)
+        for delta in deltas or []:
+            if not isinstance(delta, dict):
+                continue
+            value += float(delta.get("delta", 0.0) or 0.0) * max(0.0, float(delta.get("weight", 1.0) or 0.0))
+        max_reduction = 0.030 if profile == "aggro" else 0.020
+        if is_raise:
+            max_reduction *= 0.80
+        return _clamp(value, max(0.35, base - max_reduction), min(0.95, base + 0.020))
+
+    def _future_edge_tax(
+        self,
+        view: PlayerView,
+        ctx: dict[str, Any],
+        hero_bb: float,
+        eff_bb: float,
+        commit_frac: float,
+        players_left: int,
+        rank: dict[str, Any] | str | None,
+        *,
+        is_all_in_call: bool = False,
+    ) -> float:
+        if commit_frac < 0.25 or hero_bb <= 10.0:
+            return 0.0
+        profile = self.config.name
+        cap_table = _FUTURE_EDGE_TAX_CAPS.get(profile, _FUTURE_EDGE_TAX_CAPS["survival"])
+        capped_players = max(2, min(6, int(players_left or 2)))
+        cap = cap_table.get(capped_players, cap_table.get(6, 0.0))
+        if players_left >= 6:
+            cap = cap_table.get(6, cap)
+        if self.future_edge_tax_cap_override is not None:
+            cap = min(cap, max(0.0, float(self.future_edge_tax_cap_override)))
+        if is_all_in_call:
+            cap = min(cap, 0.010 if profile == "survival" else 0.004)
+        if players_left == 2:
+            cap = min(cap, 0.008 if profile == "survival" else 0.003)
+            depth_factor = _clamp((float(eff_bb) - 12.0) / 28.0)
+        else:
+            depth_factor = _clamp((min(float(hero_bb), float(eff_bb)) - 12.0) / 28.0)
+        if cap <= 0.0 or depth_factor <= 0.0:
+            return 0.0
+
+        commit_factor = _clamp((float(commit_frac) - 0.25) / 0.50)
+        bust_factor = 1.0 if commit_frac >= 1.0 else _clamp((float(commit_frac) - 0.50) / 0.50)
+        if hero_bb <= 16.0:
+            depth_factor *= 0.25
+        tax = cap * depth_factor * commit_factor * max(0.35, bust_factor)
+        tax *= float(self.config.future_edge_tax_scale or 1.0)
+        return round(_clamp(tax, 0.0, cap), 4)
+
+    @staticmethod
+    def _range_pct(hands: frozenset[str] | set[str]) -> float:
+        return _clamp(len(hands or ()) / _RANGE_DENOM)
+
+    def _range_hit_with_nudges(
+        self,
+        view: PlayerView,
+        key: str,
+        base_range: frozenset[str],
+        expansion_range: frozenset[str],
+        spot: str,
+        nudges: list[dict[str, float]],
+        ceiling: Any,
+    ) -> tuple[bool, DecisionTrace]:
+        base_hit = key in base_range
+        base_pct = self._range_pct(base_range)
+        target_pct = self._apply_range_nudges(base_pct, nudges, self.config.name, ceiling)
+        candidates = frozenset(expansion_range or frozenset()) - frozenset(base_range or frozenset())
+        candidate_pct = self._range_pct(candidates)
+        admit_freq = 0.0
+        nudge_pp = max(0.0, target_pct - base_pct)
+        if candidate_pct > 0.0 and nudge_pp > 0.0:
+            admit_freq = _clamp(nudge_pp / candidate_pct)
+        expansion_hit = (
+            not base_hit
+            and key in candidates
+            and self._freq_gate(view, f"{spot}_range_expand", admit_freq)
+        )
+        return base_hit or expansion_hit, {
+            "base_range_hit": base_hit,
+            "range_hit": base_hit or expansion_hit,
+            "range_expansion_hit": expansion_hit,
+            "range_base_pct": round(base_pct, 4),
+            "range_after_pct": round(target_pct, 4),
+            "range_nudge_pp": round(nudge_pp, 4),
+            "range_admit_freq": round(admit_freq, 4),
+        }
+
+    def _rfi_pressure_spot(self, view: PlayerView, category: str, strategy_category: str) -> str:
+        if strategy_category == "heads_up":
+            return "btn_steal"
+        tag = str(getattr(view, "position", "") or "").strip().upper()
+        if category == "sb":
+            return "sb_steal"
+        if tag == "BTN":
+            return "btn_steal"
+        if tag == "CO":
+            return "late_open"
+        if category == "late":
+            return "late_open"
+        if category == "middle":
+            return "middle_open"
+        return "early_open"
+
+    @staticmethod
+    def _pressure_nudge(profile: str, spot: str, weight: float, family: str = "default") -> dict[str, float]:
+        rel, abs_pp = _CHIPLEADER_PREFLOP.get(profile, _CHIPLEADER_PREFLOP["survival"]).get(spot, (0.0, 0.0))
+        return {"rel": rel, "abs": abs_pp, "weight": _clamp(weight), "family": family}
+
+    def _limper_pids(self, view: PlayerView) -> list[Any]:
+        pids: list[Any] = []
+        for entry in getattr(view, "history", None) or []:
+            if not isinstance(entry, dict) or entry.get("street") != "preflop":
+                continue
+            if entry.get("type") == "raise":
+                break
+            if entry.get("type") == "call":
+                pids.append(entry.get("pid"))
+        return [pid for pid in pids if pid is not None]
+
+    def _opener_pid(self, view: PlayerView) -> Any:
+        for entry in getattr(view, "history", None) or []:
+            if isinstance(entry, dict) and entry.get("street") == "preflop" and entry.get("type") == "raise":
+                return entry.get("pid")
+        return None
+
+    def _stack_state_trace(
+        self,
+        view: PlayerView,
+        context: dict[str, Any],
+        hero_bb: float,
+        eff_bb: float,
+        pressure_weight: float = 0.0,
+        short_weight: float | None = None,
+        hu_weight: float = 0.0,
+        commit_frac: float = 0.0,
+    ) -> DecisionTrace:
+        rank_ctx = context.get("rank_ctx") or self._rank_context(view)
+        stacks = getattr(view, "stacks", None) or {}
+        hero_stack = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+        return {
+            "stack_state": {
+                "bucket": rank_ctx.get("bucket"),
+                "rank": rank_ctx.get("rank"),
+                "players_left": rank_ctx.get("players_left"),
+                "hero_stack": hero_stack,
+                "hero_bb": round(float(hero_bb), 3),
+                "eff_bb": round(float(eff_bb), 3),
+                "m_ratio": round(self._m_ratio(view, hero_stack), 3),
+                "hands_until_blind_up": self._hands_until_blind_up(view),
+                "pressure_weight": round(float(pressure_weight), 4),
+                "short_weight": round(self._short_weight(hero_bb) if short_weight is None else short_weight, 4),
+                "heads_up_weight": round(float(hu_weight), 4),
+                "commit_frac": round(float(commit_frac), 4),
+            }
+        }
+
+    @staticmethod
+    def _value_raise_thr(profile: str, way3: str, si: int) -> float:
+        table = _VALUE_RAISE.get(profile, _VALUE_RAISE["survival"])
+        base = table["hu"][si] if way3 == "hu" else table["mw"][si]
+        return base + (0.03 if way3 == "4plus" else 0.0)
+
+    @staticmethod
+    def _value_bet_thr(profile: str, way3: str, si: int) -> float:
+        table = _VALUE_BET.get(profile, _VALUE_BET["survival"])
+        base = table["hu"][si] if way3 == "hu" else table["mw"][si]
+        return base + (0.03 if way3 == "4plus" else 0.0)
+
+    @staticmethod
+    def _sizing(profile: str, category: str, way2: str, si: int) -> float:
+        try:
+            return _SIZING[profile][category][way2][si]
+        except (KeyError, IndexError):
+            return 0.6
+
+    @staticmethod
+    def _bet_total(pot: int, frac: float) -> int:
+        return max(1, int(round(frac * max(0, pot))))
+
+    @staticmethod
+    def _raise_total(pot: int, to_call: int, frac: float) -> int:
+        pot_after_call = max(0, pot) + max(0, to_call)
+        return max(1, int(round(max(0, to_call) + frac * pot_after_call)))
+
+    def _freq_gate(self, view: PlayerView, salt: str, freq: float) -> bool:
+        """Deterministic frequency gate keyed on the exact spot (no global RNG)."""
+        try:
+            f = float(freq)
+        except (TypeError, ValueError):
+            return False
+        if f <= 0.0:
+            return False
+        if f >= 1.0:
+            return True
+        return (self._stable_hash(view, salt) % 100000) / 100000.0 < f
+
+    def _stable_hash(self, view: PlayerView, salt: str) -> int:
+        """FNV-1a over stable spot features; stable across processes."""
+        key = "|".join(str(part) for part in (
+            getattr(view, "hand_id", None),
+            getattr(view, "hole_cards", None) or [],
+            getattr(view, "board", None) or [],
+            getattr(view, "street", None),
+            self._safe_int(getattr(view, "pot", 0)),
+            self._safe_int(getattr(view, "to_call", 0)),
+            salt,
+        ))
+        h = 2166136261
+        for ch in key:
+            h ^= ord(ch)
+            h = (h * 16777619) & 0xFFFFFFFF
+        return h
+
+    @staticmethod
+    def _draw_mult(hole: list, board: list) -> float:
+        return 1.25 if TournamentHybridBot._draw_category(hole, board) in ("flush", "oeso") else 1.0
+
+    @staticmethod
+    def _draw_category(hole: list, board: list) -> str:
+        """Lightweight flush-/straight-draw detector for semi-bluff weighting."""
+        try:
+            hole = list(hole or [])
+            cards = [
+                (c[0], c[1]) for c in hole + list(board or [])
+                if c and len(c) >= 2 and c[0] in _RANK_INDEX
+            ]
+            if len(cards) < 4:
+                return "none"
+            hero_suits = set(c[1] for c in hole if c and len(c) >= 2)
+            suit_counts: dict[str, int] = {}
+            for _, s in cards:
+                suit_counts[s] = suit_counts.get(s, 0) + 1
+            for s, cnt in suit_counts.items():
+                if cnt == 4 and s in hero_suits:
+                    return "flush"
+            ranks = set(_RANK_INDEX[r] for r, _ in cards)
+            if 12 in ranks:  # Ace also plays low for the wheel.
+                ranks.add(-1)
+            oeso = False
+            gutshot = False
+            for low in range(-1, 9):
+                present = sum(1 for k in range(5) if (low + k) in ranks)
+                if present < 4:
+                    continue
+                run4 = any(all((start + k) in ranks for k in range(4))
+                           for start in (low, low + 1))
+                if run4:
+                    oeso = True
+                else:
+                    gutshot = True
+            if oeso:
+                return "oeso"
+            if gutshot:
+                return "gutshot"
+            return "none"
+        except Exception:
+            return "none"
+
+    @staticmethod
+    def _board_bluff_mult(board: list, n_opp: int) -> float:
+        """Cut pure-bluff frequency on wet boards multiway."""
+        try:
+            if n_opp < 2:
+                return 1.0
+            cards = [c for c in (board or []) if c and len(c) >= 2 and c[0] in _RANK_INDEX]
+            suit_counts: dict[str, int] = {}
+            for _, s in cards:
+                suit_counts[s] = suit_counts.get(s, 0) + 1
+            monotone = any(cnt >= 3 for cnt in suit_counts.values())
+            ranks = sorted(set(_RANK_INDEX[r] for r, _ in cards))
+            connected = len(ranks) >= 3 and (ranks[-1] - ranks[0]) <= 4
+            return 0.5 if (monotone or connected) else 1.0
+        except Exception:
+            return 1.0
 
     @staticmethod
     def _legal_specs(view: PlayerView) -> list[dict[str, Any]]:
@@ -843,25 +3257,30 @@ class TournamentHybridBot:
                 return Action(action_type)
         return Action("fold")
 
-    @classmethod
-    def _context(cls, view: PlayerView) -> dict[str, Any]:
+    def _context(self, view: PlayerView) -> dict[str, Any]:
         stacks = getattr(view, "stacks", None) or {}
         opponents = list(getattr(view, "opponents", None) or [])
         hero = getattr(view, "me", None)
-        hero_stack = cls._safe_int(stacks.get(hero, 0))
+        hero_stack = self._safe_int(stacks.get(hero, 0))
         opponent_stacks = [
-            cls._safe_int(stacks.get(pid, 0))
+            self._safe_int(stacks.get(pid, 0))
             for pid in opponents
+            if self._safe_int(stacks.get(pid, 0)) > 0
         ]
         effective_stack = (
             min(hero_stack, max(opponent_stacks))
             if opponent_stacks
             else hero_stack
         )
+        rank_ctx = self._rank_context(view)
+        bb = max(1, self._infer_big_blind(view))
         return {
-            "players_remaining": 1 + len(opponents),
+            "players_remaining": max(1, self._safe_int(rank_ctx.get("players_left")) or (1 + len(opponents))),
             "position": getattr(view, "position", None),
+            "hero_stack": hero_stack,
             "effective_stack": effective_stack,
+            "hero_bb": hero_stack / bb,
+            "rank_ctx": rank_ctx,
         }
 
     @classmethod

@@ -176,6 +176,7 @@ def run_tournament(
                 on_event=None,
                 log_decisions=log_decisions,
                 ante=hand_ante,
+                blind_increase_every=blind_increase_every,
             )
 
             if dealer_rotation == "full_table":

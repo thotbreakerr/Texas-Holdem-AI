@@ -26,6 +26,7 @@ class PlayerView:
     seat_indices: Optional[Dict[str, int]] = None
     acting_opponents: Optional[List[str]] = None
     all_in_opponents: Optional[List[str]] = None
+    blind_increase_every: Optional[int] = None
 
 class BotAdapter:
     def act(self, view: PlayerView) -> Action:
