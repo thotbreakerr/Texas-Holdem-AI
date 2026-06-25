@@ -31,6 +31,10 @@ def create_bot(btype: str) -> BotAdapter:
       final_aggro         TournamentHybridBot aggro profile
       final_<profile>:p4|telemetry|station|r2|p5
                           TournamentHybridBot Phase 5 ablation arms
+      maniac, maniac_trigger, maniac_mixed, overbet_merchant,
+      calling_station, nit, folder, loose_passive, minraise, minraiser,
+      baseline_sane, pressure_filler
+                          Phase 7 stress-opponent archetypes
       random             RandomBot
     """
     raw_btype = btype.strip()
@@ -101,11 +105,31 @@ def create_bot(btype: str) -> BotAdapter:
         _configure_final_arm(bot, raw_btype)
         return _wrap(bot)
 
+    if btype in (
+        "maniac",
+        "maniac_trigger",
+        "maniac_mixed",
+        "overbet_merchant",
+        "calling_station",
+        "nit",
+        "folder",
+        "loose_passive",
+        "minraise",
+        "minraiser",
+        "baseline_sane",
+        "pressure_filler",
+    ):
+        from bots.archetype_bot import ArchetypeBot
+        return _wrap(ArchetypeBot(btype))
+
     raise ValueError(f"Unknown bot type: {raw_btype!r}. "
                      "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
                      "cfr, cfr:<path>, deep_cfr, deep_cfr:<path>, "
                      "icm, exploitative, gto, opponentmodel, "
-                     "final, final_survival, final_aggro")
+                     "final, final_survival, final_aggro, "
+                     "maniac_trigger, maniac_mixed, overbet_merchant, "
+                     "calling_station, nit, folder, loose_passive, minraise, "
+                     "minraiser, baseline_sane, pressure_filler")
 
 
 class _PlayerViewAdapter(BotAdapter):

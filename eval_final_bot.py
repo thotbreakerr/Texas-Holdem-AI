@@ -42,6 +42,15 @@ P5_ARM_SPECS = {
     "P4+station+R2": "p5",
 }
 P5_ARM_CHOICES = tuple(P5_ARM_SPECS)
+P5_ARM_TOKEN_ALIASES = {
+    "p4": "P4",
+    "telemetry": "P4+telemetry",
+    "station": "P4+station-only",
+    "station_only": "P4+station-only",
+    "r2": "P4+strict-R2-only",
+    "strict_r2": "P4+strict-R2-only",
+    "p5": "P4+station+R2",
+}
 
 
 def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -80,6 +89,16 @@ def _arm_list(raw: str | None) -> list[str]:
     return arms or ["P4"]
 
 
+def _arm_from_token(raw: str) -> str:
+    token = str(raw or "").strip()
+    if token in P5_ARM_SPECS:
+        return token
+    key = token.lower().replace("-", "_").replace("+", "_")
+    if key in P5_ARM_TOKEN_ALIASES:
+        return P5_ARM_TOKEN_ALIASES[key]
+    raise ValueError(f"unknown P5 arm token: {raw!r}")
+
+
 def _candidate_spec(profile: str, arm: str) -> str:
     return f"final_{profile}:{P5_ARM_SPECS[arm]}"
 
@@ -89,6 +108,8 @@ def _empty_p5_eval_telemetry() -> dict:
         "p5_decisions": 0,
         "p5_station_read_fire_count": 0,
         "p5_r2_read_fire_count": 0,
+        "p5_r2_tax_relief_applied_count": 0,
+        "p5_r2_tax_relieved_total": 0.0,
         "p5_error_count": 0,
         "p5_villain_samples": {},
     }
@@ -101,14 +122,19 @@ def _merge_p5_eval_telemetry(total: dict, row: dict | None) -> None:
         "p5_decisions",
         "p5_station_read_fire_count",
         "p5_r2_read_fire_count",
+        "p5_r2_tax_relief_applied_count",
         "p5_error_count",
     ):
         total[key] += int(row.get(key, 0) or 0)
+    total["p5_r2_tax_relieved_total"] += float(row.get("p5_r2_tax_relieved_total", 0.0) or 0.0)
     samples = total["p5_villain_samples"]
     for pid, stats in (row.get("p5_villain_samples") or {}).items():
         bucket = samples.setdefault(pid, {})
         for stat_key, value in (stats or {}).items():
-            bucket[stat_key] = int(bucket.get(stat_key, 0) or 0) + int(value or 0)
+            if str(stat_key).endswith("_hat"):
+                bucket[stat_key] = float(value or 0.0)
+            else:
+                bucket[stat_key] = int(bucket.get(stat_key, 0) or 0) + int(value or 0)
 
 
 def _finalize_p5_eval_telemetry(total: dict) -> dict:
@@ -118,6 +144,106 @@ def _finalize_p5_eval_telemetry(total: dict) -> dict:
     total["p5_station_read_fire_rate"] = station / decisions
     total["p5_r2_read_fire_rate"] = r2 / decisions
     total["p5_any_active_read_fire_rate"] = (station + r2) / decisions
+    return total
+
+
+def _empty_stress_eval_telemetry() -> dict:
+    return {
+        "enabled": False,
+        "by_pid": {},
+        "by_archetype": {},
+        "totals": {},
+        "station_false_positive_count": 0,
+        "station_false_positive_sampled_count": 0,
+        "station_false_positive_rate": 0.0,
+        "short_jam_like_contamination_rate": 0.0,
+    }
+
+
+def _merge_stress_eval_telemetry(total: dict, pid: str, archetype: str, row: dict | None) -> None:
+    if not row:
+        return
+    total["enabled"] = True
+    for target in (
+        total["by_pid"].setdefault(pid, {"archetype": archetype}),
+        total["by_archetype"].setdefault(archetype, {"archetype": archetype}),
+    ):
+        for key, value in row.items():
+            try:
+                amount = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            target[key] = int(target.get(key, 0) or 0) + amount
+
+
+def _p_hat(k: int, n: int, p0: float = 0.45, w: float = 10.0) -> float:
+    n = max(0, int(n or 0))
+    k = max(0, int(k or 0))
+    denom = n + w
+    if denom <= 0:
+        return p0
+    return (k + p0 * w) / denom
+
+
+def _finalize_stress_eval_telemetry(total: dict, p5: dict) -> dict:
+    if not total.get("enabled"):
+        return total
+    samples = p5.get("p5_villain_samples") or {}
+    observed_keys = {
+        "jam_like": "jam_like_count",
+        "short_jam_like": "short_jam_like_count",
+        "large_bet": "large_bet_count",
+        "station": "postflop_pressure_call",
+        "fold_to_pressure": "pressure_fold_n",
+        "vpip": "vpip_seen",
+        "pfr": "preflop_raise_seen",
+    }
+    stress_totals: dict[str, int] = {}
+    fp_count = 0
+    fp_sampled = 0
+    for pid, bucket in total["by_pid"].items():
+        sample = samples.get(pid, {})
+        for read, sample_key in observed_keys.items():
+            observed = int(sample.get(sample_key, 0) or 0)
+            true_key = f"true_{read}_count"
+            folded_key = f"missed_due_to_hero_already_folded_{read}_count"
+            hand_end_key = f"missed_due_to_hand_end_{read}_count"
+            bucket[f"hero_observed_{read}_count"] = observed
+            bucket[hand_end_key] = max(
+                0,
+                int(bucket.get(true_key, 0) or 0)
+                - observed
+                - int(bucket.get(folded_key, 0) or 0),
+            )
+        archetype = str(bucket.get("archetype") or "")
+        if archetype in ("loose_passive", "nit"):
+            calls = int(sample.get("postflop_pressure_call", 0) or 0)
+            raises = int(sample.get("postflop_pressure_raise", 0) or 0)
+            station_n = calls + raises
+            if station_n >= 4:
+                fp_sampled += 1
+                if _p_hat(calls, station_n) >= 0.60:
+                    fp_count += 1
+                    bucket["station_false_positive"] = 1
+                else:
+                    bucket["station_false_positive"] = 0
+        for key, value in bucket.items():
+            if key == "archetype":
+                continue
+            try:
+                stress_totals[key] = int(stress_totals.get(key, 0) or 0) + int(value or 0)
+            except (TypeError, ValueError):
+                continue
+
+    total["totals"] = stress_totals
+    total["station_false_positive_count"] = fp_count
+    total["station_false_positive_sampled_count"] = fp_sampled
+    total["station_false_positive_rate"] = fp_count / fp_sampled if fp_sampled else 0.0
+    true_jams = int(stress_totals.get("true_jam_like_count", 0) or 0)
+    short_jams = int(stress_totals.get("true_short_jam_like_count", 0) or 0)
+    total["short_jam_like_contamination_rate"] = (
+        short_jams / (true_jams + short_jams) if (true_jams + short_jams) else 0.0
+    )
     return total
 
 
@@ -132,6 +258,7 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
     early_busts = 0
     reached_hu = 0
     p5_telemetry = _empty_p5_eval_telemetry()
+    stress_telemetry = _empty_stress_eval_telemetry()
 
     for t in range(args.tournaments):
         # Seed the module-global RNG that stochastic opponent bots
@@ -179,10 +306,24 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
         telemetry = getattr(hero_core, "p5_telemetry_summary", None)
         if callable(telemetry):
             _merge_p5_eval_telemetry(p5_telemetry, telemetry())
+        for pid, bot_type in specs:
+            if pid == "HERO":
+                continue
+            core = getattr(bots.get(pid), "bot", None)
+            stress_summary = getattr(core, "stress_telemetry_summary", None)
+            if callable(stress_summary):
+                archetype = getattr(getattr(core, "config", None), "name", bot_type)
+                _merge_stress_eval_telemetry(
+                    stress_telemetry,
+                    pid,
+                    str(archetype),
+                    stress_summary(),
+                )
 
     n = args.tournaments
     lo, hi = wilson_interval(wins, n)
     avg_finish = sum(finishes) / len(finishes) if finishes else float("nan")
+    p5_final = _finalize_p5_eval_telemetry(p5_telemetry)
     return {
         "candidate": candidate,
         "p5_arm": arm,
@@ -195,7 +336,8 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
         "avg_finish": avg_finish,
         "reached_hu_rate": reached_hu / n if n else 0.0,
         "early_bust_rate": early_busts / n if n else 0.0,
-        "p5_telemetry": _finalize_p5_eval_telemetry(p5_telemetry),
+        "p5_telemetry": p5_final,
+        "stress_telemetry": _finalize_stress_eval_telemetry(stress_telemetry, p5_final),
     }
 
 
@@ -215,10 +357,15 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20260619)
     ap.add_argument("--p5-arm", choices=P5_ARM_CHOICES, default="P4",
                     help="Single Phase 5 ablation arm to evaluate.")
+    ap.add_argument("--arm", default=None,
+                    help="Short alias for --p5-arm: p4, telemetry, station, r2, or p5.")
     ap.add_argument("--p5-arms", default=None,
                     help="Comma-separated Phase 5 arms, or 'all'. Overrides --p5-arm.")
     ap.add_argument("--p5-telemetry", action="store_true",
                     help="Print Phase 5 pre-gate telemetry summaries.")
+    ap.add_argument("--stress-pool", default=None,
+                    help="Opt-in comma-separated Phase 7 stress-opponent pool. "
+                         "When set, overrides --pool for this run only.")
     ap.add_argument(
         "--future-edge-tax-cap", type=float, default=None,
         help="A/B override (Phase 4 §12 R7): hard ceiling on the hero's "
@@ -227,13 +374,20 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    pool = [p.strip() for p in args.pool.split(",") if p.strip()]
+    pool_raw = args.stress_pool if args.stress_pool is not None else args.pool
+    pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
     profiles = ["survival", "aggro"] if args.profile == "both" else [args.profile]
-    arms = _arm_list(args.p5_arms) if args.p5_arms is not None else [args.p5_arm]
+    if args.p5_arms is not None:
+        arms = _arm_list(args.p5_arms)
+    elif args.arm is not None:
+        arms = [_arm_from_token(args.arm)]
+    else:
+        arms = [args.p5_arm]
 
     tax_cap = ("built-in" if args.future_edge_tax_cap is None
                else ("OFF" if args.future_edge_tax_cap == 0 else f"{args.future_edge_tax_cap:.3f}"))
-    print(f"Pool: {', '.join(pool)}  |  field size: {len(pool) + 1}  |  "
+    pool_label = "Stress pool" if args.stress_pool is not None else "Pool"
+    print(f"{pool_label}: {', '.join(pool)}  |  field size: {len(pool) + 1}  |  "
           f"chips={args.chips} sb={args.sb} bb={args.bb} "
           f"blind_up_every={args.blind_increase_every}  |  future-edge-tax-cap={tax_cap}")
     print("=" * 72)
@@ -258,6 +412,8 @@ def main() -> int:
                       f"station={tel['p5_station_read_fire_rate']:.4f} "
                       f"r2={tel['p5_r2_read_fire_rate']:.4f} "
                       f"(decisions={tel['p5_decisions']})")
+                print(f"  r2 tax relief   : applied={tel['p5_r2_tax_relief_applied_count']} "
+                      f"relieved_total={tel['p5_r2_tax_relieved_total']:.4f}")
                 for pid, stats in sorted(tel["p5_villain_samples"].items()):
                     print(
                         f"    {pid}: station_n={stats.get('station_response_n', 0)} "
@@ -266,6 +422,19 @@ def main() -> int:
                         f"jam_like={stats.get('jam_like_count', 0)} "
                         f"large_bet={stats.get('large_bet_count', 0)}"
                     )
+            stress = s.get("stress_telemetry") or {}
+            if stress.get("enabled"):
+                totals = stress.get("totals") or {}
+                print(f"  stress events   : true_jam={totals.get('true_jam_like_count', 0)} "
+                      f"obs_jam={totals.get('hero_observed_jam_like_count', 0)} "
+                      f"true_large={totals.get('true_large_bet_count', 0)} "
+                      f"obs_large={totals.get('hero_observed_large_bet_count', 0)} "
+                      f"true_station={totals.get('true_station_count', 0)} "
+                      f"obs_station={totals.get('hero_observed_station_count', 0)}")
+                print(f"  stress censor   : hero_folded={totals.get('missed_due_to_hero_already_folded_count', 0)} "
+                      f"short_jam_rate={stress.get('short_jam_like_contamination_rate', 0.0):.3f} "
+                      f"station_fp={stress.get('station_false_positive_count', 0)}/"
+                      f"{stress.get('station_false_positive_sampled_count', 0)}")
     print("=" * 72)
     return 0
 
