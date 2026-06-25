@@ -1008,18 +1008,21 @@ class OpponentProfiles:
 
     @classmethod
     def _infer_big_blind(cls, view: PlayerView) -> int:
+        for entry in getattr(view, "history", None) or []:
+            if not isinstance(entry, dict) or entry.get("street") != "preflop":
+                continue
+            to_call = cls._safe_int(entry.get("to_call_before"))
+            if to_call > 0:
+                return max(1, to_call)
+            pot_before = cls._safe_int(entry.get("pot_before"))
+            if pot_before > 0:
+                return max(1, int(round(pot_before / 1.5)))
         min_raise = cls._safe_int(getattr(view, "min_raise", 0))
         if min_raise > 0:
             return max(1, min_raise)
         pot = cls._safe_int(getattr(view, "pot", 0))
         if pot > 0:
             return max(1, int(round(pot / 1.5)))
-        for entry in getattr(view, "history", None) or []:
-            if not isinstance(entry, dict):
-                continue
-            to_call = cls._safe_int(entry.get("to_call_before"))
-            if to_call > 0:
-                return max(1, to_call)
         return 10
 
     @staticmethod

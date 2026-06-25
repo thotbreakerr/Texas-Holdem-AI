@@ -184,6 +184,9 @@ class ArchetypeBot:
             "jam_opportunity_n",
             "jam_opportunity_taken_count",
             "missed_due_to_hero_already_folded_count",
+            "missed_due_to_hero_already_folded_preflop_count",
+            "missed_due_to_hero_already_folded_postflop_count",
+            "missed_due_to_hero_already_folded_unknown_count",
         ]
         return {key: 0 for key in keys}
 
@@ -422,9 +425,29 @@ class ArchetypeBot:
         if getattr(view, "me", None) != _HERO_PID:
             opponents = getattr(view, "opponents", None) or []
             if _HERO_PID not in opponents:
+                fold_bucket = self._hero_fold_bucket(view)
                 self._telemetry["missed_due_to_hero_already_folded_count"] += 1
+                folded_bucket = f"missed_due_to_hero_already_folded_{fold_bucket}_count"
+                self._telemetry[folded_bucket] = self._telemetry.get(folded_bucket, 0) + 1
                 specific = f"missed_due_to_hero_already_folded_{read_name}_count"
                 self._telemetry[specific] = self._telemetry.get(specific, 0) + 1
+                specific_bucket = f"missed_due_to_hero_already_folded_{fold_bucket}_{read_name}_count"
+                self._telemetry[specific_bucket] = self._telemetry.get(specific_bucket, 0) + 1
+
+    def _hero_fold_bucket(self, view: PlayerView) -> str:
+        for entry in getattr(view, "history", None) or []:
+            if (
+                isinstance(entry, dict)
+                and entry.get("pid") == _HERO_PID
+                and entry.get("type") == "fold"
+            ):
+                street = entry.get("street")
+                if street == "preflop":
+                    return "preflop"
+                if street in _POSTFLOP:
+                    return "postflop"
+                return "unknown"
+        return "unknown"
 
     def _record_action_telemetry(self, view: PlayerView, action: Action) -> None:
         street = getattr(view, "street", None)

@@ -13,6 +13,7 @@ from bots import create_bot
 from bots.archetype_bot import ARCHETYPE_CONFIGS, ArchetypeBot
 from bots.tournament_hybrid_bot import OpponentProfiles
 from core.bot_api import Action, PlayerView
+from eval_final_bot import _build_eval_specs, _hero_relative_offsets
 
 
 def _history_entry(street, pid, action_type, *, amount=None, to_call_before=0, pot_before=0):
@@ -26,7 +27,7 @@ def _history_entry(street, pid, action_type, *, amount=None, to_call_before=0, p
     }
 
 
-def _view(history, *, hand_id=70000, opponents=("V",), all_in=(), street="flop"):
+def _view(history, *, hand_id=70000, opponents=("V",), all_in=(), street="flop", min_raise=10):
     return PlayerView(
         me="Hero",
         street=street,
@@ -35,7 +36,7 @@ def _view(history, *, hand_id=70000, opponents=("V",), all_in=(), street="flop")
         board=[("2", "c"), ("7", "d"), ("J", "h")] if street != "preflop" else [],
         pot=180,
         to_call=0,
-        min_raise=10,
+        min_raise=min_raise,
         max_raise=1000,
         legal_actions=[{"type": "check"}],
         stacks={"Hero": 1000, **{pid: 1000 for pid in opponents}},
@@ -193,6 +194,14 @@ def _check_classifier_targets():
     ok &= raw["postflop_bet_raise"] == 1
     ok &= raw["jam_like_count"] == 0 and raw["large_bet_count"] == 0
 
+    profiles = OpponentProfiles()
+    profiles.ingest(_view([
+        _history_entry("preflop", "V", "raise", amount=30, to_call_before=10, pot_before=15),
+        _history_entry("flop", "V", "raise", amount=1461, to_call_before=50, pot_before=140),
+    ], all_in=("V",), hand_id=72008, min_raise=2822))
+    raw = profiles.raw("V")
+    ok &= raw["jam_like_count"] == 1 and raw["short_jam_like_count"] == 0
+
     print(f"[P7 CHECK 2] {'PASS' if ok else 'FAIL'} - classifier targets fire for all policy roles")
     return ok
 
@@ -229,11 +238,51 @@ def _check_policy_roster_shape():
     return ok
 
 
+def _bot_base_type(bot_type):
+    return str(bot_type or "").strip().lower().split(":", 1)[0]
+
+
+def _check_seat_geometry_harness():
+    candidate = "final_aggro:p5"
+    pool = ["maniac_trigger", "maniac_trigger", "pressure_filler", "calling_station", "nit"]
+
+    before_after = _build_eval_specs(candidate, pool, "target-before-after")
+    target_after = _build_eval_specs(candidate, pool, "target-after-hero")
+    bracketing = _build_eval_specs(candidate, pool, "bracketing")
+
+    is_maniac = lambda bot_type: _bot_base_type(bot_type).startswith("maniac")
+    ok = True
+    ok &= [pid for pid, _ in before_after] == ["P0", "HERO", "P1", "P2", "P3", "P4"]
+    ok &= _hero_relative_offsets(before_after, is_maniac) == [1, 5]
+    ok &= [pid for pid, _ in target_after] == ["P2", "P0", "HERO", "P1", "P3", "P4"]
+    ok &= _hero_relative_offsets(target_after, is_maniac) == [1, 5]
+    ok &= [pid for pid, _ in bracketing] == ["P0", "P2", "P3", "P1", "HERO", "P4"]
+    ok &= _hero_relative_offsets(bracketing, is_maniac) == [2, 5]
+
+    pressure_pool = ["maniac_trigger", "calling_station", "pressure_filler", "loose_passive", "nit"]
+    pressure = _build_eval_specs(candidate, pressure_pool, "pressure-nit-hero")
+    ok &= [pid for pid, _ in pressure] == ["P0", "P1", "P3", "P2", "P4", "HERO"]
+    ok &= _hero_relative_offsets(pressure, lambda bot_type: _bot_base_type(bot_type) == "pressure_filler") == [4]
+    ok &= _hero_relative_offsets(pressure, lambda bot_type: _bot_base_type(bot_type) == "nit") == [5]
+
+    try:
+        _build_eval_specs(candidate, ["pressure_filler", "calling_station"], "target-before-after")
+    except ValueError:
+        missing_roles_rejected = True
+    else:
+        missing_roles_rejected = False
+    ok &= missing_roles_rejected
+
+    print(f"[P7 CHECK 4] {'PASS' if ok else 'FAIL'} - deterministic seat geometry offsets")
+    return ok
+
+
 def run():
     ok = True
     ok &= _check_registry_and_legal_actions()
     ok &= _check_classifier_targets()
     ok &= _check_policy_roster_shape()
+    ok &= _check_seat_geometry_harness()
     print("=" * 60)
     print(f"PHASE 7: {'ALL CHECKS PASSED [PASS]' if ok else 'SOME CHECKS FAILED [FAIL]'}")
     return ok
