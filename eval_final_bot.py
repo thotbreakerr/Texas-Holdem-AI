@@ -52,6 +52,44 @@ P5_ARM_TOKEN_ALIASES = {
     "p5": "P4+station+R2",
 }
 
+SEAT_GEOMETRY_LAYOUTS: dict[str, tuple[str, ...] | None] = {
+    "none": None,
+    "target-before-after": ("T", "H", "T", "F", "F", "F"),
+    "target-after-hero": ("F", "T", "H", "T", "F", "F"),
+    "bracketing": ("T", "F", "F", "T", "H", "F"),
+    "pressure-nit-hero": ("F", "F", "F", "PF", "N", "H"),
+}
+SEAT_GEOMETRY_ALIASES = {
+    "": "none",
+    "off": "none",
+    "default": "none",
+    "target-before-hero": "target-before-after",
+    "target-adjacent": "target-before-after",
+    "target-sandwich": "target-before-after",
+    "target-after": "target-after-hero",
+    "bracket": "bracketing",
+    "pressure-filler-nit-hero": "pressure-nit-hero",
+    "filler-nit-hero": "pressure-nit-hero",
+}
+TARGET_BOT_TYPES = {
+    "calling_station",
+    "loose_passive",
+    "minraise",
+    "minraiser",
+    "overbet_merchant",
+}
+TARGET_BOT_PREFIXES = ("maniac",)
+NIT_BOT_TYPES = {"nit", "folder"}
+STRESS_FUNNEL_READS = (
+    "jam_like",
+    "short_jam_like",
+    "large_bet",
+    "station",
+    "fold_to_pressure",
+    "vpip",
+    "pfr",
+)
+
 
 def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     """95% Wilson score interval for a binomial proportion."""
@@ -62,6 +100,90 @@ def wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
     centre = (p + z * z / (2 * n)) / denom
     half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
     return (max(0.0, centre - half), min(1.0, centre + half))
+
+
+def _canonical_seat_geometry(raw: str | None) -> str:
+    token = str(raw or "none").strip().lower().replace("_", "-")
+    token = SEAT_GEOMETRY_ALIASES.get(token, token)
+    if token not in SEAT_GEOMETRY_LAYOUTS:
+        names = ", ".join(sorted(SEAT_GEOMETRY_LAYOUTS))
+        aliases = ", ".join(sorted(k for k in SEAT_GEOMETRY_ALIASES if k))
+        raise ValueError(f"unknown seat geometry {raw!r}; expected one of: {names}; aliases: {aliases}")
+    return token
+
+
+def _bot_base_type(bot_type: str) -> str:
+    return str(bot_type or "").strip().lower().split(":", 1)[0]
+
+
+def _is_target_bot(bot_type: str) -> bool:
+    base = _bot_base_type(bot_type)
+    return base in TARGET_BOT_TYPES or any(base.startswith(prefix) for prefix in TARGET_BOT_PREFIXES)
+
+
+def _is_nit_bot(bot_type: str) -> bool:
+    return _bot_base_type(bot_type) in NIT_BOT_TYPES
+
+
+def _is_pressure_filler_bot(bot_type: str) -> bool:
+    return _bot_base_type(bot_type) == "pressure_filler"
+
+
+def _build_eval_specs(candidate: str, pool: list[str], seat_geometry: str | None = None) -> list[tuple[str, str]]:
+    """Return ring-order ``(pid, bot_type)`` specs for an eval table."""
+    geometry = _canonical_seat_geometry(seat_geometry)
+    default_specs = [("HERO", candidate)] + [(f"P{i}", bot) for i, bot in enumerate(pool)]
+    layout = SEAT_GEOMETRY_LAYOUTS[geometry]
+    if layout is None:
+        return default_specs
+
+    if len(default_specs) != len(layout):
+        raise ValueError(
+            f"seat geometry {geometry!r} requires {len(layout)} total seats "
+            f"(hero + {len(layout) - 1} opponents); got {len(default_specs)}"
+        )
+
+    remaining = list(default_specs[1:])
+
+    def take(role: str, predicate) -> tuple[str, str]:
+        for idx, entry in enumerate(remaining):
+            if predicate(entry[1]):
+                return remaining.pop(idx)
+        raise ValueError(f"seat geometry {geometry!r} needs a {role} opponent in --stress-pool/--pool")
+
+    targets = [take("target", _is_target_bot) for _ in range(layout.count("T"))]
+    pressure_fillers = [
+        take("pressure_filler", _is_pressure_filler_bot)
+        for _ in range(layout.count("PF"))
+    ]
+    nits = [take("nit/folder", _is_nit_bot) for _ in range(layout.count("N"))]
+
+    specs: list[tuple[str, str]] = []
+    for token in layout:
+        if token == "H":
+            specs.append(("HERO", candidate))
+        elif token == "T":
+            specs.append(targets.pop(0))
+        elif token == "PF":
+            specs.append(pressure_fillers.pop(0))
+        elif token == "N":
+            specs.append(nits.pop(0))
+        elif token == "F":
+            if not remaining:
+                raise ValueError(f"seat geometry {geometry!r} ran out of filler opponents")
+            specs.append(remaining.pop(0))
+        else:
+            raise ValueError(f"internal error: unknown seat geometry token {token!r}")
+
+    if remaining:
+        raise ValueError(f"seat geometry {geometry!r} left unused opponents: {remaining!r}")
+    return specs
+
+
+def _hero_relative_offsets(specs: list[tuple[str, str]], predicate) -> list[int]:
+    n = len(specs)
+    hero_idx = next(idx for idx, (pid, _) in enumerate(specs) if pid == "HERO")
+    return sorted((idx - hero_idx) % n for idx, (_, bot_type) in enumerate(specs) if predicate(bot_type))
 
 
 def _hero_finish(result: dict, hero: str, n_players: int) -> tuple[int | None, int | None]:
@@ -150,6 +272,7 @@ def _finalize_p5_eval_telemetry(total: dict) -> dict:
 def _empty_stress_eval_telemetry() -> dict:
     return {
         "enabled": False,
+        "seat_geometry": "none",
         "by_pid": {},
         "by_archetype": {},
         "totals": {},
@@ -247,10 +370,28 @@ def _finalize_stress_eval_telemetry(total: dict, p5: dict) -> dict:
     return total
 
 
+def _stress_funnel_fields(totals: dict, read: str) -> dict[str, int]:
+    true_count = int(totals.get(f"true_{read}_count", 0) or 0)
+    observed = int(totals.get(f"hero_observed_{read}_count", 0) or 0)
+    folded = int(totals.get(f"missed_due_to_hero_already_folded_{read}_count", 0) or 0)
+    folded_pre = int(totals.get(f"missed_due_to_hero_already_folded_preflop_{read}_count", 0) or 0)
+    folded_post = int(totals.get(f"missed_due_to_hero_already_folded_postflop_{read}_count", 0) or 0)
+    folded_unknown = max(0, folded - folded_pre - folded_post)
+    hand_end = int(totals.get(f"missed_due_to_hand_end_{read}_count", 0) or 0)
+    return {
+        "true": true_count,
+        "observed": observed,
+        "folded_pre": folded_pre,
+        "folded_post": folded_post,
+        "folded_unknown": folded_unknown,
+        "hand_end": hand_end,
+    }
+
+
 def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
     candidate = _candidate_spec(profile, arm)
-    specs: list[tuple[str, str]] = [("HERO", candidate)]
-    specs += [(f"P{i}", bot) for i, bot in enumerate(pool)]
+    seat_geometry = _canonical_seat_geometry(getattr(args, "seat_geometry", "none"))
+    specs = _build_eval_specs(candidate, pool, seat_geometry)
     n_players = len(specs)
 
     wins = 0
@@ -259,6 +400,7 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
     reached_hu = 0
     p5_telemetry = _empty_p5_eval_telemetry()
     stress_telemetry = _empty_stress_eval_telemetry()
+    stress_telemetry["seat_geometry"] = seat_geometry
 
     for t in range(args.tournaments):
         # Seed the module-global RNG that stochastic opponent bots
@@ -337,6 +479,8 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
         "reached_hu_rate": reached_hu / n if n else 0.0,
         "early_bust_rate": early_busts / n if n else 0.0,
         "p5_telemetry": p5_final,
+        "seat_geometry": seat_geometry,
+        "seat_order": [pid for pid, _ in specs],
         "stress_telemetry": _finalize_stress_eval_telemetry(stress_telemetry, p5_final),
     }
 
@@ -367,12 +511,22 @@ def main() -> int:
                     help="Opt-in comma-separated Phase 7 stress-opponent pool. "
                          "When set, overrides --pool for this run only.")
     ap.add_argument(
+        "--seat-geometry",
+        default="none",
+        help="Opt-in deterministic Phase 7 ring layout: none, target-before-after, "
+             "target-after-hero, bracketing, or pressure-nit-hero.",
+    )
+    ap.add_argument(
         "--future-edge-tax-cap", type=float, default=None,
         help="A/B override (Phase 4 §12 R7): hard ceiling on the hero's "
              "future-edge tax, in equity fractions. 0 disables the tax; omit "
              "to use the built-in per-player caps.",
     )
     args = ap.parse_args()
+    try:
+        args.seat_geometry = _canonical_seat_geometry(args.seat_geometry)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     pool_raw = args.stress_pool if args.stress_pool is not None else args.pool
     pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
@@ -387,9 +541,11 @@ def main() -> int:
     tax_cap = ("built-in" if args.future_edge_tax_cap is None
                else ("OFF" if args.future_edge_tax_cap == 0 else f"{args.future_edge_tax_cap:.3f}"))
     pool_label = "Stress pool" if args.stress_pool is not None else "Pool"
+    geometry_label = "" if args.seat_geometry == "none" else f"  |  seat_geometry={args.seat_geometry}"
     print(f"{pool_label}: {', '.join(pool)}  |  field size: {len(pool) + 1}  |  "
           f"chips={args.chips} sb={args.sb} bb={args.bb} "
-          f"blind_up_every={args.blind_increase_every}  |  future-edge-tax-cap={tax_cap}")
+          f"blind_up_every={args.blind_increase_every}{geometry_label}  |  "
+          f"future-edge-tax-cap={tax_cap}")
     print("=" * 72)
     print(f"P5 arms: {', '.join(arms)}")
     for profile in profiles:
@@ -425,6 +581,7 @@ def main() -> int:
             stress = s.get("stress_telemetry") or {}
             if stress.get("enabled"):
                 totals = stress.get("totals") or {}
+                geometry = stress.get("seat_geometry") or s.get("seat_geometry") or "none"
                 print(f"  stress events   : true_jam={totals.get('true_jam_like_count', 0)} "
                       f"obs_jam={totals.get('hero_observed_jam_like_count', 0)} "
                       f"true_large={totals.get('true_large_bet_count', 0)} "
@@ -435,6 +592,21 @@ def main() -> int:
                       f"short_jam_rate={stress.get('short_jam_like_contamination_rate', 0.0):.3f} "
                       f"station_fp={stress.get('station_false_positive_count', 0)}/"
                       f"{stress.get('station_false_positive_sampled_count', 0)}")
+                print(f"  stress funnel   : geometry={geometry}")
+                for read in STRESS_FUNNEL_READS:
+                    row = _stress_funnel_fields(totals, read)
+                    if not any(row.values()):
+                        continue
+                    unknown = (
+                        f" folded_unknown={row['folded_unknown']}"
+                        if row["folded_unknown"]
+                        else ""
+                    )
+                    print(
+                        f"    {read}: true={row['true']} obs={row['observed']} "
+                        f"folded_pre={row['folded_pre']} folded_post={row['folded_post']}"
+                        f"{unknown} hand_end={row['hand_end']}"
+                    )
     print("=" * 72)
     return 0
 
