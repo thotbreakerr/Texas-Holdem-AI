@@ -1165,6 +1165,8 @@ class TournamentHybridBot:
         self.p5_decision_count = 0
         self.p5_station_read_fire_count = 0
         self.p5_r2_read_fire_count = 0
+        self.p5_r2_tax_relief_applied_count = 0
+        self.p5_r2_tax_relieved_total = 0.0
         self._p5_trace_updates: DecisionTrace = {}
 
         # Adaptive Monte Carlo budget for postflop equity.  Defaults are sized
@@ -1192,6 +1194,8 @@ class TournamentHybridBot:
         self.p5_decision_count = 0
         self.p5_station_read_fire_count = 0
         self.p5_r2_read_fire_count = 0
+        self.p5_r2_tax_relief_applied_count = 0
+        self.p5_r2_tax_relieved_total = 0.0
         self._p5_trace_updates = {}
         return None
 
@@ -1621,6 +1625,14 @@ class TournamentHybridBot:
             self.p5_station_read_fire_count += 1
         if trace.get("p5_r2_would_apply"):
             self.p5_r2_read_fire_count += 1
+        if trace.get("p5_r2_relief_applied"):
+            self.p5_r2_tax_relief_applied_count += 1
+            before = self._safe_float(trace.get("p5_r2_tax_before"), 0.0)
+            after = self._safe_float(
+                trace.get("future_edge_tax", trace.get("p5_r2_tax_after_proposed")),
+                before,
+            )
+            self.p5_r2_tax_relieved_total += max(0.0, before - after)
 
     def p5_telemetry_summary(self) -> DecisionTrace:
         villains = {}
@@ -1628,21 +1640,34 @@ class TournamentHybridBot:
             type("_P5View", (), {"opponents": list(self._profiles.profiles), "me": None, "seat_indices": {}})()
         ):
             stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
+            raw = self._profiles.raw(pid)
             villains[pid] = {
                 "preflop_action_seen": stats.get("preflop_action_seen", 0),
+                "vpip_seen": stats.get("vpip_seen", 0),
+                "preflop_raise_seen": stats.get("preflop_raise_seen", 0),
                 "postflop_aggression_n": stats.get("postflop_aggression_n", 0),
                 "station_response_n": stats.get("station_response_n", 0),
                 "pressure_fold_n": stats.get("pressure_fold_n", 0),
+                "postflop_pressure_call": raw.get("postflop_pressure_call", 0),
+                "postflop_pressure_raise": raw.get("postflop_pressure_raise", 0),
+                "postflop_pressure_fold": raw.get("postflop_pressure_fold", 0),
                 "jam_opportunity_n": stats.get("jam_opportunity_n", 0),
                 "jam_like_count": stats.get("jam_like_count", 0),
                 "large_bet_count": stats.get("large_bet_count", 0),
                 "short_jam_like_count": stats.get("short_jam_like_count", 0),
+                "vpip_hat": round(float(stats.get("vpip_hat", 0.0) or 0.0), 4),
+                "preflop_aggression_rate_hat": round(float(stats.get("preflop_aggression_rate_hat", 0.0) or 0.0), 4),
+                "postflop_aggression_freq_hat": round(float(stats.get("postflop_aggression_freq_hat", 0.0) or 0.0), 4),
+                "station_score_hat": round(float(stats.get("station_score_hat", 0.0) or 0.0), 4),
+                "fold_to_pressure_hat": round(float(stats.get("fold_to_pressure_hat", 0.0) or 0.0), 4),
             }
         decisions = max(1, self.p5_decision_count)
         return {
             "p5_decisions": self.p5_decision_count,
             "p5_station_read_fire_count": self.p5_station_read_fire_count,
             "p5_r2_read_fire_count": self.p5_r2_read_fire_count,
+            "p5_r2_tax_relief_applied_count": self.p5_r2_tax_relief_applied_count,
+            "p5_r2_tax_relieved_total": round(float(self.p5_r2_tax_relieved_total), 6),
             "p5_any_active_read_fire_rate": (
                 (self.p5_station_read_fire_count + self.p5_r2_read_fire_count) / decisions
             ),
@@ -3330,6 +3355,14 @@ class TournamentHybridBot:
             return int(value)
         except (TypeError, ValueError):
             return 0
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return default
+        return f if math.isfinite(f) else default
 
     def _infer_big_blind(self, view: PlayerView) -> int:
         hand_id = getattr(view, "hand_id", None)
