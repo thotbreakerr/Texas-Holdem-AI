@@ -2294,6 +2294,150 @@ def _check_p5_zero_data_neutral():
     return ok
 
 
+# --- Cross-process determinism of the decision path (CHECK 35) --------------
+#
+# In-process determinism (CHECK 13, 19) only proves the bot is reproducible
+# within a single process. The stricter property is that the chosen action is
+# identical across *separate* processes. Two distinct mechanisms can break it,
+# and they need different guards:
+#
+#  1. Builtin ``hash()`` or unordered set/dict iteration -> output depends on
+#     PYTHONHASHSEED. Caught behaviourally by diffing an action digest across
+#     two PYTHONHASHSEED subprocesses.
+#  2. A value keyed on object identity -- ``id(...)`` / a memory address. This
+#     is what actually bit the exploitative bot here: a per-opponent dedup keyed
+#     on ``id(entry)`` collided non-deterministically as freed history dicts had
+#     their addresses reused, desyncing opponent profiles run-to-run. This does
+#     NOT track PYTHONHASHSEED (two seeds can share an address layout), so the
+#     behavioural diff misses it. It is caught reliably by a source audit that
+#     forbids builtin ``id(`` / ``hash(`` in the bot decision path.
+#
+# CHECK 35 runs both. Mark a deliberate, determinism-safe use with a trailing
+# ``# det-ok`` comment to exempt it from the audit.
+
+_TRACE_ARG = "__determinism_trace__"
+
+
+def _audit_decision_path_for_nondeterminism() -> list[str]:
+    """Scan bots/*.py for builtin ``id(`` / ``hash(`` feeding the decision path.
+
+    ``\\bid\\s*\\(`` / ``\\bhash\\s*\\(`` match the builtins but not ``hand_id``,
+    ``session_id`` (the ``id`` is not at a word boundary) nor ``_stable_hash`` /
+    ``hashlib`` (same). Inline comments are stripped; ``# det-ok`` opts a line
+    out. Returns a list of ``file:lineno: source`` violations (empty == clean).
+    """
+    import glob
+    import re
+
+    forbidden = re.compile(r"\b(?:id|hash)\s*\(")
+    violations: list[str] = []
+    for path in sorted(glob.glob(os.path.join(REPO_ROOT, "bots", "*.py"))):
+        with open(path, encoding="utf-8") as fh:
+            for lineno, raw in enumerate(fh, 1):
+                if "det-ok" in raw:
+                    continue
+                code = raw.split("#", 1)[0]
+                if forbidden.search(code):
+                    violations.append(
+                        f"{os.path.basename(path)}:{lineno}: {raw.strip()}"
+                    )
+    return violations
+
+
+def _determinism_trace_digest() -> str:
+    """Replay fixed seeded tournaments; return ``<n_actions> <sha256>``.
+
+    Mirrors eval_final_bot's loop (same pool, per-tournament global-RNG seed,
+    deck RNG, dealer rotation) so the trace exercises the exact spots the eval
+    does. A handful of tournaments are played because process-dependent leaks
+    (e.g. a dedup keyed on ``id()``, or hash-randomized iteration) only flip an
+    action in specific accumulated states -- a single short tournament can miss
+    them.
+    """
+    import hashlib
+
+    base_seed = 20260619
+    pool = ["smart", "mc200", "gto", "icm", "exploitative"]
+    specs = [("HERO", "final_survival:p4")]
+    specs += [(f"P{i}", b) for i, b in enumerate(pool)]
+    n_players = len(specs)
+    actions: list[str] = []
+
+    def wrap(pid, bot):
+        orig = bot.act
+
+        def traced(view):
+            action = orig(view)
+            actions.append(
+                f"{getattr(view, 'hand_id', None)}|{getattr(view, 'street', None)}"
+                f"|{getattr(view, 'pot', None)}|{getattr(view, 'to_call', None)}"
+                f"|{pid}|{getattr(action, 'type', None)}|{getattr(action, 'amount', None)}"
+            )
+            return action
+
+        bot.act = traced
+        return bot
+
+    for t in range(2):
+        random.seed(base_seed + t + 1 + 7_000_003)
+        seats = [Seat(player_id=pid, chips=1000) for pid, _ in specs]
+        bots = {pid: wrap(pid, create_bot(spec)) for pid, spec in specs}
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            run_tournament(
+                seats,
+                bots,
+                small_blind=5,
+                big_blind=10,
+                blind_increase_every=50,
+                max_hands=40,
+                dealer_index=t % n_players,
+                dealer_rotation="full_table",
+                winner_resolution="chip_count_on_max_hands",
+                rng=random.Random(base_seed + t + 1),
+                suppress_output=True,
+                log_decisions=False,
+            )
+    digest = hashlib.sha256("\n".join(actions).encode()).hexdigest()
+    return f"{len(actions)} {digest}"
+
+
+def _check_cross_process_determinism():
+    import subprocess
+
+    # (1) Source audit -- the reliable guard for id()/hash() leaks.
+    violations = _audit_decision_path_for_nondeterminism()
+    audit_ok = not violations
+
+    # (2) Behavioural diff across two PYTHONHASHSEED subprocesses -- guards
+    #     against hash-randomized set/dict iteration order.
+    def trace(hashseed: str) -> str:
+        env = dict(os.environ, PYTHONHASHSEED=hashseed)
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), _TRACE_ARG],
+            capture_output=True, text=True, env=env, cwd=REPO_ROOT,
+        )
+        if proc.returncode != 0:
+            return f"ERR rc={proc.returncode} {proc.stderr.strip()[-300:]}"
+        return proc.stdout.strip()
+
+    a = trace("0")
+    b = trace("1")
+    n_actions = int(a.split()[0]) if a[:1].isdigit() else 0
+    behaviour_ok = a == b and n_actions > 0
+
+    ok = audit_ok and behaviour_ok
+    if not audit_ok:
+        detail = f"forbidden id()/hash() in bot decision path: {violations}"
+    elif not behaviour_ok:
+        detail = f"PYTHONHASHSEED=0 -> {a!r}; =1 -> {b!r}"
+    else:
+        detail = f"audit clean, replay digest stable across hashseeds (actions={n_actions})"
+    print(f"[CHECK 35] {'PASS' if ok else 'FAIL'} - cross-process "
+          f"determinism of the decision path ({detail})")
+    return ok
+
+
 def run():
     PASS = True
     PASS &= _check_registry()
@@ -2330,10 +2474,15 @@ def run():
     PASS &= _check_p5_log_only_multi_read_precedence()
     PASS &= _check_p5_fail_closed()
     PASS &= _check_p5_zero_data_neutral()
+    PASS &= _check_cross_process_determinism()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == _TRACE_ARG:
+        # Subprocess entry point for CHECK 35: emit the action digest and exit.
+        print(_determinism_trace_digest())
+        sys.exit(0)
     sys.exit(0 if run() else 1)

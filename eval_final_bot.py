@@ -134,6 +134,17 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
     p5_telemetry = _empty_p5_eval_telemetry()
 
     for t in range(args.tournaments):
+        # Seed the module-global RNG that stochastic opponent bots
+        # (gto/smart/exploitative) draw from. Without this the global stream is
+        # seeded from os.urandom at process startup, so the same eval seed
+        # produces different results every run -- and, in particular, differs
+        # across PYTHONHASHSEED values purely by chance. A fixed per-tournament
+        # seed makes the whole table reproducible across processes. The offset
+        # keeps this stream distinct from the per-tournament deck RNG below so
+        # bot randomness is not correlated with the shuffle. (HERO itself never
+        # relies on this stream -- it gates on a stable hash and save/restores
+        # global RNG state around its Monte Carlo equity.)
+        random.seed(args.seed + t + 1 + 7_000_003)
         seats = [Seat(player_id=pid, chips=args.chips) for pid, _ in specs]
         bots = {pid: create_bot(bot) for pid, bot in specs}
         hero_core = getattr(bots["HERO"], "bot", None)
