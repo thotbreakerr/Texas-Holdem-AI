@@ -232,6 +232,15 @@ def _empty_p5_eval_telemetry() -> dict:
         "p5_r2_read_fire_count": 0,
         "p5_r2_tax_relief_applied_count": 0,
         "p5_r2_tax_relieved_total": 0.0,
+        "n_changed_decisions": 0,
+        "n_chip_ev_ok": 0,
+        "exante_ev_margin_total": 0.0,
+        "mean_exante_ev_margin": 0.0,
+        "realized_chip_delta_total": 0.0,
+        "n_negative_realized": 0,
+        "n_realized_decisions": 0,
+        "n_pending_outcomes": 0,
+        "no_realized_harm": True,
         "p5_error_count": 0,
         "p5_villain_samples": {},
     }
@@ -245,10 +254,24 @@ def _merge_p5_eval_telemetry(total: dict, row: dict | None) -> None:
         "p5_station_read_fire_count",
         "p5_r2_read_fire_count",
         "p5_r2_tax_relief_applied_count",
+        "n_changed_decisions",
+        "n_chip_ev_ok",
+        "n_negative_realized",
+        "n_realized_decisions",
+        "n_pending_outcomes",
         "p5_error_count",
     ):
         total[key] += int(row.get(key, 0) or 0)
     total["p5_r2_tax_relieved_total"] += float(row.get("p5_r2_tax_relieved_total", 0.0) or 0.0)
+    changed = int(row.get("n_changed_decisions", row.get("p5_r2_tax_relief_applied_count", 0)) or 0)
+    total["exante_ev_margin_total"] += float(
+        row.get(
+            "exante_ev_margin_total",
+            float(row.get("mean_exante_ev_margin", 0.0) or 0.0) * changed,
+        )
+        or 0.0
+    )
+    total["realized_chip_delta_total"] += float(row.get("realized_chip_delta_total", 0.0) or 0.0)
     samples = total["p5_villain_samples"]
     for pid, stats in (row.get("p5_villain_samples") or {}).items():
         bucket = samples.setdefault(pid, {})
@@ -266,6 +289,12 @@ def _finalize_p5_eval_telemetry(total: dict) -> dict:
     total["p5_station_read_fire_rate"] = station / decisions
     total["p5_r2_read_fire_rate"] = r2 / decisions
     total["p5_any_active_read_fire_rate"] = (station + r2) / decisions
+    changed = int(total.get("n_changed_decisions", 0) or 0)
+    total["mean_exante_ev_margin"] = (
+        float(total.get("exante_ev_margin_total", 0.0) or 0.0) / changed
+        if changed else 0.0
+    )
+    total["no_realized_harm"] = float(total.get("realized_chip_delta_total", 0.0) or 0.0) >= 0.0
     return total
 
 
@@ -447,7 +476,7 @@ def evaluate_profile(profile: str, pool: list[str], args, arm: str) -> dict:
             early_busts += 1
         telemetry = getattr(hero_core, "p5_telemetry_summary", None)
         if callable(telemetry):
-            _merge_p5_eval_telemetry(p5_telemetry, telemetry())
+            _merge_p5_eval_telemetry(p5_telemetry, telemetry(result))
         for pid, bot_type in specs:
             if pid == "HERO":
                 continue
@@ -570,6 +599,15 @@ def main() -> int:
                       f"(decisions={tel['p5_decisions']})")
                 print(f"  r2 tax relief   : applied={tel['p5_r2_tax_relief_applied_count']} "
                       f"relieved_total={tel['p5_r2_tax_relieved_total']:.4f}")
+                harm_label = "no net realized harm" if tel["no_realized_harm"] else "net realized harm"
+                print(f"  r2 value/no-harm: changed={tel['n_changed_decisions']} "
+                      f"chipEV_ok={tel['n_chip_ev_ok']}/{tel['n_changed_decisions']} "
+                      f"mean_margin={tel['mean_exante_ev_margin']:.4f} "
+                      f"realized_delta={tel['realized_chip_delta_total']:.1f} "
+                      f"negative_realized={tel['n_negative_realized']} "
+                      f"realized={tel['n_realized_decisions']} "
+                      f"pending={tel['n_pending_outcomes']} "
+                      f"({harm_label}; realized outcome only, not counterfactual EV)")
                 for pid, stats in sorted(tel["p5_villain_samples"].items()):
                     print(
                         f"    {pid}: station_n={stats.get('station_response_n', 0)} "

@@ -1170,6 +1170,14 @@ class TournamentHybridBot:
         self.p5_r2_read_fire_count = 0
         self.p5_r2_tax_relief_applied_count = 0
         self.p5_r2_tax_relieved_total = 0.0
+        self.p5_r2_chip_ev_ok_count = 0
+        self.p5_r2_exante_ev_margin_total = 0.0
+        self.p5_r2_realized_count = 0
+        self.p5_r2_realized_chip_delta_total = 0.0
+        self.p5_r2_negative_realized_count = 0
+        self._p5_r2_pending_outcomes: dict[Any, DecisionTrace] = {}
+        self._p5_r2_realized_outcomes: list[DecisionTrace] = []
+        self._p5_last_observed_hand_id: int | None = None
         self._p5_trace_updates: DecisionTrace = {}
 
         # Adaptive Monte Carlo budget for postflop equity.  Defaults are sized
@@ -1199,12 +1207,24 @@ class TournamentHybridBot:
         self.p5_r2_read_fire_count = 0
         self.p5_r2_tax_relief_applied_count = 0
         self.p5_r2_tax_relieved_total = 0.0
+        self.p5_r2_chip_ev_ok_count = 0
+        self.p5_r2_exante_ev_margin_total = 0.0
+        self.p5_r2_realized_count = 0
+        self.p5_r2_realized_chip_delta_total = 0.0
+        self.p5_r2_negative_realized_count = 0
+        self._p5_r2_pending_outcomes = {}
+        self._p5_r2_realized_outcomes = []
+        self._p5_last_observed_hand_id = None
         self._p5_trace_updates = {}
         return None
 
     def act(self, view: PlayerView) -> Action:
         """Return a safe action and populate ``last_decision``."""
         self._p5_trace_updates = self._p5_base_trace()
+        try:
+            self._p5_observe_r2_stack_resolution(view)
+        except Exception as exc:
+            self._p5_record_error("r2_stack_resolution", exc)
         try:
             self._p5_ingest(view)
         except Exception as exc:
@@ -1331,10 +1351,133 @@ class TournamentHybridBot:
             "p5_r2_relief_applied": False,
             "p5_r2_confirmed_spewy": False,
             "p5_r2_aggressor": None,
+            "p5_r2_pending_outcome_count": len(self._p5_r2_pending_outcomes),
         }
 
     def _p5_ingest(self, view: PlayerView) -> None:
         self._profiles.ingest(view)
+
+    @staticmethod
+    def _p5_hand_id_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _p5_same_hand_id(cls, left: Any, right: Any) -> bool:
+        if left == right:
+            return True
+        left_int = cls._p5_hand_id_int(left)
+        right_int = cls._p5_hand_id_int(right)
+        return left_int is not None and left_int == right_int
+
+    @classmethod
+    def _p5_pending_sort_key(cls, hand_id: Any) -> tuple[int, int, str]:
+        hand_int = cls._p5_hand_id_int(hand_id)
+        if hand_int is not None:
+            return (0, hand_int, "")
+        return (1, 0, str(hand_id))
+
+    def _p5_record_r2_pending_outcome(self, trace: DecisionTrace) -> None:
+        hand_id = trace.get("p5_r2_hand_id")
+        if hand_id is None:
+            return
+        stack_before = self._safe_int(trace.get("p5_r2_stack_before"))
+        entry = {
+            "hand_id": hand_id,
+            "hero_pid": trace.get("p5_r2_hero_pid"),
+            "stack_before": stack_before,
+            "call_amount": self._safe_int(trace.get("p5_r2_call_amount")),
+            "eq": self._safe_float(trace.get("p5_r2_eq")),
+            "pot_odds": self._safe_float(trace.get("p5_r2_pot_odds")),
+            "exante_ev_margin": self._safe_float(trace.get("p5_r2_exante_ev_margin")),
+            "chip_ev_ok": bool(trace.get("p5_r2_chip_ev_ok")),
+        }
+        self._p5_r2_pending_outcomes[hand_id] = entry
+        self._p5_trace_updates["p5_r2_pending_outcome_count"] = len(self._p5_r2_pending_outcomes)
+
+    def _p5_resolve_r2_pending_outcome(self, hand_id: Any, delta: int, reason: str) -> None:
+        entry = self._p5_r2_pending_outcomes.pop(hand_id, None)
+        if entry is None:
+            return
+        chip_delta = int(delta)
+        record = dict(entry)
+        record.update({
+            "realized_chip_delta": chip_delta,
+            "realized_reason": reason,
+        })
+        self._p5_r2_realized_outcomes.append(record)
+        self.p5_r2_realized_count += 1
+        self.p5_r2_realized_chip_delta_total += chip_delta
+        if chip_delta < 0:
+            self.p5_r2_negative_realized_count += 1
+        self._p5_trace_updates.update({
+            "p5_r2_last_realized_hand_id": entry.get("hand_id"),
+            "p5_r2_last_realized_chip_delta": chip_delta,
+            "p5_r2_last_realized_reason": reason,
+            "p5_r2_pending_outcome_count": len(self._p5_r2_pending_outcomes),
+        })
+
+    def _p5_observe_r2_stack_resolution(self, view: PlayerView) -> None:
+        current_hand = getattr(view, "hand_id", None)
+        current_int = self._p5_hand_id_int(current_hand)
+        if (
+            current_int is not None
+            and self._p5_last_observed_hand_id is not None
+            and current_int < self._p5_last_observed_hand_id
+        ):
+            self._p5_r2_pending_outcomes = {}
+        if current_int is not None:
+            self._p5_last_observed_hand_id = current_int
+
+        if not self._p5_r2_pending_outcomes:
+            self._p5_trace_updates["p5_r2_pending_outcome_count"] = 0
+            return
+
+        stacks = getattr(view, "stacks", None) or {}
+        for hand_id in sorted(list(self._p5_r2_pending_outcomes), key=self._p5_pending_sort_key):
+            if self._p5_same_hand_id(hand_id, current_hand):
+                continue
+            entry = self._p5_r2_pending_outcomes.get(hand_id)
+            if not entry:
+                continue
+            entry_int = self._p5_hand_id_int(entry.get("hand_id", hand_id))
+            if entry_int is not None and current_int is not None and current_int <= entry_int:
+                continue
+            hero_pid = entry.get("hero_pid")
+            if hero_pid not in stacks:
+                continue
+            delta = self._safe_int(stacks.get(hero_pid)) - self._safe_int(entry.get("stack_before"))
+            self._p5_resolve_r2_pending_outcome(hand_id, delta, "later_stack_observation")
+
+    def p5_flush_r2_pending_outcomes(self, tournament_result: dict | None = None) -> None:
+        if not tournament_result or not self._p5_r2_pending_outcomes:
+            return
+        finish_order = tournament_result.get("finish_order") or []
+        final_chips = tournament_result.get("final_chips") or {}
+
+        for hand_id in sorted(list(self._p5_r2_pending_outcomes), key=self._p5_pending_sort_key):
+            entry = self._p5_r2_pending_outcomes.get(hand_id)
+            if not entry:
+                continue
+            hero_pid = entry.get("hero_pid")
+            stack_before = self._safe_int(entry.get("stack_before"))
+            busted_here = False
+            for finish in finish_order:
+                if (
+                    finish
+                    and len(finish) > 2
+                    and finish[0] == hero_pid
+                    and self._p5_same_hand_id(finish[2], hand_id)
+                ):
+                    busted_here = True
+                    break
+            if busted_here:
+                self._p5_resolve_r2_pending_outcome(hand_id, -stack_before, "bust_finish_order")
+            elif hero_pid in final_chips:
+                delta = self._safe_int(final_chips.get(hero_pid)) - stack_before
+                self._p5_resolve_r2_pending_outcome(hand_id, delta, "final_chips")
 
     def _p5_record_error(self, label: str, exc: Exception | str) -> None:
         self.p5_error_count += 1
@@ -1541,6 +1684,7 @@ class TournamentHybridBot:
             )
             heads_up_shover = len(live_villains) == 1 and aggressor in live_villains and aggressor in all_in
             chip_ev_ok = self._p5_finite(eq) and self._p5_finite(pot_odds) and float(eq) >= float(pot_odds)
+            margin = (float(eq) - float(pot_odds)) if self._p5_finite(eq) and self._p5_finite(pot_odds) else 0.0
             confirmed = False
             spewy_trace: DecisionTrace = {}
             if aggressor is not None:
@@ -1555,15 +1699,26 @@ class TournamentHybridBot:
                 and bool(getattr(self, "p5_r2_enabled", True))
             )
             proposed_tax = round(max(0.0, float(tax) * (1.0 - relief)), 4)
+            stacks = getattr(view, "stacks", None) or {}
+            hero = getattr(view, "me", None)
+            stack_before = self._safe_int(stacks.get(hero, 0))
+            call_amount = min(max(0, self._safe_int(getattr(view, "to_call", 0))), max(0, stack_before))
             self._p5_trace_updates.update({
                 "p5_r2_aggressor": aggressor,
                 "p5_r2_heads_up_shover": heads_up_shover,
+                "p5_r2_eq": round(float(eq), 6) if self._p5_finite(eq) else None,
+                "p5_r2_pot_odds": round(float(pot_odds), 6) if self._p5_finite(pot_odds) else None,
+                "p5_r2_exante_ev_margin": round(margin, 6),
                 "p5_r2_chip_ev_ok": bool(chip_ev_ok),
                 "p5_r2_relief": round(relief, 4),
                 "p5_r2_tax_before": round(float(tax), 4),
                 "p5_r2_tax_after_proposed": proposed_tax,
                 "p5_r2_would_apply": would_apply,
                 "p5_r2_relief_applied": applied,
+                "p5_r2_hand_id": getattr(view, "hand_id", None),
+                "p5_r2_hero_pid": hero,
+                "p5_r2_stack_before": stack_before,
+                "p5_r2_call_amount": call_amount,
                 **spewy_trace,
             })
             return proposed_tax if applied else tax
@@ -1630,14 +1785,22 @@ class TournamentHybridBot:
             self.p5_r2_read_fire_count += 1
         if trace.get("p5_r2_relief_applied"):
             self.p5_r2_tax_relief_applied_count += 1
+            if trace.get("p5_r2_chip_ev_ok"):
+                self.p5_r2_chip_ev_ok_count += 1
+            self.p5_r2_exante_ev_margin_total += self._safe_float(
+                trace.get("p5_r2_exante_ev_margin"),
+                0.0,
+            )
             before = self._safe_float(trace.get("p5_r2_tax_before"), 0.0)
             after = self._safe_float(
                 trace.get("future_edge_tax", trace.get("p5_r2_tax_after_proposed")),
                 before,
             )
             self.p5_r2_tax_relieved_total += max(0.0, before - after)
+            self._p5_record_r2_pending_outcome(trace)
 
-    def p5_telemetry_summary(self) -> DecisionTrace:
+    def p5_telemetry_summary(self, tournament_result: dict | None = None) -> DecisionTrace:
+        self.p5_flush_r2_pending_outcomes(tournament_result)
         villains = {}
         for pid in self._p5_sorted_pids(
             type("_P5View", (), {"opponents": list(self._profiles.profiles), "me": None, "seat_indices": {}})()
@@ -1665,12 +1828,24 @@ class TournamentHybridBot:
                 "fold_to_pressure_hat": round(float(stats.get("fold_to_pressure_hat", 0.0) or 0.0), 4),
             }
         decisions = max(1, self.p5_decision_count)
+        changed = int(self.p5_r2_tax_relief_applied_count)
+        mean_margin = (self.p5_r2_exante_ev_margin_total / changed) if changed else 0.0
+        realized_total = float(self.p5_r2_realized_chip_delta_total)
         return {
             "p5_decisions": self.p5_decision_count,
             "p5_station_read_fire_count": self.p5_station_read_fire_count,
             "p5_r2_read_fire_count": self.p5_r2_read_fire_count,
             "p5_r2_tax_relief_applied_count": self.p5_r2_tax_relief_applied_count,
             "p5_r2_tax_relieved_total": round(float(self.p5_r2_tax_relieved_total), 6),
+            "n_changed_decisions": changed,
+            "n_chip_ev_ok": int(self.p5_r2_chip_ev_ok_count),
+            "exante_ev_margin_total": round(float(self.p5_r2_exante_ev_margin_total), 6),
+            "mean_exante_ev_margin": round(float(mean_margin), 6),
+            "realized_chip_delta_total": round(realized_total, 6),
+            "n_negative_realized": int(self.p5_r2_negative_realized_count),
+            "n_realized_decisions": int(self.p5_r2_realized_count),
+            "n_pending_outcomes": len(self._p5_r2_pending_outcomes),
+            "no_realized_harm": bool(realized_total >= 0.0),
             "p5_any_active_read_fire_rate": (
                 (self.p5_station_read_fire_count + self.p5_r2_read_fire_count) / decisions
             ),
