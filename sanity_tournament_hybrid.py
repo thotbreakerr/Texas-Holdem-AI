@@ -2294,6 +2294,77 @@ def _check_p5_zero_data_neutral():
     return ok
 
 
+def _check_p5_r2_value_no_harm_instrumentation():
+    class _NoR2OutcomeInstrumentationBot(_FixedEquityBot):
+        def _p5_observe_r2_stack_resolution(self, view):
+            return None
+
+        def _p5_record_r2_pending_outcome(self, trace):
+            return None
+
+        def p5_flush_r2_pending_outcomes(self, tournament_result=None):
+            return None
+
+    active = _FixedEquityBot(equity=0.575)
+    disabled = _NoR2OutcomeInstrumentationBot(equity=0.575)
+    for bot in (active, disabled):
+        bot.p5_enabled = True
+        _p5_feed_spewy(bot, start=35000)
+
+    parity_view = _p5_r2_view(hand_id=35100)
+    active_action = active.act(parity_view)
+    disabled_action = disabled.act(parity_view)
+    ok = active_action == disabled_action
+    ok &= active.last_decision.get("p5_r2_relief_applied") is True
+    ok &= len(active._p5_r2_pending_outcomes) == 1
+    active.reset_memory()
+    ok &= active._p5_r2_pending_outcomes == {}
+    ok &= active._p5_r2_realized_outcomes == []
+    ok &= active.p5_r2_chip_ev_ok_count == 0
+    ok &= active.p5_r2_realized_count == 0
+
+    outcome = _FixedEquityBot(equity=0.575)
+    outcome.p5_enabled = True
+    _p5_feed_spewy(outcome, start=35200)
+
+    win_view = _p5_r2_view(hand_id=35300, hero_stack=1000, to_call=1000)
+    outcome.act(win_view)
+    stack_after_win = _postflop_view(
+        [("7", "s"), ("2", "d")],
+        [("A", "c"), ("K", "d"), ("9", "h")],
+        to_call=0,
+        pot=120,
+        opponents=("V",),
+        hero_stack=1350,
+        legal=[{"type": "check"}],
+        hand_id=35301,
+    )
+    outcome.act(stack_after_win)
+
+    bust_view = _p5_r2_view(hand_id=35302, hero_stack=800, to_call=800)
+    outcome.act(bust_view)
+    summary = outcome.p5_telemetry_summary({
+        "finish_order": [("Hero", 6, 35302, 0)],
+        "final_chips": {"Hero": 0, "V": 1800},
+    })
+    expected_delta = (1350 - 1000) - 800
+    ok &= summary["n_changed_decisions"] == 2
+    ok &= summary["n_chip_ev_ok"] == 2
+    ok &= summary["n_realized_decisions"] == 2
+    ok &= summary["realized_chip_delta_total"] == expected_delta
+    ok &= summary["n_negative_realized"] == 1
+    ok &= summary["n_pending_outcomes"] == 0
+    ok &= summary["no_realized_harm"] is False
+    ok &= summary["mean_exante_ev_margin"] > 0.0
+    ok &= [
+        row.get("realized_chip_delta")
+        for row in outcome._p5_r2_realized_outcomes
+    ] == [350, -800]
+
+    print(f"[CHECK 36] {'PASS' if ok else 'FAIL'} - R2 value/no-harm telemetry preserves actions and reconciles outcomes")
+    return ok
+
+
 # --- Cross-process determinism of the decision path (CHECK 35) --------------
 #
 # In-process determinism (CHECK 13, 19) only proves the bot is reproducible
@@ -2475,6 +2546,7 @@ def run():
     PASS &= _check_p5_fail_closed()
     PASS &= _check_p5_zero_data_neutral()
     PASS &= _check_cross_process_determinism()
+    PASS &= _check_p5_r2_value_no_harm_instrumentation()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS
