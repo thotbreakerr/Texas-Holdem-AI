@@ -1907,7 +1907,11 @@ def _check_p5_censoring_discipline():
     folded = _FixedEquityBot()
     _p5_feed_overfolder(folded, folds=5)
     fstats = folded._profiles.stat_summary("V")
-    ok &= fstats["station_response_n"] == 0
+    # O1: folds-to-pressure now count toward the station denominator, so a pure
+    # folder HAS pressure-response samples but scores low (call-rate ~0) and must
+    # never classify as a station.
+    ok &= fstats["station_response_n"] == 5
+    ok &= fstats["station_score_hat"] < 0.60
     ok &= folded._profiles.read_strength("V", "station_score", threshold=0.60, band=0.25) == 0.0
 
     caller = _FixedEquityBot()
