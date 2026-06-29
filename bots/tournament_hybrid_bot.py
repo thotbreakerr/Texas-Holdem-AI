@@ -687,9 +687,14 @@ class OpponentProfiles:
             + counters["pressure_call"]
             + counters["pressure_raise"]
         )
+        # O1 (Phase-7 finding): station_score is the call-rate over ALL postflop
+        # pressure responses, so folding-to-pressure counts against station-ness.
+        # Without folds in the denominator the score is call-vs-raise, which scores
+        # any low-aggression archetype (loose_passive, nit) as a station.
         station_n = (
             counters["postflop_pressure_call"]
             + counters["postflop_pressure_raise"]
+            + counters["postflop_pressure_fold"]
         )
         preflop_pressure_n = counters["preflop_pressure_action_n"]
 
@@ -1144,6 +1149,12 @@ _PROFILE_CONFIGS = {
 class TournamentHybridBot:
     """Legal-by-construction tournament bot with deterministic preflop play."""
 
+    # O1: max broad fold-to-pressure for a villain to still count as a station.
+    # Calibrated from the Phase-7 loose_passive-heavy field: true stations and
+    # loose-passives both sit ~0.24, the nit ~0.51 -- so this cleanly excludes
+    # the folder (nit) while leaving the true station's read intact.
+    _P5_STATION_MAX_FOLD_TO_PRESSURE: float = 0.40
+
     def __init__(self, profile: str = "survival"):
         key = str(profile).strip().lower()
         if key not in _PROFILE_CONFIGS:
@@ -1567,7 +1578,13 @@ class TournamentHybridBot:
             stats = self._profiles.stat_summary(pid, self._p5_confidence_w())
             n = self._safe_int(stats.get("pressure_response_n"))
             strength = self._p5_read_strength(pid, "station_score", threshold=0.60, band=0.25)
-            guard = n >= 4 and strength > 0.0
+            # O1 guard: a true calling-station almost never folds to pressure. A
+            # frequent folder (e.g. a nit) can still post a high postflop call-rate
+            # once it chooses to continue, so a call-rate test alone mislabels it.
+            # Gate the station read on broad fold-to-pressure to exclude folders.
+            f2p = float(stats.get("fold_to_pressure_hat", 0.0) or 0.0)
+            not_folder = f2p <= self._P5_STATION_MAX_FOLD_TO_PRESSURE
+            guard = n >= 4 and strength > 0.0 and not_folder
             score = float(stats.get("station_score_hat", 0.0) or 0.0)
             if guard and (strength, score, str(pid)) > (
                 best["strength"],
@@ -1817,6 +1834,9 @@ class TournamentHybridBot:
                 "postflop_pressure_call": raw.get("postflop_pressure_call", 0),
                 "postflop_pressure_raise": raw.get("postflop_pressure_raise", 0),
                 "postflop_pressure_fold": raw.get("postflop_pressure_fold", 0),
+                "pressure_fold": raw.get("pressure_fold", 0),
+                "pressure_call": raw.get("pressure_call", 0),
+                "pressure_raise": raw.get("pressure_raise", 0),
                 "jam_opportunity_n": stats.get("jam_opportunity_n", 0),
                 "jam_like_count": stats.get("jam_like_count", 0),
                 "large_bet_count": stats.get("large_bet_count", 0),

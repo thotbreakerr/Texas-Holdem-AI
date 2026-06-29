@@ -369,12 +369,21 @@ def _finalize_stress_eval_telemetry(total: dict, p5: dict) -> dict:
             )
         archetype = str(bucket.get("archetype") or "")
         if archetype in ("loose_passive", "nit"):
+            # Mirror the bot's O1 station_score: call-rate over ALL postflop
+            # pressure responses (folds in the denominator), not call-vs-raise,
+            # AND the fold-to-pressure guard (a true station does not fold).
             calls = int(sample.get("postflop_pressure_call", 0) or 0)
             raises = int(sample.get("postflop_pressure_raise", 0) or 0)
-            station_n = calls + raises
+            folds = int(sample.get("postflop_pressure_fold", 0) or 0)
+            station_n = calls + raises + folds
+            bfold = int(sample.get("pressure_fold", 0) or 0)
+            bcall = int(sample.get("pressure_call", 0) or 0)
+            braise = int(sample.get("pressure_raise", 0) or 0)
+            f2p = _p_hat(bfold, bfold + bcall + braise)
+            not_folder = f2p <= 0.40  # mirrors _P5_STATION_MAX_FOLD_TO_PRESSURE
             if station_n >= 4:
                 fp_sampled += 1
-                if _p_hat(calls, station_n) >= 0.60:
+                if not_folder and _p_hat(calls, station_n) >= 0.60:
                     fp_count += 1
                     bucket["station_false_positive"] = 1
                 else:
@@ -609,12 +618,25 @@ def main() -> int:
                       f"pending={tel['n_pending_outcomes']} "
                       f"({harm_label}; realized outcome only, not counterfactual EV)")
                 for pid, stats in sorted(tel["p5_villain_samples"].items()):
+                    # Pooled (cross-tournament) rates -- these match the station
+                    # FP measurement. The per-villain station_score_hat in the
+                    # sample is a per-tournament average-of-ratios and reads low.
+                    _c = int(stats.get("postflop_pressure_call", 0) or 0)
+                    _r = int(stats.get("postflop_pressure_raise", 0) or 0)
+                    _f = int(stats.get("postflop_pressure_fold", 0) or 0)
+                    _bf = int(stats.get("pressure_fold", 0) or 0)
+                    _bc = int(stats.get("pressure_call", 0) or 0)
+                    _br = int(stats.get("pressure_raise", 0) or 0)
+                    _callrate = _p_hat(_c, _c + _r + _f)
+                    _f2p = _p_hat(_bf, _bf + _bc + _br)
                     print(
                         f"    {pid}: station_n={stats.get('station_response_n', 0)} "
                         f"pressure_fold_n={stats.get('pressure_fold_n', 0)} "
                         f"jam_opp_n={stats.get('jam_opportunity_n', 0)} "
                         f"jam_like={stats.get('jam_like_count', 0)} "
-                        f"large_bet={stats.get('large_bet_count', 0)}"
+                        f"large_bet={stats.get('large_bet_count', 0)} "
+                        f"pooled_callrate={_callrate:.3f} "
+                        f"pooled_fold_to_pressure={_f2p:.3f}"
                     )
             stress = s.get("stress_telemetry") or {}
             if stress.get("enabled"):
