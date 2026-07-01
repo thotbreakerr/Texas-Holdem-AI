@@ -551,6 +551,86 @@ if "--diagnostic" in sys.argv:
     print()
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  LEAF THROUGHPUT KNOBS (2026-07-01): max_enumerate + LeafScoreCache
+# ═══════════════════════════════════════════════════════════════════════════
+
+print("=" * 60)
+print("AIVAT: max_enumerate / LeafScoreCache (Path A throughput fix)")
+print("=" * 60)
+
+from core.aivat import LeafScoreCache
+
+_leaf_hole = {
+    0: (("A", "s"), ("K", "s")),
+    1: (("Q", "h"), ("Q", "d")),
+    2: (("7", "c"), ("2", "c")),
+}
+_leaf_flop = Snapshot(
+    hole_cards=_leaf_hole,
+    board=(("K", "h"), ("8", "d"), ("3", "c")),
+    pot=120, stacks=(900, 900, 900), alive=(True, True, True),
+    to_call=0, hero_committed=40, committed_per_seat=(40, 40, 40),
+)
+_leaf_turn = Snapshot(
+    hole_cards=_leaf_hole,
+    board=(("K", "h"), ("8", "d"), ("3", "c"), ("9", "h")),
+    pot=120, stacks=(900, 900, 900), alive=(True, True, True),
+    to_call=0, hero_committed=40, committed_per_seat=(40, 40, 40),
+)
+
+# 1. Defaults unchanged: no cap + no cache is the historical exact path.
+v_exact = aivat_value(_leaf_flop, hero_seat=0)
+print(f"  Flop exact value: {v_exact:.3f}")
+
+# 2. Cache with no cap must be bit-identical to exact (pure memoization).
+v_cached = aivat_value(_leaf_flop, hero_seat=0, cache=LeafScoreCache())
+print(f"  Cache-only == exact: {v_cached == v_exact}")
+if v_cached == v_exact:
+    print("  [PASS] — LeafScoreCache is value-neutral")
+else:
+    PASS = False
+    print(f"  [FAIL] — cache changed the value ({v_cached:.6f} vs {v_exact:.6f})")
+
+# 3. Turn stays exact under any cap >= 44 remaining rivers.
+v_turn_exact = aivat_value(_leaf_turn, hero_seat=0)
+v_turn_capped = aivat_value(_leaf_turn, hero_seat=0, max_enumerate=120)
+if v_turn_capped == v_turn_exact:
+    print("  [PASS] — turn enumeration untouched by cap 120")
+else:
+    PASS = False
+    print(f"  [FAIL] — turn value changed under cap "
+          f"({v_turn_capped:.6f} vs {v_turn_exact:.6f})")
+
+# 4. Capped flop sampling lands near exact (avg over rounds vs MC noise).
+random.seed(20260701)
+samp = sum(
+    aivat_value(_leaf_flop, hero_seat=0, max_enumerate=120)
+    for _ in range(rounds)
+) / rounds
+rel_err = abs(samp - v_exact) / v_exact
+print(f"  Flop sampled(120) avg over {rounds}: {samp:.3f} "
+      f"(exact {v_exact:.3f}, rel err {rel_err:.2%})")
+if rel_err < 0.05:
+    print("  [PASS] — sampled flop value within 5% of exact")
+else:
+    PASS = False
+    print("  [FAIL] — sampled flop value drifted from exact")
+
+# 5. Cache reuse: a second identical call must not consume RNG (the
+#    completion set and scores are memoized for the traversal).
+_c = LeafScoreCache()
+random.seed(7)
+v1 = aivat_value(_leaf_flop, hero_seat=0, max_enumerate=120, cache=_c)
+_rng_state = random.getstate()
+v2 = aivat_value(_leaf_flop, hero_seat=0, max_enumerate=120, cache=_c)
+if v1 == v2 and random.getstate() == _rng_state:
+    print("  [PASS] — cached leaf re-eval is free (no RNG, same value)")
+else:
+    PASS = False
+    print("  [FAIL] — cache did not short-circuit the second evaluation")
+print()
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  OVERALL
 # ═══════════════════════════════════════════════════════════════════════════
 

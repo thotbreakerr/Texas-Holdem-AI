@@ -34,13 +34,16 @@ Checkpoint
 Usage
 -----
     python training/train_cfr_bot_multiway.py
-    python training/train_cfr_bot_multiway.py --tournaments 100000 --iterations 200
+    python training/train_cfr_bot_multiway.py --tournaments 5000 --iterations 10
     python training/train_cfr_bot_multiway.py --profile models/cfr_deep_v2.pkl
+    # exact (uncapped) AIVAT leaf enumeration, pre-2026-07 behavior:
+    python training/train_cfr_bot_multiway.py --leaf_enum_cap 0 --leaf_sims 200
 """
 
 import os
 import random
 import sys
+import time
 
 # Add project root so imports work from any working directory.
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -96,13 +99,26 @@ def _preview_first_flop(rng: random.Random, n_players: int) -> tuple:
     return tuple(deck.pop() for _ in range(3))
 
 
+def _format_eta(seconds: float) -> str:
+    """Human-readable remaining-time estimate."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    if seconds < 48 * 3600:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
 def train_cfr_bot_multiway(
     num_tournaments: int = 50_000,
     chips_per_player: int = 1_000,
-    iterations: int = 200,
+    iterations: int = 10,
     save_every: int = 500,
     profile_path: str = "models/cfr_regret_deep_v2.pkl",
     seed: int | None = None,
+    leaf_sims: int = 100,
+    leaf_enum_cap: int | None = 120,
 ) -> CFRBot:
     """
     Run multi-player CFR self-play for ``num_tournaments`` episodes.
@@ -114,6 +130,9 @@ def train_cfr_bot_multiway(
         save_every:       Persist the regret table every N episodes.
         profile_path:     Path for regret-table persistence.
         seed:             Optional base seed. Episode N uses seed + N - 1.
+        leaf_sims:        Preflop Monte Carlo sims per AIVAT leaf.
+        leaf_enum_cap:    Max turn/flop runouts per AIVAT leaf
+                          (None = exact enumeration, ~990 on the flop).
 
     Returns:
         The trained CFRBot instance.
@@ -127,6 +146,9 @@ def train_cfr_bot_multiway(
     print(f"Base blinds:      {BASE_SB}/{BASE_BB}")
     print(f"Blind escalation: every {BLIND_ESCALATION_EVERY} hands (×1.5)")
     print(f"Iterations/pt:    {iterations}  (MCCFR traversals per decision)")
+    print(f"Leaf sims:        {leaf_sims}  (preflop MC per AIVAT leaf)")
+    print(f"Leaf enum cap:    {leaf_enum_cap if leaf_enum_cap is not None else 'exact (no cap)'}"
+          f"  (turn/flop runouts per AIVAT leaf)")
     print(f"Save every:       {save_every} episodes")
     print(f"Profile path:     {profile_path}")
     if seed is None:
@@ -144,6 +166,8 @@ def train_cfr_bot_multiway(
         iterations=iterations,
         profile_path=profile_path,
         use_average=True,
+        leaf_sims=leaf_sims,
+        leaf_enum_cap=leaf_enum_cap,
     )
 
     loaded_stats = bot.stats()
@@ -163,8 +187,10 @@ def train_cfr_bot_multiway(
     first_flop_previews = []
 
     # ── Main training loop ───────────────────────────────────────────────────
+    t_train_start = time.monotonic()
     try:
         for episode in range(1, num_tournaments + 1):
+            ep_start = time.monotonic()
             episode_seed = seed + episode - 1 if seed is not None else None
             table_rng = (
                 random.Random(episode_seed)
@@ -233,19 +259,26 @@ def train_cfr_bot_multiway(
             if episode % save_every == 0:
                 bot.save(profile_path)
 
-            # ── Progress report every 100 episodes (first 1k) or 1000 ─────
+            # ── Progress report: every episode for the first 10 (heartbeat
+            # with wall time + ETA so a slow config is visible immediately),
+            # then every 100 episodes (first 1k) or 1000. ────────────────
             report_interval = 100 if episode <= 1_000 else 1_000
-            if episode % report_interval == 0:
+            if episode <= 10 or episode % report_interval == 0:
                 s = bot.stats()
                 win_rates = "  ".join(
                     f"{pid}={wins[pid]/episode:.1%}" for pid in PLAYER_IDS
                 )
+                ep_time = time.monotonic() - ep_start
+                avg_ep = (time.monotonic() - t_train_start) / episode
+                eta = _format_eta(avg_ep * (num_tournaments - episode))
                 print(
                     f"  ep={episode:>7}  "
+                    f"{ep_time:6.1f}s/ep  ETA={eta:<7}  "
                     f"info_sets={s['info_sets']:<7}  "
                     f"total_iters={s['total_iterations']:<10}  "
                     f"recursion_calls={s.get('recursion_calls', '?'):<8}  "
-                    f"{win_rates}"
+                    f"{win_rates}",
+                    flush=True,
                 )
 
     except KeyboardInterrupt:
@@ -293,8 +326,18 @@ if __name__ == "__main__":
         help="Starting chips per player (default: 1000)"
     )
     parser.add_argument(
-        "--iterations", type=int, default=200,
-        help="MCCFR traversals per decision point (default: 200)"
+        "--iterations", type=int, default=10,
+        help="MCCFR traversals per decision point (default: 10; each "
+             "traversal fully recurses the tree, so this is expensive)"
+    )
+    parser.add_argument(
+        "--leaf_sims", type=int, default=100,
+        help="Preflop Monte Carlo sims per AIVAT leaf (default: 100)"
+    )
+    parser.add_argument(
+        "--leaf_enum_cap", type=int, default=120,
+        help="Max turn/flop runouts settled per AIVAT leaf (default: 120; "
+             "0 = exact enumeration, ~990 boards per flop leaf — slow)"
     )
     parser.add_argument(
         "--save_every", type=int, default=500,
@@ -319,4 +362,6 @@ if __name__ == "__main__":
         save_every=args.save_every,
         profile_path=args.profile,
         seed=args.seed,
+        leaf_sims=args.leaf_sims,
+        leaf_enum_cap=args.leaf_enum_cap if args.leaf_enum_cap > 0 else None,
     )

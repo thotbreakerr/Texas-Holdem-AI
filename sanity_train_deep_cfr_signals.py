@@ -34,6 +34,9 @@ purpose — and forces it to FAIL).
      true signal and completed-iteration count, and must NOT write or promote
      the .safe / .warn artifacts.  Pre-4.2, abort_without_save outranked the
      interrupt: the run reported "interrupted" yet saved nothing.
+  7. pick_device("cpu") returns cpu — pre-fix an explicit CPU request fell
+     through to the auto branch and was silently upgraded to mps on Apple
+     hardware.
 """
 from __future__ import annotations
 
@@ -435,6 +438,21 @@ def run() -> bool:
     print("Check 6: SIGINT during a FAILING periodic canary still saves (4.2)")
     print("=" * 60)
     PASS &= interrupt_during_failing_canary_check()
+    print()
+
+    print("=" * 60)
+    print("Check 7: pick_device honors an explicit --device cpu")
+    print("=" * 60)
+    # Pre-fix, "cpu" fell through to the auto branch and returned mps on
+    # Apple hardware — an explicit CPU request was silently upgraded.
+    from training.train_deep_cfr import pick_device
+    dev = pick_device("cpu")
+    print(f"  pick_device('cpu') = {dev}")
+    if dev.type == "cpu":
+        print("  [PASS] — explicit cpu request returns cpu on every platform")
+    else:
+        PASS = False
+        print("  [FAIL] — explicit cpu request was overridden")
     print()
 
     print("=" * 60)

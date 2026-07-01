@@ -38,7 +38,11 @@ from core.equity import equity as _canonical_equity
 from core.equity import equity_bucket as _canonical_equity_bucket
 from core.action_history import ActionEvent, tokenize as _canonical_tokenize
 from core.action_history import sizing_token as _sizing_token
-from core.aivat import Snapshot as _Snapshot, value as _aivat_value
+from core.aivat import (
+    LeafScoreCache as _LeafScoreCache,
+    Snapshot as _Snapshot,
+    value as _aivat_value,
+)
 from core.opponent_stats import OpponentStatTracker as _OpponentStatTracker
 from core.table_order import street_action_order as _shared_street_action_order
 
@@ -1237,6 +1241,15 @@ class CFRBot:
         If ``True`` (default), play the cumulative average strategy (the
         standard CFR deployment policy). If ``False``, play the current
         regret-matched strategy.
+    leaf_sims : int
+        Preflop Monte Carlo sims per leaf evaluation (default 200, the
+        historical value) — both the AIVAT training leaf and the inference
+        equity fallback.
+    leaf_enum_cap : int | None
+        Max turn/flop runouts settled per AIVAT training leaf. ``None``
+        (default) = exact enumeration (flop = C(45,2) ≈ 990 boards); the
+        trainer passes a cap (e.g. 120) to trade a little leaf precision
+        for a large speedup.
     """
 
     def __init__(
@@ -1247,10 +1260,22 @@ class CFRBot:
         inference_mode: bool = False,
         search_depth: int = _DEFAULT_SEARCH_DEPTH,
         allow_stale_profile: bool = False,
+        leaf_sims: int = 200,
+        leaf_enum_cap: Optional[int] = None,
     ):
         self.iterations = iterations
         self.profile_path = profile_path
         self.use_average = use_average
+        # Leaf-evaluation budget (Path A throughput fix, 2026-07-01).
+        # leaf_sims: preflop Monte Carlo sims per leaf (both the AIVAT
+        # training leaf and the inference equity fallback). leaf_enum_cap:
+        # max turn/flop runouts settled per training leaf — None keeps the
+        # historical exact enumeration (flop = C(45,2) ≈ 990 boards).
+        self.leaf_sims = leaf_sims
+        self.leaf_enum_cap = leaf_enum_cap
+        # Per-traversal AIVAT memo; created in _run_iterations, valid only
+        # while one sampled deal is fixed. None outside training traversals.
+        self._traversal_cache: Optional[_LeafScoreCache] = None
         # When True, skip _run_iterations during act() so the loaded regret
         # table is used as-is without being overwritten by online updates.
         self.inference_mode = inference_mode
@@ -1605,16 +1630,22 @@ class CFRBot:
         builds a full-info _GameState from PlayerView.history, and recurses.
         """
         completed = 0
-        for _ in range(self.iterations):
-            sample_opponents = max(1, len(view.opponents or []))
-            opp_hands = self._sample_opponent_hands(hole, board, sample_opponents)
-            state = self._build_training_game_state(
-                view, hero_hole=hole, opp_hands=opp_hands, board=board
-            )
-            if state is None:
-                continue
-            self._cfr_recurse(state, state.hero_seat, depth=0)
-            completed += 1
+        try:
+            for _ in range(self.iterations):
+                sample_opponents = max(1, len(view.opponents or []))
+                opp_hands = self._sample_opponent_hands(hole, board, sample_opponents)
+                state = self._build_training_game_state(
+                    view, hero_hole=hole, opp_hands=opp_hands, board=board
+                )
+                if state is None:
+                    continue
+                # Fresh memo per traversal: the sampled deal is fixed for
+                # this traversal only, so cached runouts/scores expire here.
+                self._traversal_cache = _LeafScoreCache()
+                self._cfr_recurse(state, state.hero_seat, depth=0)
+                completed += 1
+        finally:
+            self._traversal_cache = None
 
         self._total_iterations += completed
 
@@ -1807,7 +1838,7 @@ class CFRBot:
                 list(hole),
                 list(game_state.board),
                 n_opponents=max(1, n_opponents),
-                n_sims=200,
+                n_sims=self.leaf_sims,
             )
             return eq * game_state.pot
 
@@ -1826,7 +1857,10 @@ class CFRBot:
             hero_committed=game_state.total_committed_per_seat[hero_seat],
             committed_per_seat=tuple(game_state.total_committed_per_seat),
         )
-        return _aivat_value(snapshot, hero_seat, mode="chip_ev", n_sims=200)
+        return _aivat_value(snapshot, hero_seat, mode="chip_ev",
+                            n_sims=self.leaf_sims,
+                            max_enumerate=self.leaf_enum_cap,
+                            cache=self._traversal_cache)
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Gate 2A: Recursive tree CFR (item 1)

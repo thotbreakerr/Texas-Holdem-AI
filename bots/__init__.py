@@ -8,6 +8,7 @@ Provides:
 """
 import os
 import re
+import sys
 from core.engine import InProcessBot, RandomBot
 from core.bot_api import BotAdapter, PlayerView, Action
 
@@ -87,6 +88,16 @@ def create_bot(btype: str) -> BotAdapter:
         if ":" in raw_btype:
             profile_path = raw_btype.split(":", 1)[1]
         elif not os.path.exists(profile_path):
+            # Bare "cfr" must not crash without the default artifact (gated
+            # by sanity_review_findings), but a blank bot silently poisons
+            # evals and RL opponent pools — so be unmissable about it.
+            print(
+                f"[create_bot] WARNING: default profile {profile_path!r} "
+                f"not found — creating UNTRAINED CFRBot (blank regret "
+                f"table, plays from heuristic fallback). Pass cfr:<path> "
+                f"to load a trained profile.",
+                file=sys.stderr,
+            )
             profile_path = None
         return _wrap(CFRBot(profile_path=profile_path, inference_mode=True))
 

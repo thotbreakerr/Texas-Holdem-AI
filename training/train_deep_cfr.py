@@ -132,6 +132,8 @@ def epsilon_for_iteration(t: int, total: int) -> float:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def pick_device(arg: str) -> torch.device:
+    if arg == "cpu":
+        return torch.device("cpu")
     if arg == "mps":
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")

@@ -26,7 +26,7 @@ import pickle
 import sys
 import tempfile
 import uuid
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -680,13 +680,25 @@ def test_new_cfr_profile_and_stats_contracts() -> None:
         f"total_iterations={skipped._total_iterations}",
     )
 
-    with redirect_stdout(io.StringIO()):
+    bare_stderr = io.StringIO()
+    with redirect_stdout(io.StringIO()), redirect_stderr(bare_stderr):
         bare = create_bot("cfr")
     check(
         "bare cfr works without default artifact",
         bare is not None,
         "create_bot('cfr') raised or returned None",
     )
+    # The no-crash fallback is intentional, but it must be LOUD: a blank
+    # CFRBot silently poisons eval pools and RL opponent tables. Only
+    # assert the warning when the default artifact is actually absent
+    # (with a real profile on disk, bare cfr loads it and stays quiet).
+    if not os.path.exists("models/cfr_regret_deep_v2.pkl"):
+        check(
+            "bare cfr fallback warns UNTRAINED on stderr",
+            "UNTRAINED" in bare_stderr.getvalue(),
+            f"no UNTRAINED warning on stderr; got: "
+            f"{bare_stderr.getvalue()!r:.120}",
+        )
 
     node = _CFRNode()
     node.strategy_sum[1] = 1.0
