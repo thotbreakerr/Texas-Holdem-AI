@@ -11,6 +11,11 @@ AIVAT paper.
 
 Both Path A and Path B import from here. This module is read-only
 after Gate 1 closes.
+
+Amendment (2026-07-01, Path A throughput fix): opt-in `max_enumerate` and
+`cache` parameters added to value(). Defaults (None) preserve the exact
+Gate-1 behavior — exhaustive turn/flop enumeration, fresh preflop Monte
+Carlo per call, no memoization. Only Path A's training leaf opts in.
 """
 from __future__ import annotations
 
@@ -42,6 +47,26 @@ class Snapshot:
     committed_per_seat: tuple # per-seat chips already in the pot this hand
 
 
+class LeafScoreCache:
+    """Per-traversal memo for leaf evaluation.
+
+    Scope contract: valid only while the deal (all hole cards) is fixed —
+    i.e. within a single MCCFR traversal. The owner must create a fresh
+    instance per traversal; sharing one across deals returns stale scores.
+
+    completions: (board, need, budget) -> list of full boards, so every
+        leaf under the same public board settles the SAME runout set
+        (this is what lets sampled runouts still hit the score memo).
+    scores: (seat, hole, full_board) -> eval_hand score. Hole is in the
+        key defensively; within the contract it never varies per seat.
+    """
+    __slots__ = ("completions", "scores")
+
+    def __init__(self):
+        self.completions = {}
+        self.scores = {}
+
+
 def _deal_remaining_board(board_tuple, deck_remaining, need):
     """Complete the board from remaining deck cards.
 
@@ -55,14 +80,23 @@ def _deal_remaining_board(board_tuple, deck_remaining, need):
     return [board_tuple + combo for combo in combinations(deck_remaining, need)]
 
 
-def _score_alive_hands(hole_cards_dict, full_board, alive_tuple):
+def _score_alive_hands(hole_cards_dict, full_board, alive_tuple, cache=None):
     """Return {seat: score} for live seats with known hole cards."""
     board_list = list(full_board)
     scores = {}
     for seat, is_alive in enumerate(alive_tuple):
         if not is_alive or seat not in hole_cards_dict:
             continue
-        scores[seat] = eval_hand(list(hole_cards_dict[seat]), board_list)
+        hole = hole_cards_dict[seat]
+        if cache is None:
+            scores[seat] = eval_hand(list(hole), board_list)
+            continue
+        key = (seat, tuple(tuple(c) for c in hole), full_board)
+        score = cache.scores.get(key)
+        if score is None:
+            score = eval_hand(list(hole), board_list)
+            cache.scores[key] = score
+        scores[seat] = score
     return scores
 
 
@@ -125,7 +159,8 @@ def _side_pot_awards(scores, alive_tuple, committed_per_seat, pot):
 
 
 def _evaluate_showdown(hole_cards_dict, full_board, alive_tuple, pot,
-                        stacks_tuple, hero_seat, committed_per_seat):
+                        stacks_tuple, hero_seat, committed_per_seat,
+                        cache=None):
     """Evaluate a single showdown scenario for chip-EV.
 
     Returns hero's share of the pot (the equity * pot value).
@@ -139,13 +174,16 @@ def _evaluate_showdown(hole_cards_dict, full_board, alive_tuple, pot,
             return pot
         return 0.0
 
-    scores = _score_alive_hands(hole_cards_dict, full_board, alive_tuple)
+    scores = _score_alive_hands(hole_cards_dict, full_board, alive_tuple,
+                                cache=cache)
     awards = _side_pot_awards(scores, alive_tuple, committed_per_seat, pot)
     return awards.get(hero_seat, 0.0)
 
 
 def value(snapshot: Snapshot, hero_seat: int, mode: str = "chip_ev",
-          payouts=None, n_sims: int = 500) -> float:
+          payouts=None, n_sims: int = 500,
+          max_enumerate: Optional[int] = None,
+          cache: Optional[LeafScoreCache] = None) -> float:
     """Equity-shaped value of the snapshot for hero_seat.
 
     Convention:
@@ -173,6 +211,16 @@ def value(snapshot: Snapshot, hero_seat: int, mode: str = "chip_ev",
     The 500 preflop default is higher than equity()'s 100 because preflop
     is the only noisy case here and we want it tight -- AIVAT is called
     on every snapshot in every training tournament.
+
+    max_enumerate (chip_ev mode only): when the exact turn/flop runout
+        enumeration would exceed this many boards, settle a random sample
+        of that size instead (module-global `random`, so seeded runs stay
+        reproducible). None (default) = exact enumeration, the historical
+        behavior. Turn (~44 boards) stays exact under any cap >= 44.
+
+    cache (chip_ev mode only): a LeafScoreCache scoped to the current
+        traversal/deal. Reuses runout sets and per-seat hand scores across
+        leaf evaluations of the same deal. None (default) = no memoization.
     """
     # Edge case: hero already folded
     if not snapshot.alive[hero_seat]:
@@ -209,7 +257,8 @@ def value(snapshot: Snapshot, hero_seat: int, mode: str = "chip_ev",
 
     if mode == "chip_ev":
         return _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
-                              deck_remaining, n_sims)
+                              deck_remaining, n_sims,
+                              max_enumerate=max_enumerate, cache=cache)
     elif mode == "tournament":
         if payouts is None:
             raise ValueError("payouts required for tournament mode")
@@ -220,7 +269,7 @@ def value(snapshot: Snapshot, hero_seat: int, mode: str = "chip_ev",
 
 
 def _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
-                   deck_remaining, n_sims):
+                   deck_remaining, n_sims, max_enumerate=None, cache=None):
     """Compute chip-EV value: equity * pot."""
 
     if cards_remaining == 0:
@@ -228,34 +277,54 @@ def _chip_ev_value(snapshot, hero_seat, board, cards_remaining,
         return _evaluate_showdown(
             snapshot.hole_cards, board, snapshot.alive,
             snapshot.pot, snapshot.stacks, hero_seat,
-            snapshot.committed_per_seat)
+            snapshot.committed_per_seat, cache=cache)
 
-    if cards_remaining <= 2:
-        # Turn (1 card) or flop (2 cards): enumerate exactly
-        boards = _deal_remaining_board(board, deck_remaining, cards_remaining)
-        total_value = 0.0
-        for full_board in boards:
-            total_value += _evaluate_showdown(
-                snapshot.hole_cards, full_board, snapshot.alive,
-                snapshot.pot, snapshot.stacks, hero_seat,
-                snapshot.committed_per_seat)
-        return total_value / len(boards) if boards else 0.0
+    boards = _runout_boards(board, deck_remaining, cards_remaining,
+                            n_sims, max_enumerate, cache)
+    if not boards:
+        return 0.0
 
-    # Preflop (5 cards remaining): Monte Carlo
     total_value = 0.0
-    valid = 0
-    for _ in range(n_sims):
-        if len(deck_remaining) < cards_remaining:
-            break
-        sample = random.sample(deck_remaining, cards_remaining)
-        full_board = board + tuple(sample)
+    for full_board in boards:
         total_value += _evaluate_showdown(
             snapshot.hole_cards, full_board, snapshot.alive,
             snapshot.pot, snapshot.stacks, hero_seat,
-            snapshot.committed_per_seat)
-        valid += 1
+            snapshot.committed_per_seat, cache=cache)
+    return total_value / len(boards)
 
-    return total_value / valid if valid > 0 else 0.0
+
+def _runout_boards(board, deck_remaining, cards_remaining, n_sims,
+                   max_enumerate, cache):
+    """Board completions to settle, cached per (board, need, budget).
+
+    Turn (1 card) / flop (2 cards): exact enumeration, downsampled to
+    max_enumerate boards when the combo count exceeds it. Preflop
+    (5 cards): n_sims Monte Carlo boards. With a cache, every leaf that
+    shares this public board within the deal settles the SAME runout set,
+    so sampled boards still hit the per-seat score memo.
+    """
+    budget = n_sims if cards_remaining > 2 else max_enumerate
+    key = (board, cards_remaining, budget)
+    if cache is not None:
+        cached = cache.completions.get(key)
+        if cached is not None:
+            return cached
+
+    if cards_remaining <= 2:
+        boards = _deal_remaining_board(board, deck_remaining, cards_remaining)
+        if max_enumerate is not None and len(boards) > max_enumerate:
+            boards = random.sample(boards, max_enumerate)
+    else:
+        # Preflop: Monte Carlo
+        boards = []
+        if len(deck_remaining) >= cards_remaining:
+            for _ in range(n_sims):
+                sample = random.sample(deck_remaining, cards_remaining)
+                boards.append(board + tuple(sample))
+
+    if cache is not None:
+        cache.completions[key] = boards
+    return boards
 
 
 def _tournament_value(snapshot, hero_seat, board, cards_remaining,
