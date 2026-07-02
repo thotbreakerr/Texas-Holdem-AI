@@ -881,6 +881,8 @@ def test_new_chip_accounting_and_training_failure_contracts() -> None:
         iterations=0,
         round_size=25_000,
         update_interval=1,
+        fit_steps=1,
+        fit_batch_size=999,
         checkpoint_interval=100,
         batch_size=999,
         lr=1e-4,

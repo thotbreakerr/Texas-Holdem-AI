@@ -938,7 +938,10 @@ def run_training(args) -> dict:
     print(f"  Variant:             {args.variant}")
     print(f"  Traversals:          {args.iterations}")
     print(f"  Frozen round size:   {args.round_size}")
-    print(f"  Fit-step divisor:    {args.update_interval}")
+    print(f"  Fit steps/round:     {args.fit_steps}")
+    print(f"  Fit batch size:      {args.fit_batch_size} "
+          f"(falls back to {args.batch_size} on small reservoirs)")
+    print(f"  Progress interval:   {args.update_interval}")
     print(f"  Checkpoint interval: {args.checkpoint_interval}")
     print(f"  Curriculum:          {args.curriculum_profile} "
           f"{CURRICULUM_PROFILES[args.curriculum_profile]}")
@@ -1093,20 +1096,34 @@ def run_training(args) -> dict:
         bot.network.reinitialize_advantage()
         optimizers["advantage"] = torch.optim.Adam(
             bot.network.advantage.parameters(), lr=args.lr)
-        fit_steps = max(1, math.ceil(round_span / max(1, args.update_interval)))
+        # Flat per-round budget: the advantage net restarts from scratch, so
+        # the fit must be sized to the reservoir, not to the traversal span.
+        # (Deriving it from round_span/update_interval gave the 2026-07-02
+        # pilot 250 steps for a 5.36M-param reinit — a policy of pure noise.)
+        fit_steps = args.fit_steps
+        fit_batch = (
+            args.fit_batch_size
+            if len(buffers["regret"]) >= args.fit_batch_size
+            else args.batch_size
+        )
         print(
             f"[ROUND] fitting round {round_index + 1} at iter {round_end}: "
-            f"{fit_steps} steps from cumulative reservoirs",
+            f"{fit_steps} steps (batch {fit_batch}) from cumulative "
+            f"reservoirs",
             flush=True,
         )
+        adv_fit_losses = []
+        steps_run = 0
+        t_fit = _time.monotonic()
         for _ in range(fit_steps):
+            steps_run += 1
             r_loss, v_loss, s_loss, info = train_step(
                 bot.network,
                 optimizers,
                 buffers["regret"],
                 buffers["value"],
                 buffers["sizing"],
-                args.batch_size,
+                fit_batch,
                 device,
                 strategy_buf=buffers["strategy"],
             )
@@ -1145,9 +1162,29 @@ def run_training(args) -> dict:
                     head_steps[head] += 1
             if info["heads_trained"].get("regret", False):
                 gradient_steps_taken += 1
+                adv_fit_losses.append(r_loss)
         round_index += 1
         last_fit_iteration = round_end
         bot.network.eval()
+        # Fit-quality line, smoothed over windows (single-batch endpoints
+        # are noise): a head-vs-tail average that barely moves means the
+        # deployed policy is regret-matching on an unfit net — the
+        # 2026-07-02 pilot failure mode — long before a canary trips.
+        if adv_fit_losses:
+            k = max(1, min(25, len(adv_fit_losses) // 4))
+            head_avg = sum(adv_fit_losses[:k]) / k
+            tail_avg = sum(adv_fit_losses[-k:]) / k
+            adv_note = (
+                f"adv_loss {head_avg:.4f} -> {tail_avg:.4f} "
+                f"(avg of first/last {k})")
+        else:
+            adv_note = "advantage head never trained (regret buffer < batch)"
+        print(
+            f"[ROUND] round {round_index} fit complete at iter {round_end}: "
+            f"{adv_note} over {steps_run} steps "
+            f"({_time.monotonic() - t_fit:.0f}s)",
+            flush=True,
+        )
         return True
 
     try:
@@ -1309,7 +1346,28 @@ def parse_args(argv=None):
         "--update-interval",
         type=int,
         default=100,
-        help="Traversals per refit optimizer batch at each round boundary",
+        help="Traversals between progress lines",
+    )
+    parser.add_argument(
+        "--fit-steps",
+        type=int,
+        default=4_000,
+        help=(
+            "Optimizer steps per round refit (default: 4,000). The advantage "
+            "network is reinitialized every round, so this budget decides "
+            "whether the deployed policy reflects the reservoir at all — the "
+            "2026-07-02 pilot collapse traced to an effective 250 here."
+        ),
+    )
+    parser.add_argument(
+        "--fit-batch-size",
+        type=int,
+        default=1_024,
+        help=(
+            "Batch size during round refits (default: 1,024). Falls back to "
+            "--batch-size while the regret reservoir is still smaller than "
+            "this."
+        ),
     )
     parser.add_argument("--checkpoint-interval", type=int, default=5_000)
     parser.add_argument("--batch-size", type=int, default=256)
@@ -1346,6 +1404,8 @@ def parse_args(argv=None):
         "iterations",
         "round_size",
         "update_interval",
+        "fit_steps",
+        "fit_batch_size",
         "checkpoint_interval",
         "batch_size",
         "canary_fail_patience",

@@ -308,6 +308,20 @@ overnight training run (steps 7/8 below) after the appropriate ladder is green.
    Use `run_eval.py --mode pilot` for the six-player `1/6` baseline gate and
    `--mode promotion --promotion-opponent <bot>` for the final 1,000-tournament
    canary-clean confidence-interval check.
+   **Attempt 1 post-mortem (2026-07-02):** the first 150k pilot ABORTED at the
+   iter-100k hard health gate after 12.8 h (`output/deep_cfr_v2_pilot150k.log`).
+   Root cause (code + reservoir analysis): the per-round advantage refit budget
+   was derived from `round_size/update_interval` = **250 Adam steps for a full
+   5.36M-param reinit** — end-of-fit loss ≈ predict-zero, so each round deployed
+   a regret-matched-noise policy and the all-in mass flapped
+   (adv_raw 0 → 70.7 → 0.2 → 95.2%). NOT the May all-in-regret-row bug (reservoir
+   scan: all-in targets 7.5–16.3 BB mean, same range as other rows). Fixed
+   2026-07-02: dedicated `--fit-steps` (default 4,000) + `--fit-batch-size`
+   (default 1,024) decoupled from `--update-interval` (now progress-only), and a
+   `[ROUND] ... fit complete: adv_loss <head> -> <tail>` quality line — a
+   barely-moving tail average means underfit; do not proceed to 1M on such a
+   pilot. Rerun the smoke + pilot at the new defaults (~+30 min total fit time
+   at 150k; traversal cost unchanged).
 8. [TODO] **User-driven: train Path A on M5 Max CPU after Path B finishes.** Re-benchmarked 2026-07-01 after the AIVAT leaf-cost fix (`--leaf_sims` / `--leaf_enum_cap` + per-traversal `LeafScoreCache`): at the new defaults (`--iterations 10 --leaf_sims 100 --leaf_enum_cap 120`), full 6-max tournaments run ~0.45 s/traversal ≈ 1.5–4 min/tournament (high variance with tournament length). So `--tournaments 5000` is a **~7–9 day** run, not overnight — the old "2–4 hours" estimate predated the recursive `_cfr_recurse` + AIVAT-leaf rewrite and was never re-measured (pre-fix reality was ~1.9–2.4 s/traversal ⇒ weeks–months). An overnight (~10 h) run fits **~250–350 tournaments** at defaults, or ~350–450 with `--leaf_sims 50 --leaf_enum_cap 60` (~0.32 s/traversal). `--leaf_enum_cap 0 --leaf_sims 200` restores the exact pre-2026-07 leaf evaluation. The trainer prints per-episode wall time + ETA for the first 10 episodes — sanity-check the ETA before walking away. Never concurrent with Path B (unified memory contention).
 
 #### Eval and pocket bots — HARNESS COMPLETE, EVAL USER-DRIVEN

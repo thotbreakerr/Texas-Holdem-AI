@@ -175,7 +175,9 @@ def run() -> bool:
             "--variant", "small",
             "--iterations", str(threshold * 4),  # plenty past the threshold
             "--round-size", "1",
-            "--update-interval", "1",            # one train_step per iteration
+            "--update-interval", "1",
+            "--fit-steps", "1",                  # one train_step per iteration
+            "--fit-batch-size", "8",
             "--checkpoint-interval", "1000000",  # no periodic checkpoints
             "--batch-size", "8",
             "--aivat-sims", "1",
@@ -276,6 +278,8 @@ def run() -> bool:
             "--iterations", str(threshold * 6),
             "--round-size", "1",
             "--update-interval", "1",
+            "--fit-steps", "1",
+            "--fit-batch-size", "8",
             "--checkpoint-interval", "1000000",
             "--batch-size", "8",
             "--aivat-sims", "1",
@@ -325,7 +329,9 @@ def run() -> bool:
             "--variant", "small",
             "--iterations", str(threshold * 4),
             "--round-size", "1",
-            "--update-interval", "1",            # one train_step per iteration
+            "--update-interval", "1",
+            "--fit-steps", "1",                  # one train_step per iteration
+            "--fit-batch-size", "8",
             "--checkpoint-interval", "1000000",  # no periodic checkpoints
             "--batch-size", "8",
             "--aivat-sims", "1",

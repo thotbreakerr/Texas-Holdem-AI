@@ -180,3 +180,44 @@ quality), nothing new.
   turn exactness under cap, sampled-flop tolerance, RNG short-circuit) ALL PASS.
 - F2 (start Path B rollout) and F4 (regenerate ML session logs) remain open — both are
   runs to launch, not code changes.
+
+---
+
+## Addendum 2 — Path B pilot #1 abort + fit-budget fix (2026-07-02)
+
+The F2 rollout ran: 10k smoke PASSED, then the fresh 150k pilot **ABORTED at the
+iter-100k hard health gate** after 12.8 h (`output/deep_cfr_v2_pilot150k.log`) —
+raw_all_in 17.7% (limit <10%), strong_continue 43.3% (≥80%), normal_mass 14.1% (≥30%),
+adv_raw 95.2%. Probes oscillated with growing amplitude across the four round fits
+(adv_raw 0 → 70.7 → 0.2 → 95.2%).
+
+**Root cause** (code + reservoir analysis): the per-round advantage refit budget was
+derived from `round_size/update_interval` = **250 Adam steps for a full 5.36M-param
+reinit** against a ≥588k-sample reservoir. End-of-fit losses (8.6/10.9/16.8) matched
+the mean |target| scale — i.e. no better than predicting zero — so each round deployed
+a regret-matched-noise policy; linear CFR weights then made each refit chase the prior
+round's distortion.
+
+**Reservoir evidence** (19.5GB checkpoint at iter 95k, regret buffer 588,164 samples,
+mean|target| / max|target| in BB by round; buckets by sample weight = iteration):
+
+| action | R1 (1–25k) | R2 (25–50k) | R3 (50–75k) | R4 (75–95k) |
+|---|---|---|---|---|
+| fold | 13.2 / 326 | 20.7 / 380 | 21.0 / 555 | 11.7 / 334 |
+| check_call | 10.0 / 326 | 10.6 / 472 | 18.2 / 579 | 15.0 / 388 |
+| bet_33 | 6.3 / 265 | 11.2 / 345 | 13.8 / 399 | 9.8 / 401 |
+| bet_100 | 6.7 / 240 | 13.1 / 358 | 14.4 / 444 | 9.5 / 286 |
+| all_in | 16.3 / 571 | 10.5 / 372 | 7.5 / 248 | 10.8 / 286 |
+
+This **refutes** "all-in targets are outsized" (they sit in the same range as fold /
+check_call) and confirms the failure was fit adequacy, not target corruption — a
+different mechanism than the May v1 collapse. Both 19.5GB pilot checkpoints were
+deleted after this analysis; this table is the durable record.
+
+**Fix (same day)**: dedicated `--fit-steps` (default 4,000) + `--fit-batch-size`
+(default 1,024, small-reservoir fallback) decoupled from `--update-interval` (now
+progress-only); `[ROUND] ... fit complete: adv_loss <head-avg> -> <tail-avg>` quality
+line (windowed — single-batch endpoints are noise). Gate pins in the five tiny-smoke
+gates preserve their old 1–3-step semantics; signals gate Check 8 pins the production
+defaults. Ladder 32/0 + all trainer gates green. TRAINING_PLAN step 7 carries the
+post-mortem and the rerun rule.

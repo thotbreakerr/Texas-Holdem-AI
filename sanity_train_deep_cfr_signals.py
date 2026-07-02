@@ -37,6 +37,9 @@ purpose — and forces it to FAIL).
   7. pick_device("cpu") returns cpu — pre-fix an explicit CPU request fell
      through to the auto branch and was silently upgraded to mps on Apple
      hardware.
+  8. --fit-steps / --fit-batch-size defaults are production-sized — the
+     2026-07-02 pilot collapse traced to the round refit deriving its budget
+     from round_size/update_interval (250 steps for a full advantage reinit).
 """
 from __future__ import annotations
 
@@ -453,6 +456,24 @@ def run() -> bool:
     else:
         PASS = False
         print("  [FAIL] — explicit cpu request was overridden")
+    print()
+
+    print("=" * 60)
+    print("Check 8: round-refit budget defaults are production-sized")
+    print("=" * 60)
+    # The 2026-07-02 pilot collapse traced to fit_steps being derived from
+    # round_size/update_interval (= 250 steps for a full 5.36M-param
+    # advantage reinit — a policy of regret-matched noise). Pin the
+    # dedicated budget so the footgun cannot silently return.
+    from training.train_deep_cfr import parse_args as _parse_args
+    fit_defaults = _parse_args(["--variant", "small"])
+    print(f"  default --fit-steps = {fit_defaults.fit_steps:,}; "
+          f"--fit-batch-size = {fit_defaults.fit_batch_size:,}")
+    if fit_defaults.fit_steps >= 2_000 and fit_defaults.fit_batch_size >= 256:
+        print("  [PASS] — refit budget is sized to the reservoir, not the span")
+    else:
+        PASS = False
+        print("  [FAIL] — refit budget default regressed below production size")
     print()
 
     print("=" * 60)
