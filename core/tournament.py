@@ -94,7 +94,7 @@ def run_tournament(
         raise ValueError("ante must be non-negative")
 
     # An explicitly-passed table wins; otherwise select the engine
-    # implementation (legacy by default, or "pe" / THAI_ENGINE_IMPL).
+    # implementation ("pe" by default since P6, or "legacy" / THAI_ENGINE_IMPL).
     table = table or make_table(rng=rng, engine_impl=engine_impl)
     dealer = dealer_index
     hand_count = 0

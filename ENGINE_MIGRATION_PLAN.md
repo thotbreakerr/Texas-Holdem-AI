@@ -1,12 +1,15 @@
 # Engine Migration — Poker-Engine as the Rules Core (Implementation Plan)
 
-> Status: **P1–P5 IMPLEMENTED (2026-07-06)** on branch
+> Status: **IMPLEMENTED — P1–P6 done (2026-07-06)** on branch
 > `engine-migration-poker-engine`. D1 = clean break, D2 = yes (both approved).
 > Poker-Engine patches are additive and default-off; PE's own 32 tests stay
-> green. The legacy engine is untouched and remains the default. Full sanity
-> ladder is a clean **37/37 under both legacy and PE**; P5 A/B shows competitive
-> equivalence with exact chip conservation (after fixing a short-blind leak).
-> **Remaining: P6 (flip default before the next fresh CFR/Deep CFR run).**
+> green. Full sanity ladder is a clean **37/37 under both legacy and PE**; P5 A/B
+> shows competitive equivalence with exact chip conservation (after fixing a
+> short-blind leak). **P6 done:** the default engine is now **`pe`**
+> (`core/engine_factory.py :: DEFAULT_ENGINE_IMPL`); the legacy engine is marked
+> DEPRECATED in-code but stays selectable via `engine_impl="legacy"` /
+> `THAI_ENGINE_IMPL=legacy` so the ~50 `sanity_*.py` regression tests keep
+> exercising it. The next fresh CFR / Deep CFR runs will train on `pe`.
 >
 > Goal: replace `core/engine.py`'s betting/state machine with the engine from
 > `../Poker-Engine`, while preserving the `PlayerView`/`BotAdapter` contract so
@@ -34,8 +37,9 @@
 **Texas-Holdem-AI:**
 - `core/pe_engine.py`: `PokerEngineTable` (drop-in `Table`). Legacy unchanged.
 - `core/engine_factory.py`: `make_table(rng, engine_impl)` — the single
-  selection seam; lazy imports so the default legacy path never loads
-  Poker-Engine. Wired into `run_tournament`, the training loops, the run
+  selection seam; lazy imports so the unselected engine is never imported (the
+  legacy escape hatch never pulls in Poker-Engine, and vice-versa). Wired into
+  `run_tournament`, the training loops, the run
   utilities, and a `run_eval.py --engine` flag.
 - `sanity_engine_parity.py`: legacy-vs-adapter parity harness (8 check groups,
   300-hand injected-card fuzz), mutation-tested to prove it catches divergences.
@@ -135,8 +139,8 @@ translates at the boundary:
    per-episode seeding model used by training loops.
 
 ### 3.2 Engine selection flag
-`Table(engine_impl="legacy"|"pe")` (or env `THAI_ENGINE_IMPL`), default
-`legacy` until §6 P6. One construction point; `run_eval.py`,
+`make_table(engine_impl="pe"|"legacy")` (or env `THAI_ENGINE_IMPL`), default
+`pe` since §6 P6 (was `legacy` through P5). One construction point; `run_eval.py`,
 `core/tournament.py`, and training scripts pick it up without signature churn.
 
 ### 3.3 Settlement
@@ -258,8 +262,17 @@ winners. This gates the swap regardless of the D1 answer.
   `return_uncalled_bets`; `_needs_to_act` uses the same cap to avoid a betting
   loop). Post-fix: all 300 PE tournaments conserve exactly (4000 chips), 32/32 PE
   tests, parity 8/8. See PROGRESS.md.
-- **P6 — flip default**, mark legacy deprecated in-code; next MCCFR / Deep CFR
-  runs (already planned as fresh) train on PE impl.
+- **P6 — flip default (DONE 2026-07-06)**: `DEFAULT_ENGINE_IMPL = "pe"` in
+  `core/engine_factory.py`; legacy engine marked DEPRECATED in-code
+  (`core/engine.py` docstring) but still reachable via `engine_impl="legacy"` /
+  `THAI_ENGINE_IMPL=legacy`. Precedence unchanged (arg > env > default). Three
+  now-stale "legacy is default" comments corrected (`core/tournament.py`,
+  `core/pe_engine.py`, `run_eval.py --engine` help). Verified: factory resolves
+  `pe` with no arg/env and `legacy` when asked; `run_tournament` with no
+  `engine_impl` runs on pe and conserves chips (8-bot field, seed 70000, 400
+  hands); explicit-legacy escape hatch + direct `core.engine.Table` import still
+  run clean. No test/sanity script pins the old default, so nothing regressed.
+  Next MCCFR / Deep CFR runs (already planned as fresh) train on the PE impl.
 
 **Call-site wiring (done 2026-07-06):** engine selection lives in
 `core/engine_factory.py :: make_table` (lazy imports, so the legacy path never
@@ -289,8 +302,8 @@ if flipped before the next run.
 - [x] Call sites wired through `make_table`; torch env rebuilt (Python 3.12).
 - [x] Sanity ladder under `impl=pe`, incl. `--full`: legacy 37/37, PE 37/37 —
       clean sweep after making `sanity_test_hand` engine-agnostic; no divergences.
-- [ ] A/B `run_eval` shows no regression; perf within budget (V4 tuning) (P5).
-- [ ] Default flipped to `pe`; this doc updated to IMPLEMENTED (P6).
+- [x] A/B `run_eval` shows no regression; perf within budget (V4 tuning) (P5).
+- [x] Default flipped to `pe`; this doc updated to IMPLEMENTED (P6).
 
 ---
 

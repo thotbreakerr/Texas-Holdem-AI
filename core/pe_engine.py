@@ -3,8 +3,9 @@
 This adapter exposes the exact ``PlayerView`` / ``BotAdapter`` / ``play_hand``
 contract the rest of Texas-Holdem-AI depends on, but runs the sibling
 ``Poker-Engine`` repo's tested rules core (dealing, betting, closure, side
-pots) underneath. It is selected explicitly (see :func:`make_table` and the
-``THAI_ENGINE_IMPL`` env var); the legacy engine remains the default.
+pots) underneath. It is the default engine as of P6 (see :func:`make_table` and
+the ``THAI_ENGINE_IMPL`` env var); the legacy engine remains selectable via
+``engine_impl="legacy"`` for the legacy regression suite.
 
 Design (see ENGINE_MIGRATION_PLAN.md):
   * Each legacy bot is wrapped as a Poker-Engine "agent" (duck-typed ``act``).
