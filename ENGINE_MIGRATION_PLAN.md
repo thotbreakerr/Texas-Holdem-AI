@@ -1,11 +1,12 @@
 # Engine Migration — Poker-Engine as the Rules Core (Implementation Plan)
 
-> Status: **P1–P4 IMPLEMENTED (2026-07-06)** on branch
-> `engine-migration-poker-engine` (uncommitted). D1 = clean break, D2 = yes
-> (both approved). Poker-Engine patches are additive and default-off; PE's own
-> 32 tests stay green. The legacy engine is untouched and remains the default.
-> Full sanity ladder is a clean **37/37 under both legacy and PE**.
-> **Remaining: P5 (A/B eval + perf), P6 (flip default).**
+> Status: **P1–P5 IMPLEMENTED (2026-07-06)** on branch
+> `engine-migration-poker-engine`. D1 = clean break, D2 = yes (both approved).
+> Poker-Engine patches are additive and default-off; PE's own 32 tests stay
+> green. The legacy engine is untouched and remains the default. Full sanity
+> ladder is a clean **37/37 under both legacy and PE**; P5 A/B shows competitive
+> equivalence with exact chip conservation (after fixing a short-blind leak).
+> **Remaining: P6 (flip default before the next fresh CFR/Deep CFR run).**
 >
 > Goal: replace `core/engine.py`'s betting/state machine with the engine from
 > `../Poker-Engine`, while preserving the `PlayerView`/`BotAdapter` contract so
@@ -245,9 +246,18 @@ winners. This gates the swap regardless of the D1 answer.
   `view.street` (engine-agnostic), so it passes under both engines; this also
   clears `sanity_eval`, whose only PE failure was a regression subprocess that
   re-ran `sanity_test_hand`. No other regression-test files touched.
-- **P5 — A/B eval:** `run_eval --engine pe` vs `--engine legacy`, same seeds;
-  scripted-deck subset identical, full-run chip distributions statistically
-  indistinguishable; finish the perf tuning (per-decision PlayerView rebuild).
+- **P5 — A/B eval** ✅ *(done 2026-07-06)*: `run_eval --engine pe` vs
+  `--engine legacy`, 300 tournaments each, identical 8-bot rule-based field, same
+  seeds. **Competitive equivalence holds** — every bot's win-rate Wilson CIs
+  overlap, no per-bot z/Welch test survives Bonferroni, winner-distribution
+  omnibus χ² below the 0.05 crit. Perf is on par (PE ~700s vs legacy ~730s; the
+  ~2.9× engine micro-overhead is swamped by bot/NN compute in a real field).
+  The run surfaced — and this validated the fix of — a PE chip-conservation bug:
+  short-all-in blinds destroyed the over-blind player's uncalled excess (497
+  chips over 300 tournaments). Fixed in Poker-Engine (`_match_target` call-cap +
+  `return_uncalled_bets`; `_needs_to_act` uses the same cap to avoid a betting
+  loop). Post-fix: all 300 PE tournaments conserve exactly (4000 chips), 32/32 PE
+  tests, parity 8/8. See PROGRESS.md.
 - **P6 — flip default**, mark legacy deprecated in-code; next MCCFR / Deep CFR
   runs (already planned as fresh) train on PE impl.
 
