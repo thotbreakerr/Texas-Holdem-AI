@@ -22,6 +22,7 @@ __pycache__/
 venv/
 .env/
 .env/*
+path/          # accidental placeholder venv (python -m venv path/to/venv) — never track
 
 # Generated tournament charts
 tournament_progress.png
