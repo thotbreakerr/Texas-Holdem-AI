@@ -9,6 +9,7 @@ from typing import Any, Callable, Literal
 
 from bots import escalate_blinds
 from core.engine import Seat, Table
+from core.engine_factory import make_table
 from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from run_tournament_stats import finalize_finish_order
 
@@ -66,6 +67,7 @@ def run_tournament(
     ante_schedule: AnteSchedule | None = None,
     rng: random.Random | None = None,
     table: Table | None = None,
+    engine_impl: str | None = None,
     on_event: TournamentCallback | None = None,
     hand_delay: Callable[[], None] | None = None,
     should_cancel: CancelCheck | None = None,
@@ -91,7 +93,9 @@ def run_tournament(
     if ante < 0:
         raise ValueError("ante must be non-negative")
 
-    table = table or (Table(rng=rng) if rng is not None else Table())
+    # An explicitly-passed table wins; otherwise select the engine
+    # implementation (legacy by default, or "pe" / THAI_ENGINE_IMPL).
+    table = table or make_table(rng=rng, engine_impl=engine_impl)
     dealer = dealer_index
     hand_count = 0
     total_players = len(seats)

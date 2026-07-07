@@ -82,19 +82,6 @@ inner_bots = {
 
 recording = {pid: RecordingBot(pid, inner_bots[pid]) for pid in inner_bots}
 
-streets_seen = []
-_orig_betting = table._betting_round
-street_actors = {}  # street → set of pids that acted
-
-def _patched_betting(street, *args, **kwargs):
-    streets_seen.append(street)
-    print(f"\n=== STREET START: {street} ===")
-    result = _orig_betting(street, *args, **kwargs)
-    print(f"=== STREET END:   {street} | winner={result} ===")
-    return result
-
-table._betting_round = _patched_betting
-
 bot_for = {pid: InProcessBot(recording[pid]) for pid in recording}
 
 print("Playing 1 hand (check/call bots, P1 folds preflop)…\n")
@@ -107,6 +94,15 @@ net = table.play_hand(
 )
 
 # ── Analysis ───────────────────────────────────────────────────────────────────
+# Derive the streets that were actually played from the recording bots. This is
+# engine-agnostic: it depends only on the PlayerView.street each bot saw at its
+# decisions, not on any engine-private method. With 5 check/call bots and one
+# preflop folder, every reached postflop street has live actors, so the set of
+# streets any bot acted on equals the set of streets the hand reached.
+_street_order = ["preflop", "flop", "turn", "river"]
+_reached = {s for rec in recording.values() for s in rec.acted_streets}
+streets_seen = [s for s in _street_order if s in _reached]
+
 print("\n" + "="*60)
 print("NET RESULTS:", net)
 print()

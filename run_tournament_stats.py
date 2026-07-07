@@ -11,6 +11,7 @@ from contextlib import redirect_stdout
 from multiprocessing import Pool
 
 from core.engine import Table, Seat
+from core.engine_factory import make_table
 from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from bots import parse_players, escalate_blinds, create_bot
 
@@ -81,7 +82,7 @@ def run_silent_tournament(args_tuple):
 
     seats = [Seat(player_id=pid, chips=chips) for pid, _, _ in player_specs]
     table_rng = random.Random(seed) if seed is not None else random.Random()
-    table = Table(rng=table_rng)
+    table = make_table(rng=table_rng)
     dealer_index = 0
     hand_count = 0
     total_players = len(seats)

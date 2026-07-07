@@ -8,6 +8,7 @@ matplotlib.use("Agg")  # non-interactive backend for file output
 import matplotlib.pyplot as plt
 
 from core.engine import Table, Seat
+from core.engine_factory import make_table
 from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from bots import parse_players, escalate_blinds
 
@@ -34,7 +35,7 @@ def run_tournament_until_winner(seats, bots, base_sb, base_bb,
     hand of this tournament (ML training data). The caller owns it and must
     close it after the tournament ends.
     """
-    table = Table()
+    table = make_table()
     chip_history = [{s.player_id: s.chips for s in seats}]
     dealer_index = 0
     hand_count = 0
