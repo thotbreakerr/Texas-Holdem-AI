@@ -9,9 +9,9 @@ Now with:
 DEPRECATED (P6, 2026-07-06): the Poker-Engine-backed adapter
 (``core.pe_engine.PokerEngineTable``) is now the default rules engine, selected
 via ``core.engine_factory.make_table``. This legacy engine stays supported only
-so the ~50 ``sanity_*.py`` regression tests keep exercising it; new training
+so the ~40 ``sanity_*.py`` regression tests keep exercising it; new training
 runs and evals run on ``pe``. Prefer ``make_table`` over constructing ``Table``
-directly. See ENGINE_MIGRATION_PLAN.md.
+directly. See docs/plans/ENGINE_MIGRATION_PLAN.md.
 """
 from __future__ import annotations
 import random

@@ -4,7 +4,7 @@ Runs identical scenarios (same seats/blinds/dealer, same scripted bots, and —
 for showdown scenarios — the SAME injected hole cards and board) through both
 engines and asserts identical decision traces, histories, and net chip results.
 
-Covers the rule-delta checklist from ENGINE_MIGRATION_PLAN.md §4:
+Covers the rule-delta checklist from docs/plans/ENGINE_MIGRATION_PLAN.md §4:
   R1 lone-live all-in closure     R2 short all-in does not reopen
   R3 heads-up button order        R4 preflop UTG / postflop SB first
   R5 short-stack call amount       R7 uncalled bet returned (fold-win)

@@ -7,9 +7,9 @@ lazily inside :func:`make_table`. Callers pick an engine by passing
 default is ``pe`` (Poker-Engine) as of P6 of the engine migration.
 
 The legacy engine (``core.engine.Table``) is DEPRECATED: it stays reachable via
-``engine_impl="legacy"`` / ``THAI_ENGINE_IMPL=legacy`` so the ~50 ``sanity_*.py``
+``engine_impl="legacy"`` / ``THAI_ENGINE_IMPL=legacy`` so the ~40 ``sanity_*.py``
 regression tests keep exercising it, but new work — training runs, evals — runs
-on ``pe``. See ENGINE_MIGRATION_PLAN.md and PROGRESS.md.
+on ``pe``. See docs/plans/ENGINE_MIGRATION_PLAN.md and PROGRESS.md.
 """
 
 import os

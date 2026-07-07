@@ -30,7 +30,7 @@ a ~40-gate sanity ladder.
   - *Stress archetypes* (Phase 7): deliberate caricatures for robustness testing — **not** realistic models.
 - **Training pipelines** for ML, RL, CFR, and Deep CFR.
 - **Eval harness** (`run_eval.py`) with head-to-head / multiway modes and Wilson 95% CIs.
-- **Sanity ladder** — ~40 `sanity_*.py` gates wired into `sanity_validation_ladder.py`.
+- **Sanity ladder** — 41 `sanity_*.py` gates, 35 wired into `sanity_validation_ladder.py` (the rest run standalone).
 - **Tournament UI** (matplotlib) and a batch statistics runner.
 
 ---
@@ -91,7 +91,7 @@ a ~40-gate sanity ladder.
 │   └── five_card_table.pkl     Precomputed hand evaluator (~46 MB, shared by both engines)
 ├── logs/                       Auto-generated JSONL decision logs (gitignored)
 ├── output/                     Tournament charts (.png) and stats (.csv)
-├── eval_runs/                  Ablation eval logs (gitignored, reproducible)
+├── eval_runs/                  Ablation eval CSVs (manual convention via --output-csv; gitignored)
 │
 ├── docs/                       Plans, reviews, and session logs (see Docs index)
 ├── PROGRESS.md                 Reverse-chron work log
@@ -140,7 +140,7 @@ below), which has no external requirements.
 
 | Impl | What it is | Notes |
 |------|-----------|-------|
-| `pe` (default) | Poker-Engine adapter (`core/pe_engine.py`) | Default since P6 (2026-07-06); ~2.9× faster, on-par results in real fields |
+| `pe` (default) | Poker-Engine adapter (`core/pe_engine.py`) | Default since P6 (2026-07-06); ~2.9× lower engine overhead (real-field wall-clock and results on par) |
 | `legacy` | Original in-repo engine (`core/engine.py`) | No external deps; still builds the hand evaluator + primitives; backs the sanity suite |
 
 Selection priority is **explicit argument > `THAI_ENGINE_IMPL` env var > default**:
@@ -184,6 +184,9 @@ python run_tournament_stats.py --tournaments 100 --chips 500
 ```bash
 python run_eval.py --mode multiway --tournaments 1000 --engine pe
 ```
+`--mode` also accepts `head_to_head`, `pilot`, `promotion`, and `curriculum` —
+`pilot`/`promotion` are the model-promotion gates (with `--path_b_weights` /
+`--promotion-opponent`); see [docs/plans/TRAINING_PLAN.md](docs/plans/TRAINING_PLAN.md).
 
 **Final hybrid-bot eval** (tournament eval for `final_survival` / `final_aggro`,
 no CFR/DeepCFR models loaded):
@@ -197,6 +200,7 @@ supply your own):
 ```bash
 python run_local_match.py --rl_model models/your_rl_model.pt
 python run_tournament_stats.py --tournaments 50 --rl_model models/your_rl_model.pt
+python run_tournament.py --rl_model models/your_rl_model.pt
 ```
 
 ---
@@ -262,9 +266,9 @@ In this six-player, abstracted, decision-rooted setup it *approximates* — but 
 not provably converge to — equilibrium play (CFR's Nash guarantee is for
 two-player zero-sum). Maintains a persistent tabular regret store.
 
-- **Card abstraction**: 10 preflop buckets (strength tiers), 10 postflop buckets (MC equity percentiles).
-- **Bet abstraction**: 6 abstract actions (fold, check/call, 33% pot, 67% pot, pot, all-in).
-- **Action history**: compressed to 8-char tokens for info-set keys.
+- **Card abstraction**: 50 preflop buckets (strength tiers), 50 postflop buckets (MC equity percentiles, 200 rollouts).
+- **Bet abstraction**: 8 abstract actions (fold, check/call, 33% / 50% / 67% / 75% / 100% pot, all-in).
+- **Action history**: compressed to one-char action tokens (F/K/C/S/Q/M/L/P/A, variable length) for info-set keys.
 - **Inference mode**: skips online regret updates so loaded strategies aren't corrupted during play.
 
 The intended default profile path is `models/cfr_regret_deep_v2.pkl` (produced by
@@ -368,8 +372,10 @@ python training/train_deep_cfr.py --variant large --iterations 1000000 \
 
 ### ML training
 **`train_ml_bot.py`** — supervised learning on JSONL decision logs (Adam,
-ReduceLROnPlateau, 80/20 split). Requires **session-scoped** logs (`run_local_match.py
---log-session`, one file per tournament); files without a `session_start` header
+ReduceLROnPlateau, 80/20 split). Requires **session-scoped** logs — generate them
+with `run_local_match.py --log-session` (one file per tournament), or from custom
+scripts by passing `DecisionLogger(session_scoped=True)` to
+`Table.play_hand(..., logger=...)`. Files without a `session_start` header
 are rejected unless `--allow-legacy-logs` is passed. Checkpoints embed
 `feature_schema_version` so stale models can't be silently loaded.
 
@@ -382,8 +388,9 @@ python training/train_ml_bot.py --log_dir logs --epochs 8                      #
 
 ## Testing / sanity harness
 
-The repo's correctness is guarded by ~40 `sanity_*.py` scripts and the
-`sanity_validation_ladder.py` orchestrator. These are **gates**, not pytest unit
+The repo's correctness is guarded by 41 `sanity_*.py` gates and the
+`sanity_validation_ladder.py` orchestrator (35 gates are wired into the ladder;
+the rest, including `sanity_engine_parity.py`, run standalone). These are **gates**, not pytest unit
 tests: many print `ALL CHECKS PASSED` / `SOME CHECKS FAILED` and exit nonzero on
 failure. Run them from the **repo root** (the ladder invokes each gate by filename
 with `cwd=` repo root).
@@ -421,7 +428,7 @@ Then register a key → import mapping in `create_bot()` in `bots/__init__.py`.
 ## Known limitations
 
 - **No web UI** — visualization is matplotlib-only (local).
-- **CFR abstraction** — 20 buckets per street, 100 equity rollouts. Reasonable coverage but well below research-grade systems (Pluribus uses thousands of buckets per street).
+- **CFR abstraction** — 50 buckets per street, 200 equity rollouts. Reasonable coverage but well below research-grade systems (Pluribus uses thousands of buckets per street).
 - **CFR value function (`_estimate_action_value`) is heuristic, not learned.** Two known structural biases (slight passive bias on premium hands, slight shove bias on marginals). The proper fix is the equity-shaped learned value function in TRAINING_PLAN.md Step 2.
 - **CFR uses one-step lookahead with rollout, not real tree CFR.** No recursive opponent-strategy sampling (the "nuclear" Step 15).
 - **No real-time search at decision time** — we look up the precomputed strategy rather than doing depth-limited subgame solving.

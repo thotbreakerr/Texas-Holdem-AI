@@ -7,7 +7,7 @@ pots) underneath. It is the default engine as of P6 (see :func:`make_table` and
 the ``THAI_ENGINE_IMPL`` env var); the legacy engine remains selectable via
 ``engine_impl="legacy"`` for the legacy regression suite.
 
-Design (see ENGINE_MIGRATION_PLAN.md):
+Design (see docs/plans/ENGINE_MIGRATION_PLAN.md):
   * Each legacy bot is wrapped as a Poker-Engine "agent" (duck-typed ``act``).
   * On every decision the wrapper builds the legacy ``PlayerView`` from the
     Poker-Engine ``Observation``, runs the bot, sanitizes exactly as the

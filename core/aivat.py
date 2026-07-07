@@ -4,7 +4,7 @@ core/aivat.py — Full-information equity-shaping value function
 The load-bearing module. Both Path A's leaf evaluator (during recursive
 tree CFR) and Path B's value-network training targets come from here.
 
-Naming caveat (from TRAINING_PLAN.md): "AIVAT" here means full-information
+Naming caveat (from docs/plans/TRAINING_PLAN.md): "AIVAT" here means full-information
 equity shaping. We peek at all opponents' hole cards during training-time
 scoring; the bot at play time still doesn't see them. Not literally the
 AIVAT paper.
