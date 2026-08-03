@@ -214,6 +214,19 @@ class _PEAgent:
         me_stack = obs.stacks[my_seat]
         to_call = obs.to_call
         current_bet = to_call + me_sc
+
+        # Observation.to_call is the raw current_bet minus our commitment, but
+        # Poker-Engine's legality runs it through _match_target (betting.py):
+        # nobody can be forced to match a bet no live opponent can cover, so a
+        # nominal short-all-in blind shrinks the price — possibly to 0, where
+        # PE allows only check, never call. Mirror that cap here so the legacy
+        # legal list never offers a call PE would reject.
+        reach = [obs.street_committed[s] + obs.stacks[s]
+                 for s in obs.seats if s != my_seat and not obs.folded[s]]
+        if reach:
+            to_call = max(0, min(current_bet, max(max(reach), me_sc)) - me_sc)
+        else:
+            to_call = 0
         bb = obs.blind_level["big_blind"]
         lfrs = obs.last_full_raise_size
         max_total = me_sc + me_stack
