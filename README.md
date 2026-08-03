@@ -1,3 +1,7 @@
+> 🏛️ **Coming soon: The Colosseum** — a website where you can plug in your own bots and battle them against others. Stay tuned!
+
+---
+
 # Texas Hold'em Poker AI
 
 A research sandbox for tournament poker agents. The goal is a strong bot for a
