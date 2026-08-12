@@ -6,9 +6,7 @@ Provides:
   create_bot(btype)        -> BotAdapter
   escalate_blinds(...)     -> (sb, bb)
 """
-import os
 import re
-import sys
 from core.engine import InProcessBot, RandomBot
 from core.bot_api import BotAdapter, PlayerView, Action
 
@@ -22,11 +20,6 @@ def create_bot(btype: str) -> BotAdapter:
     Recognised types (case-insensitive):
       mc, mc<N>          MonteCarloBot (optional sim count: mc200, mc500)
       smart              SmartBot (heuristic)
-      ml                 MLBot (supervised learning)
-      rl, rl:<path>      RLBot (reinforcement learning, with optional model path)
-      cfr, cfr:<path>    CFRBot (MCCFR, optional profile path)
-      deep_cfr, deep_cfr:<path>
-                          DeepCFRBot (optional weights path)
       final, final_survival
                           TournamentHybridBot survival profile
       final_aggro         TournamentHybridBot aggro profile
@@ -51,18 +44,6 @@ def create_bot(btype: str) -> BotAdapter:
         from bots.poker_mind_bot import SmartBot
         return _wrap(SmartBot())
 
-    if btype in ("ml", "mlbot"):
-        from bots.ml_bot import MLBot
-        return _wrap(MLBot())
-
-    if btype in ("rl", "rlbot") or btype.startswith("rl:"):
-        from bots.rl_bot import RLBot
-        if btype.startswith("rl:"):
-            model_path = raw_btype[3:]  # Extract path after "rl:"
-            return _wrap(RLBot(model_path=model_path))
-        else:
-            return _wrap(RLBot())
-
     if btype in ("random",):
         return InProcessBot(RandomBot())
 
@@ -81,33 +62,6 @@ def create_bot(btype: str) -> BotAdapter:
     if btype in ("opponentmodel", "opponentmodelbot"):
         from bots.opponent_model_bot import OpponentModelBot
         return _wrap(OpponentModelBot())
-
-    if btype in ("cfr", "cfrbot") or btype.startswith(("cfr:", "cfrbot:")):
-        from bots.cfr_bot import CFRBot
-        profile_path = "models/cfr_regret_deep_v2.pkl"
-        if ":" in raw_btype:
-            profile_path = raw_btype.split(":", 1)[1]
-        elif not os.path.exists(profile_path):
-            # Bare "cfr" must not crash without the default artifact (gated
-            # by sanity_review_findings), but a blank bot silently poisons
-            # evals and RL opponent pools — so be unmissable about it.
-            print(
-                f"[create_bot] WARNING: default profile {profile_path!r} "
-                f"not found — creating UNTRAINED CFRBot (blank regret "
-                f"table, plays from heuristic fallback). Pass cfr:<path> "
-                f"to load a trained profile.",
-                file=sys.stderr,
-            )
-            profile_path = None
-        return _wrap(CFRBot(profile_path=profile_path, inference_mode=True))
-
-    if (btype in ("deep_cfr", "deepcfr", "deep_cfr_bot") or
-            btype.startswith(("deep_cfr:", "deepcfr:", "deep_cfr_bot:"))):
-        from bots.deep_cfr_bot import DeepCFRBot
-        weights_path = "models/deep_cfr_v2.pt"
-        if ":" in raw_btype:
-            weights_path = raw_btype.split(":", 1)[1]
-        return _wrap(DeepCFRBot(weights_path=weights_path, inference_mode=True))
 
     if btype == "final" or btype.startswith(("final_survival", "final_aggro", "final:")):
         from bots.tournament_hybrid_bot import TournamentHybridBot
@@ -134,8 +88,7 @@ def create_bot(btype: str) -> BotAdapter:
         return _wrap(ArchetypeBot(btype))
 
     raise ValueError(f"Unknown bot type: {raw_btype!r}. "
-                     "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
-                     "cfr, cfr:<path>, deep_cfr, deep_cfr:<path>, "
+                     "Expected one of: mc, mc<N>, smart, random, "
                      "icm, exploitative, gto, opponentmodel, "
                      "final, final_survival, final_aggro, "
                      "maniac_trigger, maniac_mixed, overbet_merchant, "
@@ -154,7 +107,7 @@ class _PlayerViewAdapter(BotAdapter):
     def reset_memory(self):
         """Tournament boundary: forward to bots with cross-hand state.
 
-        MLBot (and any future bot with cumulative opponent memory) must be
+        Any bot with cumulative opponent memory must be
         reset when an instance is reused across Tables — a new Table
         restarts hand ids at 0, so stale dedup keys would silently swallow
         the new tournament's actions and old stats would leak in. No-op
@@ -215,8 +168,8 @@ def parse_players(spec: str):
     (player_id, bot_type, adapter) tuples.
 
     Examples:
-      "mc200,smart,ml,rl"
-      "P1=mc200,P2=smart,P3=rl"
+      "mc200,smart,gto,icm"
+      "P1=mc200,P2=smart,P3=gto"
 
     Auto-assigns P1, P2, ... when no explicit IDs are given.
     """

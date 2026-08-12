@@ -2,12 +2,12 @@
 benchmark_m5.py
 ───────────────
 Stress test for M5 Max (64GB RAM / 18-core CPU / 40-core GPU) using this
-project's own bots and PokerMLP model.
+project's own bots and a small PyTorch MLP.
 
 Runs three phases:
   1. System info  — prints machine specs
   2. CPU phase    — parallel tournaments at 1 / 6 / 12 / 18 workers
-  3. GPU phase    — PyTorch matmul + PokerMLP training (CPU vs MPS)
+  3. GPU phase    — PyTorch matmul + MLP training (CPU vs MPS)
 
 Results are saved to output/m5_benchmark_results.txt
 
@@ -180,7 +180,7 @@ def phase_cpu(fp, quick=False, heavy=False):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Phase 3 — GPU benchmark (matmul + PokerMLP training loop)
+# Phase 3 — GPU benchmark (matmul + MLP training loop)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def phase_gpu(fp, quick=False, heavy=False):
@@ -190,7 +190,6 @@ def phase_gpu(fp, quick=False, heavy=False):
 
     try:
         import torch
-        from bots.poker_mlp import PokerMLP
     except ImportError as e:
         log(fp, f"Skipping GPU phase — import failed: {e}")
         return
@@ -247,11 +246,11 @@ def phase_gpu(fp, quick=False, heavy=False):
         else:
             log(fp, f"{n:>6}  " + "  ".join(f"{t:>14}" for t in tflops_strs))
 
-    # ── PokerMLP training loop ──────────────────────────────────────────────
+    # ── MLP training loop ───────────────────────────────────────────────────
     log(fp, "")
-    log(fp, "-- PokerMLP (256 hidden, 6-way classification) training --")
+    log(fp, "-- MLP (256 hidden, 6-way classification) training --")
 
-    input_dim  = 26     # matches rl_bot state vector
+    input_dim  = 26     # poker state-vector sized input
     batch_size = 1024
     steps      = 200 if not quick else 30
 
@@ -259,7 +258,11 @@ def phase_gpu(fp, quick=False, heavy=False):
     log(fp, f"{'Device':>6}  {'Wall sec':>10}  {'Steps/sec':>10}  "
             f"{'Samples/sec':>12}")
     for dev in devices:
-        model = PokerMLP(input_dim=input_dim, hidden=256, num_classes=6).to(dev)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, 256), torch.nn.ReLU(),
+            torch.nn.Linear(256, 256), torch.nn.ReLU(),
+            torch.nn.Linear(256, 6),
+        ).to(dev)
         opt   = torch.optim.Adam(model.parameters(), lr=1e-3)
         loss_fn = torch.nn.CrossEntropyLoss()
 

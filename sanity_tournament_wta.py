@@ -10,7 +10,6 @@ sys.path.insert(0, ".")
 from core.bot_api import Action
 from core.engine import InProcessBot, Seat, Table
 from core.tournament import run_tournament
-from run_eval import aggregate_results
 
 
 class FoldBot:
@@ -31,6 +30,22 @@ class CheckCallBot:
 
 def _wrapped(bot):
     return InProcessBot(bot)
+
+
+def _aggregate_wta_summary(results, player_specs):
+    """Count WTA wins per player and normalise to a win rate.
+
+    Minimal stand-in for the retired eval harness's aggregation, kept so
+    this gate still exercises the tournament-result contract.
+    """
+    pids = [pid for pid, _ in player_specs]
+    n = len(results)
+    wins = {pid: 0 for pid in pids}
+    for res in results:
+        if res["winner"] in wins:
+            wins[res["winner"]] += 1
+    return {pid: {"wins": w, "win_rate": (w / n if n else 0.0)}
+            for pid, w in wins.items()}
 
 
 def _play_fold_hand(ante_arg=None):
@@ -133,19 +148,19 @@ def run():
         suppress_output=True,
     )
     player_specs = [(pid, "check_call") for pid in ("P1", "P2", "P3")]
-    aggregated = aggregate_results([result], player_specs)
+    aggregated = _aggregate_wta_summary([result], player_specs)
     winner = result["winner"]
     passed &= _check(
         "first-place winner is counted as WTA win_rate",
         winner is not None
-        and aggregated["summary"][winner]["wins"] == 1
-        and aggregated["summary"][winner]["win_rate"] == 1.0
+        and aggregated[winner]["wins"] == 1
+        and aggregated[winner]["win_rate"] == 1.0
         and all(
             row["wins"] == 0
-            for pid, row in aggregated["summary"].items()
+            for pid, row in aggregated.items()
             if pid != winner
         ),
-        f"winner={winner} summary={aggregated['summary']}",
+        f"winner={winner} summary={aggregated}",
     )
     passed &= _check(
         "tournament chips conserve with antes",

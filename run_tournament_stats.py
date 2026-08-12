@@ -18,17 +18,6 @@ from bots import parse_players, escalate_blinds, create_bot
 
 # ── Single silent tournament ──────────────────────────────────────────────────
 
-def maybe_disable_deep_cfr_search(adapter, bot_type: str):
-    """Disable DeepCFR real-time search on an adapter, if it wraps DeepCFRBot."""
-    key = bot_type.strip().lower()
-    if not key.startswith(("deep_cfr", "deepcfr", "deep_cfr_bot")):
-        return adapter
-    inner = getattr(adapter, "bot", None)
-    if hasattr(inner, "search_depth"):
-        inner.search_depth = 0
-    return adapter
-
-
 def _advance_dealer(dealer_index: int, active_count: int) -> int:
     """Advance the dealer button by one in the ACTIVE seat circle.
 
@@ -67,18 +56,13 @@ def run_silent_tournament(args_tuple):
     Returns dict with: winner, hand_count, finish_order [(pid, position, hand#, chips_at_elim)].
     """
     (player_specs, chips, base_sb, base_bb, blind_increase_every,
-     max_hands, seed, disable_search) = args_tuple
+     max_hands, seed) = args_tuple
 
     if seed is not None:
         random.seed(seed)
 
     # Rebuild bots in this process (can't pickle adapters across processes)
-    bots = {}
-    for pid, btype, _ in player_specs:
-        adapter = create_bot(btype)
-        if disable_search:
-            adapter = maybe_disable_deep_cfr_search(adapter, btype)
-        bots[pid] = adapter
+    bots = {pid: create_bot(btype) for pid, btype, _ in player_specs}
 
     seats = [Seat(player_id=pid, chips=chips) for pid, _, _ in player_specs]
     table_rng = random.Random(seed) if seed is not None else random.Random()
@@ -157,8 +141,7 @@ def _bar(done, total):
 
 
 def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_bb,
-                         blind_increase_every, max_hands, parallel, output_csv, seed,
-                         disable_search=False):
+                         blind_increase_every, max_hands, parallel, output_csv, seed):
     player_specs = parse_players(player_spec_str)
     if len(player_specs) < 2:
         print("Error: need at least 2 players.")
@@ -175,8 +158,6 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
           f"Escalation every {blind_increase_every} hands")
     if parallel > 1:
         print(f"Parallel workers: {parallel}")
-    if disable_search:
-        print("DeepCFR search: disabled (raw regret-matched policy)")
     print("=" * 75)
     print()
 
@@ -185,7 +166,7 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
     for i in range(num_tournaments):
         t_seed = (seed + i) if seed is not None else None
         tasks.append((player_specs, chips, base_sb, base_bb,
-                      blind_increase_every, max_hands, t_seed, disable_search))
+                      blind_increase_every, max_hands, t_seed))
 
     # Run tournaments
     results = []
@@ -321,8 +302,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run multiple Texas Hold'em tournaments and track statistics")
     parser.add_argument("--players", type=str,
-                        default="smart,cfr,gto,icm,exploitative,opponentmodel,mc200",
-                        help="Comma-separated bot types (default: smart,cfr,gto,icm,exploitative,opponentmodel,mc200)")
+                        default="smart,gto,icm,exploitative,opponentmodel,mc200",
+                        help="Comma-separated bot types (default: smart,gto,icm,exploitative,opponentmodel,mc200)")
     parser.add_argument("--tournaments", type=int, default=100,
                         help="Number of tournaments (default: 100)")
     parser.add_argument("--chips", type=int, default=500,
@@ -341,16 +322,7 @@ def main():
                         help="Number of parallel workers (default: 1, sequential)")
     parser.add_argument("--output-csv", type=str, default=None,
                         help="Save per-tournament results to CSV file")
-    parser.add_argument("--disable-search", action="store_true",
-                        help="Disable DeepCFR real-time search; use raw policy")
-    parser.add_argument("--rl_model", type=str, default=None,
-                        help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
-                             "Rewrites any 'rl' entry in --players to use this model.")
     args = parser.parse_args()
-
-    if args.rl_model:
-        import re
-        args.players = re.sub(r'(?<![:\w])rl(?![\w:])', f'rl:{args.rl_model}', args.players)
 
     run_tournament_batch(
         player_spec_str=args.players,
@@ -363,7 +335,6 @@ def main():
         parallel=args.parallel,
         output_csv=args.output_csv,
         seed=args.seed,
-        disable_search=args.disable_search,
     )
 
 

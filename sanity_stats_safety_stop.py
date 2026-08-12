@@ -48,7 +48,7 @@ print("STATS: max-hands no four-way winner tie")
 print("=" * 60)
 
 specs = parse_players("random,random,random,random")
-res = run_silent_tournament((specs, 80, 1, 2, 0, 1, 123, False))
+res = run_silent_tournament((specs, 80, 1, 2, 0, 1, 123))
 pos_ones = [pid for pid, pos, _, _ in res["finish_order"] if pos == 1]
 print(f"  finish_order={res['finish_order']}")
 print(f"  position-1 players={pos_ones}")

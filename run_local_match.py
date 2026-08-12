@@ -192,8 +192,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run a single Texas Hold'em tournament to completion")
     parser.add_argument("--players", type=str,
-                        default="mc200,smart,mc100,smart,ml,rl",
-                        help="Comma-separated bot types (default: montecarlo,smart,smart,rl)")
+                        default="mc200,smart,mc100,smart,gto,icm",
+                        help="Comma-separated bot types (default: mc200,smart,mc100,smart,gto,icm)")
     parser.add_argument("--chips", type=int, default=500,
                         help="Starting chips per player")
     parser.add_argument("--sb", type=int, default=1,
@@ -206,22 +206,14 @@ def main():
                         help="Safety hand limit (default: 5000)")
     parser.add_argument("--output", type=str, default="output/tournament_progress.png",
                         help="Path for the output chart (default: output/tournament_progress.png)")
-    parser.add_argument("--rl_model", type=str, default=None,
-                        help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
-                             "Rewrites any 'rl' entry in --players to use this model.")
     parser.add_argument("--log-session", action="store_true",
-                        help="Write one session-scoped ML decision log for the "
-                             "whole tournament (required format for "
-                             "train_ml_bot.py — one .jsonl file per tournament)")
+                        help="Write one session-scoped decision log for the "
+                             "whole tournament (one .jsonl file per tournament)")
     parser.add_argument("--log-dir", type=str, default="logs",
                         help="Directory for --log-session output (default: logs)")
     args = parser.parse_args()
 
     from bots import parse_players, create_bot, escalate_blinds
-
-    if args.rl_model:
-        import re
-        args.players = re.sub(r'(?<![:\w])rl(?![\w:])', f'rl:{args.rl_model}', args.players)
 
     player_specs = parse_players(args.players)
     player_ids = [pid for pid, _, _ in player_specs]
@@ -230,9 +222,8 @@ def main():
     seats = [Seat(player_id=pid, chips=args.chips) for pid, _, _ in player_specs]
     bots = {pid: create_bot(btype) for pid, btype, _ in player_specs}
 
-    # One session-scoped decision log per tournament (ML training data).
-    # The header row marks the file as a full session so train_ml_bot.py
-    # can trust its cumulative opponent-memory replay.
+    # One session-scoped decision log per tournament. The header row marks
+    # the file as a full session for downstream replay tools.
     decision_logger = None
     if args.log_session:
         from core.logger import DecisionLogger
