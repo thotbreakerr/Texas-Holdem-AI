@@ -1,8 +1,13 @@
 """Phase 1 gate: canonical tournament loop matches the legacy loops.
 
 This proves loop/refactor parity only. The legacy oracle and run_tournament
-both call the same core.engine.play_hand, so shared engine bugs are invisible
-here and need separate engine-level coverage.
+both build their table via core.engine_factory.make_table (pe by default,
+legacy via THAI_ENGINE_IMPL=legacy), so shared engine bugs are invisible
+here and need separate engine-level coverage (sanity_engine_parity.py).
+Before 2026-08-12 the oracle hardcoded the legacy core.engine.Table; the P6
+default flip to Poker-Engine put the two sides on different engines (whose
+per-hand RNG streams differ by construction), which broke every seed-pinned
+outcome while the loop logic under test was fine.
 """
 
 from __future__ import annotations
@@ -15,7 +20,8 @@ from contextlib import redirect_stdout
 sys.path.insert(0, ".")
 
 from core.bot_api import Action
-from core.engine import Seat, Table
+from core.engine import Seat
+from core.engine_factory import make_table
 from core.table_order import advance_dealer_seat_index, normalize_dealer_seat_index
 from core.tournament import run_tournament
 from bots import escalate_blinds
@@ -67,7 +73,8 @@ def _legacy_full_table(player_ids, bot_cls, chips, base_sb, base_bb,
 
     bots = _make_bots(player_ids, bot_cls)
     seats = [Seat(player_id=pid, chips=chips) for pid in player_ids]
-    table = Table(rng=random.Random(seed) if seed is not None else random.Random())
+    table = make_table(
+        rng=random.Random(seed) if seed is not None else random.Random())
     dealer_index = 0
     hand_count = 0
     total_players = len(seats)
@@ -161,7 +168,8 @@ def _legacy_active_circle(player_ids, bot_cls, chips, base_sb, base_bb,
     bots = _make_bots(player_ids, bot_cls)
     seats = [Seat(player_id=pid, chips=chips) for pid in player_ids]
     active_seats = list(seats)
-    table = Table(rng=random.Random(seed) if seed is not None else random.Random())
+    table = make_table(
+        rng=random.Random(seed) if seed is not None else random.Random())
     dealer = 0
     hand_count = 0
     total_players = len(seats)
