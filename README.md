@@ -65,7 +65,8 @@ statistics runner, a hybrid-bot evaluation harness, and a sanity-gate test suite
 │   ├── gto_bot.py              GTO approximation (balanced mixed strategies)
 │   ├── opponent_model_bot.py   Bayesian hand-range modeling
 │   ├── tournament_hybrid_bot.py Final tournament bot (survival / aggro profiles)
-│   └── archetype_bot.py        Phase-7 stress archetypes (maniac, station, nit, …)
+│   ├── archetype_bot.py        Phase-7 stress archetypes (maniac, station, nit, …)
+│   └── punisher.py             Pure preflop core for tag_punisher / wide_defender (+ equity table)
 │
 ├── sanity_*.py                 14 standalone verification gates (engine, tournament, bots)
 │
@@ -187,6 +188,7 @@ specs to `parse_players()`. Auto-assigned IDs (`P1`, `P2`, …) or named seats
 | `final_<profile>:p4\|telemetry\|station\|r2\|p5` | TournamentHybridBot | Ablation arms (Phase 4/5) |
 | `random` | RandomBot | Uniform random legal actions |
 | `maniac`, `maniac_trigger`, `maniac_mixed`, `overbet_merchant`, `calling_station`, `nit`, `folder`, `loose_passive`, `minraise`, `minraiser`, `baseline_sane`, `pressure_filler` | ArchetypeBot | Phase-7 stress archetypes (deliberate caricatures, not realistic opponents) |
+| `tag_punisher`, `wide_defender` | ArchetypeBot | Deterministic preflop-core archetypes: tight-aggressive punisher / wide price-sensitive defender (`bots/punisher.py`, zero RNG) |
 
 Example: `--players mc200,smart,gto,icm` → a 4-player table (P1–P4).
 
@@ -233,6 +235,11 @@ Phase 4/5 ablation arms (`:p4`, `:telemetry`, `:station`, `:r2`, `:p5`). See
 Deliberate stress caricatures (maniac, calling station, nit, over-folder, …) used
 to probe robustness. **Not** realistic opponent models — don't read their results
 as real-field claims. See [docs/plans/PHASE7_STRESS_OPPONENTS_PLAN.md](docs/plans/PHASE7_STRESS_OPPONENTS_PLAN.md).
+
+`tag_punisher` and `wide_defender` are the two disciplined members of the family:
+a tight-aggressive punisher and a wide, price-sensitive defender that share one
+pure preflop core (`bots/punisher.py`) driven by a committed 169-class equity
+table and keyed-hash mixing, so they play deterministically with zero RNG use.
 
 ---
 
