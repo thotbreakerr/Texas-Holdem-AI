@@ -27,8 +27,10 @@ def create_bot(btype: str) -> BotAdapter:
                           TournamentHybridBot Phase 5 ablation arms
       maniac, maniac_trigger, maniac_mixed, overbet_merchant,
       calling_station, nit, folder, loose_passive, minraise, minraiser,
-      baseline_sane, pressure_filler
+      baseline_sane, pressure_filler, tag_punisher, wide_defender
                           Phase 7 stress-opponent archetypes
+                          (tag_punisher: tight-aggressive punisher;
+                           wide_defender: wide price-sensitive defender)
       random             RandomBot
     """
     raw_btype = btype.strip()
@@ -83,6 +85,8 @@ def create_bot(btype: str) -> BotAdapter:
         "minraiser",
         "baseline_sane",
         "pressure_filler",
+        "tag_punisher",
+        "wide_defender",
     ):
         from bots.archetype_bot import ArchetypeBot
         return _wrap(ArchetypeBot(btype))
@@ -93,7 +97,8 @@ def create_bot(btype: str) -> BotAdapter:
                      "final, final_survival, final_aggro, "
                      "maniac_trigger, maniac_mixed, overbet_merchant, "
                      "calling_station, nit, folder, loose_passive, minraise, "
-                     "minraiser, baseline_sane, pressure_filler")
+                     "minraiser, baseline_sane, pressure_filler, tag_punisher, "
+                     "wide_defender")
 
 
 class _PlayerViewAdapter(BotAdapter):

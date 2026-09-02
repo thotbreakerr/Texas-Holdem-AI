@@ -119,6 +119,31 @@ ARCHETYPE_CONFIGS: dict[str, ArchetypeConfig] = {
         preflop_call_freq=0.22,
         postflop_bet_freq=0.20,
     ),
+    "tag_punisher": _cfg(
+        # Tight-aggressive punisher — folds junk to aggression,
+        # opens/value-raises a strong range by pot odds. The preflop
+        # core and its knobs live in bots/punisher.py (shared with
+        # wide_defender); these knobs cover only the postflop surface.
+        "tag_punisher",
+        "tag_punisher",
+        postflop_value_frac=0.75,
+        postflop_call_req=0.30,
+        postflop_trap_freq=0.15,
+        postflop_loose_freq=0.10,
+    ),
+    "wide_defender": _cfg(
+        # Wide defender: the same pure preflop core as tag_punisher with
+        # the WIDE_DEFENDER knob struct — wider price-sensitive defense
+        # vs raises, honest jam defense, hash-mixed re-steals. Postflop
+        # is the same TAG surface.
+        "wide_defender",
+        "tag_punisher",
+        preflop_preset="wide_defender",
+        postflop_value_frac=0.75,
+        postflop_call_req=0.30,
+        postflop_trap_freq=0.15,
+        postflop_loose_freq=0.10,
+    ),
     "pressure_filler": _cfg(
         "pressure_filler",
         "pressure_filler",
@@ -888,6 +913,97 @@ class PressureFillerPolicy(BasePolicy):
         return bot.safe_passive(view)
 
 
+class TagPunisherPolicy(BasePolicy):
+    """Tight-aggressive punisher: the real-table adapter over the pure
+    preflop core in bots/punisher.py (preset-selectable via the
+    ``preflop_preset`` knob — wide_defender reuses this policy with its
+    own knob struct). Postflop: made-hand TAG rules via the engine
+    evaluator. Deterministic: mixing uses the archetype stable-hash
+    convention, zero RNG stream use."""
+
+    def act(self, bot: ArchetypeBot, view: PlayerView) -> Action:
+        from bots.punisher import class_key, preflop_intent, preset_knobs
+
+        hole = getattr(view, "hole_cards", None) or []
+        if len(hole) < 2:
+            return bot.safe_passive(view)
+        to_call = bot.safe_int(getattr(view, "to_call", 0))
+        pot = max(1, bot.safe_int(getattr(view, "pot", 0)))
+
+        if getattr(view, "street", None) != "preflop":
+            return self._postflop(bot, view, hole, to_call, pot)
+
+        # Preset seam: knobs resolved at act time (so PRESETS swaps are
+        # honored); the bernoulli salt is prefixed with the preset name
+        # so the two presets' mixes decorrelate.
+        preset = bot.knob("preflop_preset", "tag_punisher")
+        n_opp = max(1, min(5, bot.live_player_count(view) - 1))
+        # Facing a raise iff someone has visibly bet/raised this preflop
+        # (blinds never appear in history) — an inferred big blind is NOT
+        # trusted for this boundary (infer_bb returns min_raise, which is
+        # the raise increment, not the blind).
+        facing = any(
+            isinstance(e, dict)
+            and e.get("street", "preflop") == "preflop"
+            and e.get("type") in ("bet", "raise", "all_in")
+            for e in getattr(view, "history", None) or []
+        )
+        intent = preflop_intent(
+            class_key(hole),
+            n_opp=n_opp,
+            req=to_call / float(pot + to_call) if to_call > 0 else 0.0,
+            facing_raise=facing,
+            free_check=to_call <= 0,
+            spr=bot.stack(view) / float(pot),
+            mix=lambda tag, freq: bot.bernoulli(
+                view, f"{preset}:{tag}", freq),
+            knobs=preset_knobs(preset),
+        )
+        if intent == "fold":
+            return bot.fold_or_check(view)
+        if intent in ("check", "call"):
+            return bot.call_or_check(view)
+        if intent == "jam":
+            return bot.shove(view)
+        # pot-sized raise: total = own street contribution + call + pot
+        # after the call (aggressive_to clamps to the legal bounds).
+        target = bot.current_contrib(view) + 2 * to_call + pot
+        if to_call <= 0:
+            target = self.open_target(bot, view, mult=3.5)
+        return bot.aggressive_to(view, target)
+
+    def _postflop(self, bot: ArchetypeBot, view: PlayerView, hole,
+                  to_call: int, pot: int) -> Action:
+        from core.engine import eval_hand
+
+        board = getattr(view, "board", None) or []
+        category = (eval_hand(list(hole), list(board)) >> 24
+                    if len(board) >= 3 else 0)
+        if category >= 2:  # two pair or better: value line
+            if bot.bernoulli(view, "tag_punisher:trap_post",
+                             bot.knob("postflop_trap_freq", 0.15)):
+                return bot.call_or_check(view)
+            if to_call > 0:
+                return bot.aggressive_to(
+                    view, bot.current_contrib(view) + 2 * to_call + pot)
+            return self.capped_bet(
+                bot, view,
+                pot_frac=float(bot.knob("postflop_value_frac", 0.75)),
+                keepbehind_bb=0)
+        if category == 1:  # one pair: pot-odds continuation
+            if to_call <= 0:
+                return bot.safe_passive(view)
+            req = to_call / float(pot + to_call)
+            if (req <= float(bot.knob("postflop_call_req", 0.30))
+                    or bot.bernoulli(
+                        view, "tag_punisher:loose_post",
+                        bot.knob("postflop_loose_freq", 0.10))):
+                return bot.call_or_check(view)
+            return bot.fold_or_check(view)
+        # air: check when free, fold to pressure
+        return bot.fold_or_check(view) if to_call > 0 else bot.safe_passive(view)
+
+
 _POLICIES = {
     "maniac": ManiacPolicy,
     "overbet": OverbetPolicy,
@@ -897,4 +1013,5 @@ _POLICIES = {
     "minraise": MinRaisePolicy,
     "baseline_sane": BaselineSanePolicy,
     "pressure_filler": PressureFillerPolicy,
+    "tag_punisher": TagPunisherPolicy,
 }
