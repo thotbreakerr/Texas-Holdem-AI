@@ -16,6 +16,11 @@ Design (see docs/plans/ENGINE_MIGRATION_PLAN.md):
     antes are deliberately NOT recorded, matching the legacy engine, because
     downstream CFR / opponent-stat code reconstructs blinds from the first
     preflop ``pot_before``.
+  * ``stacks`` / ``seat_indices`` / ``opponents`` (and the acting / all-in
+    splits) are listed DEALER-FIRST like the legacy engine's ring, not in
+    Poker-Engine's absolute seat order: bots and tooling index that order
+    positionally (the blinds at indices 1/2, or 0/1 heads-up; hero's own
+    position label at hero's index). ``sanity_engine_parity.py`` pins it.
   * Showdown ranking is delegated back to the legacy ``eval_hand`` via
     Poker-Engine's ``rank_fn`` seam, so winners/ties are identical to legacy.
 
@@ -241,9 +246,18 @@ class _PEAgent:
             pv_min_raise = max(0, (current_bet + lfrs) - me_sc)
             pv_max_raise = me_stack
 
-        stacks_view = {ctx.seat_to_pid[s]: c for s, c in obs.stacks.items()}
-        seat_indices = {ctx.seat_to_pid[s]: s for s in obs.seats}
-        opponents = [ctx.seat_to_pid[s] for s in obs.seats
+        # Seat ORDER is part of the legacy PlayerView contract: stacks,
+        # seat_indices and opponents are listed dealer-first (the ring), so
+        # downstream code reads the blinds off indices 1/2 (0/1 heads-up)
+        # and hero's dict index carries hero's position label. ctx.seat_to_pid
+        # is that ring; obs.stacks / obs.seats are in ABSOLUTE seat order
+        # (engine/hand.py sorts players by seat number), which put the button
+        # at index 0 only when the dealer was the lowest active seat
+        # (sanity_engine_parity pins the order on both engines).
+        ring = list(ctx.seat_to_pid)
+        stacks_view = {ctx.seat_to_pid[s]: obs.stacks[s] for s in ring}
+        seat_indices = {ctx.seat_to_pid[s]: s for s in ring}
+        opponents = [ctx.seat_to_pid[s] for s in ring
                      if s != my_seat and not obs.folded[s]]
         acting_opponents = [op for op in opponents if stacks_view.get(op, 0) > 0]
         all_in_opponents = [op for op in opponents if stacks_view.get(op, 0) <= 0]

@@ -22,7 +22,7 @@ import random
 import sys
 
 from core.engine import Seat, Table, InProcessBot, _FULL_DECK
-from core.pe_engine import PokerEngineTable, _legacy_to_pe
+from core.pe_engine import PokerEngineTable, _legacy_to_pe, _positions
 
 from engine.cards import Deck as PEDeck  # noqa: E402  (via pe_engine bootstrap)
 
@@ -117,6 +117,12 @@ class ScriptedBot:
         # or folded) are net-neutral and the legacy engine prompts them while
         # the Poker-Engine adapter elides them, so they are excluded from the
         # decision-trace comparison (net is still compared exactly).
+        # Seat ORDER is part of the PlayerView contract: stacks /
+        # seat_indices / opponents are listed dealer-first, so downstream
+        # code may read the blinds off indices 1/2 (0/1 heads-up) and hero's
+        # dict index must carry hero's own position label.
+        seat_order = tuple(view.stacks)
+        labels = _positions(len(seat_order))
         self.trace.append({
             "contested": len(view.acting_opponents or []) > 0,
             "street": view.street, "me": view.me, "position": view.position,
@@ -124,6 +130,13 @@ class ScriptedBot:
             "legal": legal_key, "chosen": (action["type"], action.get("amount")),
             "hist": hist_key,
             "hole": tuple(sorted(view.hole_cards)), "board": tuple(view.board),
+            "seat_order": seat_order,
+            "seat_indices": tuple((view.seat_indices or {}).items()),
+            "opponents": tuple(view.opponents or ()),
+            "acting": tuple(view.acting_opponents or ()),
+            "all_in": tuple(view.all_in_opponents or ()),
+            "label_ok": (view.me in seat_order
+                         and labels[seat_order.index(view.me)] == view.position),
         })
         return action
 
