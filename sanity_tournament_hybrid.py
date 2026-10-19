@@ -2513,6 +2513,192 @@ def _check_cross_process_determinism():
     return ok
 
 
+# --- Tight-table module (CHECK 37, 2026-10-19) -------------------------------
+#
+# Bet respect (unconditional extra on the call requirement facing a bet, with
+# the call-for-less and strict-R2 exemptions), the pooled-VPIP tight-table
+# read (fail-closed below the sample floor, ramps to 1 on a table that never
+# enters a pot, 0 on a loose one), what the read scales (more respect, a
+# higher value-raise bar, wider steals from BTN/SB/CO and wider 3-bets at
+# five or more players), and the ``:notight`` arm.
+
+_SIX = ("V0", "V1", "V2", "V3", "V4")
+
+
+def _tt_feed(bot, *, hands, vpip, start):
+    """``hands`` preflop prefixes with five villains each folding (vpip
+    False) or calling (vpip True) a raise."""
+    for i in range(hands):
+        history = [
+            _p5_history_entry("preflop", pid, "call" if vpip else "fold",
+                              amount=20 if vpip else None, to_call_before=20, pot_before=35)
+            for pid in _SIX
+        ]
+        bot.act(_p5_counter_view(history, hand_id=start + i, opponents=_SIX))
+
+
+def _tt_six_players(view):
+    view.stacks = {"Hero": 1000, **{pid: 1000 for pid in _SIX}}
+    view.opponents = list(_SIX)
+    view.acting_opponents = list(_SIX)
+    view.seat_indices = {pid: idx for idx, pid in enumerate(["Hero", *_SIX])}
+    return view
+
+
+def _tt_call_view(*, hand_id, to_call=40, pot=100, hero_stack=1000, street="flop"):
+    board = [("K", "c"), ("7", "h"), ("2", "d")]
+    board = board + ([("9", "s")] if street != "flop" else []) + ([("3", "c")] if street == "river" else [])
+    return _postflop_view(
+        [("A", "s"), ("7", "d")], board, street=street, to_call=to_call, pot=pot,
+        opponents=("V0",), hero_stack=hero_stack,
+        legal=[{"type": "fold"}, {"type": "call"},
+               {"type": "raise", "min": min(2 * to_call, hero_stack), "max": hero_stack}],
+        hand_id=hand_id,
+    )
+
+
+def _check_tight_table_module():
+    ok = True
+    from bots.tournament_hybrid_bot import (
+        _BET_RESPECT_EXTRA, _TIGHT_BET_RESPECT_EXTRA, _TIGHT_RAISE_BUMP, _TIGHT_TABLE_READ,
+    )
+
+    # 1. Fresh bot: no read, the unconditional extra alone; exemptions.
+    fresh = _FixedEquityBot(equity=0.50)
+    fresh.act(_tt_call_view(hand_id=37001))
+    t = fresh.last_decision
+    ok &= t.get("tight_table_w") == 0.0 and t.get("tight_table_n") == 0
+    ok &= t.get("bet_respect_extra") == _BET_RESPECT_EXTRA["survival"]["hu"][0]
+    ok &= abs(t.get("call_req") - (t.get("pot_odds") + t.get("call_cushion_after")
+                                   + t.get("future_edge_tax") + t.get("bet_respect_extra"))) < 2e-4
+    ok &= t.get("branch") == "postflop_fold"       # 0.50 < 0.286 + 0.07 + 0.15
+    # call for less at better than 3:1: no extra, and the call stands
+    fresh.act(_tt_call_view(hand_id=37002, to_call=100, pot=400, hero_stack=40))
+    t = fresh.last_decision
+    ok &= t.get("bet_respect_call_for_less") is True and t.get("bet_respect_extra") == 0.0
+    ok &= t.get("branch") == "postflop_call"
+    # all-in call at even money: the extra is capped small
+    fresh.act(_tt_call_view(hand_id=37003, to_call=1000, pot=1000, hero_stack=1000))
+    t = fresh.last_decision
+    ok &= t.get("spot_type") == "all_in_call" and 0.0 < t.get("bet_respect_extra") <= 0.05
+
+    # 2. The read: below the sample floor 0; a table that never enters -> 1;
+    #    a table that always calls -> 0.
+    low = _FixedEquityBot(equity=0.50)
+    _tt_feed(low, hands=(_TIGHT_TABLE_READ["min_samples"] // 5) - 1, vpip=False, start=37100)
+    ok &= low._tight_table_weight(None)[0] == 0.0
+    ok &= 0 < low._profiles.table_vpip()[1] < _TIGHT_TABLE_READ["min_samples"]
+    tight = _FixedEquityBot(equity=0.50)
+    _tt_feed(tight, hands=12, vpip=False, start=37200)
+    w_tight, tr = tight._tight_table_weight(None)
+    ok &= w_tight == 1.0 and tr.get("tight_table_vpip") == 0.0 and tr.get("tight_table_n") == 60
+    loose = _FixedEquityBot(equity=0.50)
+    _tt_feed(loose, hands=12, vpip=True, start=37300)
+    ok &= loose._tight_table_weight(None)[0] == 0.0 and loose._profiles.table_vpip()[0] == 1.0
+
+    # 3. What w scales postflop: extra, raise bar, semi-bluff raise frequency.
+    tight.act(_tt_call_view(hand_id=37401))
+    loose.act(_tt_call_view(hand_id=37401))
+    tt, tl = tight.last_decision, loose.last_decision
+    ok &= tt.get("tight_table_w") == 1.0 and tl.get("tight_table_w") == 0.0
+    ok &= abs(tt.get("bet_respect_extra") - tl.get("bet_respect_extra")
+              - _TIGHT_BET_RESPECT_EXTRA["survival"][0]) < 2e-4
+    ok &= tt.get("call_req") > tl.get("call_req")
+    ok &= abs(tt.get("value_threshold_after") - tl.get("value_threshold_after")
+              - _TIGHT_RAISE_BUMP["survival"][0]) < 2e-4
+    ok &= tt.get("tight_raise_bump") == _TIGHT_RAISE_BUMP["survival"][0]
+    # strong hand still raises on a tight table; a medium one no longer does
+    strong = _FixedEquityBot(equity=0.95)
+    _tt_feed(strong, hands=12, vpip=False, start=37500)
+    ok &= strong.act(_tt_call_view(hand_id=37601)).type == "raise"
+    medium_t = _FixedEquityBot(equity=0.75)
+    _tt_feed(medium_t, hands=12, vpip=False, start=37700)
+    medium_l = _FixedEquityBot(equity=0.75)
+    ok &= medium_l.act(_tt_call_view(hand_id=37801)).type == "raise"
+    ok &= medium_t.act(_tt_call_view(hand_id=37801)).type != "raise"
+    # semi-bluff RAISE frequency sits below the semi-bluff bet table value
+    from bots.tournament_hybrid_bot import _SEMI_FREQ, _SEMI_RAISE_MULT
+    semi_raise = _FixedEquityBot(equity=0.35)
+    raise_view = _postflop_view([("K", "s"), ("Q", "s")], [("J", "s"), ("7", "s"), ("2", "d")],
+                                to_call=40, pot=100, opponents=("V0",), hero_stack=1000, hand_id=37902)
+    semi_raise.act(raise_view)
+    fr = semi_raise.last_decision.get("freq_before")
+    ok &= fr is not None and abs(
+        fr - _SEMI_FREQ["survival"]["hu"][0] * 1.25 * _SEMI_RAISE_MULT["survival"]) < 2e-4
+    ok &= fr < _SEMI_FREQ["survival"]["hu"][0]
+
+    # 4. Steals: BTN/SB/CO widen at six players on a tight table; UTG and a
+    #    loose table do not; three players do not.
+    def steal_trace(bot, pos, hand_id, n_players=6):
+        view = _tt_six_players(_rfi_view(pos, [("K", "s"), ("4", "s")], hand_id=hand_id))
+        if n_players < 6:
+            keep = list(_SIX)[: n_players - 1]
+            view.stacks = {"Hero": 1000, **{pid: 1000 for pid in keep}}
+            view.opponents = keep
+            view.acting_opponents = keep
+            view.seat_indices = {pid: idx for idx, pid in enumerate(["Hero", *keep])}
+        bot.act(view)
+        return bot.last_decision
+
+    for pos in ("BTN", "SB", "CO"):
+        tr = steal_trace(tight, pos, 38001)
+        ok &= tr.get("range_after_pct", 0.0) > tr.get("range_base_pct", 1.0)
+        ok &= tr.get("tight_nudge_kind") == "steal" and tr.get("tight_nudge_weight") == 1.0
+    tr = steal_trace(tight, "UTG", 38002)
+    ok &= tr.get("range_after_pct") == tr.get("range_base_pct") and tr.get("tight_nudge_kind") is None
+    tr = steal_trace(loose, "BTN", 38003)
+    ok &= tr.get("range_after_pct") == tr.get("range_base_pct") and tr.get("tight_nudge_kind") is None
+    tr = steal_trace(tight, "BTN", 38004, n_players=3)
+    ok &= tr.get("range_after_pct") == tr.get("range_base_pct") and tr.get("tight_nudge_kind") is None
+    tr = steal_trace(tight, "BTN", 38005, n_players=4)
+    ok &= tr.get("tight_nudge_weight") == 0.5
+
+    # 5. 3-bets widen versus a late open at six players on a tight table.
+    def threebet_trace(bot, hand_id):
+        view = _tt_six_players(_facing_open_view([("A", "s"), ("J", "s")], opener="CO",
+                                                 hero_pos="BTN", hand_id=hand_id))
+        bot.act(view)
+        return bot.last_decision
+
+    tr_t = threebet_trace(tight, 38101)
+    tr_l = threebet_trace(loose, 38101)
+    ok &= tr_t.get("range_after_pct", 0.0) > tr_t.get("range_base_pct", 1.0)
+    ok &= tr_t.get("tight_nudge_kind") == "threebet"
+    ok &= tr_l.get("range_after_pct") == tr_l.get("range_base_pct") and tr_l.get("tight_nudge_kind") is None
+    ok &= tr_t.get("range_admit_freq", 0.0) > 0.0
+
+    # 6. The arm turns the read off; the unconditional extra stays.
+    off = create_bot("final_survival:notight").bot
+    ok &= off.tight_table_enabled is False and off.p5_enabled is False
+    on = create_bot("final_survival").bot
+    ok &= on.tight_table_enabled is True
+    off_fixed = _FixedEquityBot(equity=0.50)
+    off_fixed.tight_table_enabled = False
+    _tt_feed(off_fixed, hands=12, vpip=False, start=38200)
+    off_fixed.act(_tt_call_view(hand_id=38301))
+    ok &= off_fixed.last_decision.get("tight_table_w") == 0.0
+    ok &= off_fixed.last_decision.get("bet_respect_extra") == _BET_RESPECT_EXTRA["survival"]["hu"][0]
+
+    # 7. Fail closed: a broken profile object gives w = 0 and an error count.
+    broken = _FixedEquityBot(equity=0.50)
+    broken._profiles.profiles = None
+    w, _ = broken._tight_table_weight(None)
+    ok &= w == 0.0 and broken.p5_error_count >= 1
+
+    # 8. Determinism: the same tight bot repeats its actions.
+    a = _FixedEquityBot(equity=0.75)
+    b = _FixedEquityBot(equity=0.75)
+    _tt_feed(a, hands=12, vpip=False, start=38400)
+    _tt_feed(b, hands=12, vpip=False, start=38400)
+    for hid in (38501, 38502):
+        ok &= a.act(_tt_call_view(hand_id=hid)) == b.act(_tt_call_view(hand_id=hid))
+        ok &= steal_trace(a, "BTN", hid) == steal_trace(b, "BTN", hid)
+
+    print(f"[CHECK 37] {'PASS' if ok else 'FAIL'} - tight-table module: bet respect with its "
+          "exemptions, pooled-VPIP read fail-closed, scaled raise bar / steals / 3-bets, notight arm")
+    return ok
+
+
 def run():
     PASS = True
     PASS &= _check_registry()
@@ -2551,6 +2737,7 @@ def run():
     PASS &= _check_p5_zero_data_neutral()
     PASS &= _check_cross_process_determinism()
     PASS &= _check_p5_r2_value_no_harm_instrumentation()
+    PASS &= _check_tight_table_module()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS

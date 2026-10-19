@@ -163,6 +163,9 @@ def _configure_final_arm(bot, raw_btype: str) -> None:
     bot.p5_log_only = arm == "telemetry"
     bot.p5_station_enabled = arm in {"telemetry", "station", "p5"}
     bot.p5_r2_enabled = arm in {"telemetry", "r2", "p5"}
+    # Tight-table read (2026-10-19): on by default; ``:notight`` is the
+    # ablation arm.  The P5 arms keep it on.
+    bot.tight_table_enabled = arm != "notight"
 
 
 # ── Player-spec parsing ────────────────────────────────────────────────────────

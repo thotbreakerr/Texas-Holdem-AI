@@ -439,8 +439,23 @@ _SHOVE_CEILINGS = {
 }
 
 _RANGE_GEAR_CAPS = {
-    "survival": {"default": (0.25, 0.080), "threebet": (0.25, 0.050), "shove": (0.25, 0.080)},
-    "aggro": {"default": (0.35, 0.120), "threebet": (0.40, 0.080), "shove": (0.35, 0.120)},
+    "survival": {"default": (0.25, 0.080), "threebet": (0.25, 0.050), "shove": (0.25, 0.080),
+                 "tight_threebet": (1.00, 0.080)},
+    "aggro": {"default": (0.35, 0.120), "threebet": (0.40, 0.080), "shove": (0.35, 0.120),
+              "tight_threebet": (1.20, 0.100)},
+}
+
+# Tight-table preflop nudges (2026-10-19), weight = tight_table_w x a
+# players-left factor (1 at five or more, 0.5 at four, 0 below: with fewer
+# live players tight-aggressive villains call and re-raise instead of
+# folding).  Against a table of tight-aggressive punishers a 3-bet was the
+# hybrid's best line (+11 bb a hand) and the blinds folded 92% of opens at
+# five or six players; the opener folds to a 3-bet about two times in three.
+# spot -> (rel, abs, family).
+_TIGHT_TABLE_NUDGES = {
+    "steal": (0.30, 0.10, "default"),
+    "threebet": (1.00, 0.08, "tight_threebet"),
+    "resteal": (0.50, 0.05, "tight_threebet"),
 }
 
 _CHIPLEADER_POSTFLOP_MULT = {
@@ -515,6 +530,36 @@ _CALL_CUSHION = {
     },
 }
 
+# Bet respect (2026-10-19).  Rule-based opponents bet postflop with made
+# hands far more often than a random holding would make them: against the
+# tight-aggressive punishers and the heuristic bots every call of a bet below
+# about 0.65 Monte-Carlo equity lost against folding, on every street.  This
+# extra is added to the call requirement (pot odds + cushion + tax) when
+# facing a bet.
+# A call for less (to_call >= stack) at 3:1 or better is exempt: the short
+# stack's last chips go in on raw pot odds, as CHECK 14 pins.
+_BET_RESPECT_EXTRA = {
+    "survival": {"hu": (0.15, 0.22, 0.25), "3way": (0.10, 0.15, 0.18), "4plus": (0.05, 0.08, 0.10)},
+    "aggro": {"hu": (0.12, 0.18, 0.20), "3way": (0.08, 0.12, 0.15), "4plus": (0.04, 0.06, 0.08)},
+}
+
+# Tight-table read: pooled raw VPIP of every villain seen this tournament
+# (OpponentProfiles.table_vpip).  Per-villain postflop reads never get a
+# sample inside one tournament (the hybrid folds before it sees them), so the
+# only read that fills in time is the table's preflop looseness.  w ramps
+# from 0 at vpip_zero to 1 at vpip_full; below min_samples it is 0 (fail
+# closed).  Typical values: tight-aggressive punishers ~0.28, heuristic
+# bots ~0.27, nits/min-raisers ~0.35, maniacs and stations 0.45+.
+_TIGHT_TABLE_READ = {"min_samples": 40, "vpip_full": 0.24, "vpip_zero": 0.32}
+# Scaled by w: more bet respect, a higher value-raise bar (their bets are
+# two pair or better), per street.
+_TIGHT_BET_RESPECT_EXTRA = {"survival": (0.08, 0.10, 0.12), "aggro": (0.06, 0.08, 0.10)}
+_TIGHT_RAISE_BUMP = {"survival": (0.12, 0.10, 0.10), "aggro": (0.10, 0.08, 0.08)}
+# Semi-bluff RAISES (facing a bet) relative to semi-bluff bets: raising a
+# bettor with a draw lost against the punishers and the heuristic bots
+# (-46 / -16 bb a hand).
+_SEMI_RAISE_MULT = {"survival": 0.35, "aggro": 0.45}
+
 # Equity needed to raise a bet (or build a large value line).  "4plus" adds +3pp.
 _VALUE_RAISE = {
     "aggro": {"hu": (0.65, 0.67, 0.70), "mw": (0.72, 0.75, 0.78)},
@@ -528,28 +573,35 @@ _VALUE_BET = {
 }
 
 # Continuation-bet frequency when hero was the preflop aggressor and is checked to.
+# 2026-10-19: the flop figures went up and the turn/river ones down.  In the
+# checked-to spots the frequency gate makes a near-randomised comparison, and
+# against every stress-opponent lineup a flop bet beat a check (punishers
+# +3.7 bb a spot, heuristic bots +1.6, loose +1.9, tight level) while turn
+# and river continuation bets lost against the punishers and heuristic bots.
 _CBET_FREQ = {
     "aggro": {
-        "hu": (0.70, 0.45, 0.30),
-        "3way": (0.45, 0.28, 0.18),
-        "4plus": (0.30, 0.16, 0.08),
+        "hu": (0.85, 0.30, 0.18),
+        "3way": (0.50, 0.22, 0.12),
+        "4plus": (0.32, 0.12, 0.06),
     },
     "survival": {
-        "hu": (0.55, 0.30, 0.18),
-        "3way": (0.30, 0.18, 0.10),
-        "4plus": (0.20, 0.10, 0.05),
+        "hu": (0.75, 0.20, 0.10),
+        "3way": (0.35, 0.14, 0.08),
+        "4plus": (0.22, 0.08, 0.04),
     },
 }
 
 # Pure-bluff frequency for non-value, non-semi-bluff hands when checked to.
+# Flop figure up on the same evidence (a flop stab beat a check against
+# every stress-opponent lineup); turn and river unchanged.
 _BLUFF_FREQ = {
     "aggro": {
-        "hu": (0.18, 0.12, 0.22),
-        "3way": (0.08, 0.05, 0.10),
+        "hu": (0.25, 0.12, 0.22),
+        "3way": (0.10, 0.05, 0.10),
         "4plus": (0.03, 0.02, 0.04),
     },
     "survival": {
-        "hu": (0.06, 0.04, 0.06),
+        "hu": (0.18, 0.04, 0.06),
         "3way": (0.02, 0.01, 0.03),
         "4plus": (0.0, 0.0, 0.01),
     },
@@ -671,6 +723,19 @@ class OpponentProfiles:
 
     def all_raw(self) -> dict[Any, dict[str, int]]:
         return {pid: dict(counters) for pid, counters in self.profiles.items()}
+
+    def table_vpip(self) -> tuple[float | None, int]:
+        """Pooled raw VPIP over every villain seen this tournament: (rate, n).
+
+        Unshrunk, once-per-hand-per-villain counts (the hero is never
+        ingested).  None when nothing has been seen.
+        """
+        n = 0
+        k = 0
+        for counters in self.profiles.values():
+            n += self._safe_int(counters.get("preflop_action_seen"))
+            k += self._safe_int(counters.get("vpip_seen"))
+        return ((k / n) if n > 0 else None, n)
 
     def stat_summary(self, pid: Any, confidence_w: float = 10.0) -> dict[str, Any]:
         counters = self.profiles.get(pid, self._blank_profile())
@@ -1098,6 +1163,12 @@ class ProfileConfig:
     spewy_tax_relief: float = 0.50
     p5_confidence_w: float = 10.0
 
+    # Tight-table read (2026-10-19): scales the extra bet respect and the
+    # value-raise bump by the table's pooled VPIP.  The unconditional parts
+    # (_BET_RESPECT_EXTRA, the flop/turn/river frequency tables) are not
+    # behind this flag; the arm ``final_<profile>:notight`` turns it off.
+    tight_table_enabled: bool = True
+
 
 SURVIVAL_CONFIG = ProfileConfig(
     name="survival",
@@ -1175,6 +1246,7 @@ class TournamentHybridBot:
         self.station_suppression_scale = float(self.config.station_suppression_scale)
         self.spewy_tax_relief = float(self.config.spewy_tax_relief)
         self.p5_confidence_w = float(self.config.p5_confidence_w)
+        self.tight_table_enabled = bool(self.config.tight_table_enabled)
         self.p5_error_count = 0
         self.p5_decision_count = 0
         self.p5_station_read_fire_count = 0
@@ -2045,13 +2117,17 @@ class TournamentHybridBot:
                 [self._opener_pid(view)],
             )
             nudge = self._pressure_nudge(self.config.name, "resteal", pressure, "threebet")
+            nudges = [nudge]
+            tight_nudge = self._tight_table_nudge(view, context, "resteal")
+            if tight_nudge is not None:
+                nudges.append(tight_nudge)
             hit, range_trace = self._range_hit_with_nudges(
                 view,
                 key,
                 resteal_range,
                 _PRESSURE_3BET_EXPANSION.get(opener_cat, frozenset()),
                 f"medium_resteal_{opener_cat}",
-                [nudge],
+                nudges,
                 {"family": "threebet", "max_pct": 1.0},
             )
             self._trace_preflop(
@@ -2156,6 +2232,12 @@ class TournamentHybridBot:
             transition = self._short_desperation_nudge(view, hero_bb)
             transition["family"] = "default"
             rfi_nudges.append(transition)
+        tight_nudge = self._tight_table_nudge(
+            view, context, "steal",
+            spot=self._rfi_pressure_spot(view, category, strategy_category),
+        )
+        if tight_nudge is not None:
+            rfi_nudges.append(tight_nudge)
         hit, range_trace = self._range_hit_with_nudges(
             view,
             key,
@@ -2259,13 +2341,17 @@ class TournamentHybridBot:
                 [self._opener_pid(view)],
             )
             nudge = self._pressure_nudge(self.config.name, "threebet", pressure, "threebet")
+            nudges = [nudge]
+            tight_nudge = self._tight_table_nudge(view, context, "threebet")
+            if tight_nudge is not None:
+                nudges.append(tight_nudge)
             threebet_hit, range_trace = self._range_hit_with_nudges(
                 view,
                 key,
                 value_range,
                 _PRESSURE_3BET_EXPANSION.get(opener_cat, frozenset()),
                 f"deep_threebet_{opener_cat}",
-                [nudge],
+                nudges,
                 {"family": "threebet", "max_pct": 1.0},
             )
             if threebet_hit:
@@ -2317,18 +2403,19 @@ class TournamentHybridBot:
             eff_bb,
             getattr(view, "acting_opponents", None) or getattr(view, "opponents", None) or [],
         )
-        nudge = self._pressure_nudge(
-            self.config.name,
-            self._rfi_pressure_spot(view, category, strategy_category),
-            pressure,
-        )
+        rfi_spot = self._rfi_pressure_spot(view, category, strategy_category)
+        nudge = self._pressure_nudge(self.config.name, rfi_spot, pressure)
+        nudges = [nudge]
+        tight_nudge = self._tight_table_nudge(view, context, "steal", spot=rfi_spot)
+        if tight_nudge is not None:
+            nudges.append(tight_nudge)
         hit, range_trace = self._range_hit_with_nudges(
             view,
             key,
             rfi_range,
             _PRESSURE_RFI_EXPANSION.get(strategy_category, _PRESSURE_RFI_EXPANSION.get(category, frozenset())),
             "deep_rfi",
-            [nudge],
+            nudges,
             {"family": "default", "max_pct": 1.0},
         )
         self._trace_preflop(
@@ -2514,6 +2601,28 @@ class TournamentHybridBot:
         cushion = self._apply_call_cushion(base_cushion, cushion_deltas, profile)
         base_call_req = pot_odds + base_cushion
         call_req = pot_odds + cushion + future_tax
+        # Bet respect: the extra above pot odds a call of this bet needs, plus
+        # the tight-table share; a call for less at 3:1 or better is exempt.
+        tight_w, tight_trace = self._tight_table_weight(view)
+        respect_extra = _BET_RESPECT_EXTRA.get(profile, _BET_RESPECT_EXTRA["survival"])[way3][si]
+        respect_extra += _TIGHT_BET_RESPECT_EXTRA.get(profile, _TIGHT_BET_RESPECT_EXTRA["survival"])[si] * tight_w
+        call_for_less = all_in_call and pot_odds <= 0.25
+        if call_for_less:
+            respect_extra = 0.0
+        elif all_in_call:
+            # A jam already prices itself; all-in calls broke even from about
+            # 0.55 equity against the stress opponents, so only a small margin.
+            respect_extra = min(respect_extra, 0.05)
+        if bool(self._p5_trace_updates.get("p5_r2_relief_applied")):
+            # Strict R2: a confirmed spewy villain's jam is not a strong bet.
+            respect_extra = 0.0
+        respect_extra = round(_clamp(respect_extra, 0.0, 0.40), 4)
+        call_req = min(0.95, call_req + respect_extra)
+        self._trace_preflop(
+            bet_respect_extra=respect_extra,
+            bet_respect_call_for_less=call_for_less,
+            **tight_trace,
+        )
         pressure = self._pressure_weight(
             view,
             rank_ctx,
@@ -2549,9 +2658,13 @@ class TournamentHybridBot:
                 "weight": hu_weight * float(self.config.hu_aggression_scale or 1.0),
             })
         value_raise_thr = self._apply_value_threshold(base_value_raise, value_deltas, profile, True)
+        # Tight table: their bets are two pair or better, so a raise needs more.
+        raise_bump = round(_TIGHT_RAISE_BUMP.get(profile, _TIGHT_RAISE_BUMP["survival"])[si] * tight_w, 4)
+        value_raise_thr = min(0.95, value_raise_thr + raise_bump)
         self._trace_preflop(
             value_threshold_before=round(base_value_raise, 4),
             value_threshold_after=round(value_raise_thr, 4),
+            tight_raise_bump=raise_bump,
         )
 
         if can_raise and eq >= value_raise_thr:
@@ -2565,7 +2678,8 @@ class TournamentHybridBot:
             lo, hi = _SEMI_BAND[way3][si]
             if lo <= eq <= hi:
                 base_freq = _SEMI_FREQ.get(profile, _SEMI_FREQ["survival"])[way3][si] \
-                    * self._draw_mult(hole, board)
+                    * self._draw_mult(hole, board) \
+                    * _SEMI_RAISE_MULT.get(profile, _SEMI_RAISE_MULT["survival"])
                 mults = []
                 mults.append({
                     "mult": _CHIPLEADER_POSTFLOP_MULT.get(profile, _CHIPLEADER_POSTFLOP_MULT["survival"])[way3]["semi"][si],
@@ -2962,6 +3076,60 @@ class TournamentHybridBot:
         cover_quality = max(0.45, cover_margin) if hero_stack > max_villain else cover
         scale = float(self.config.chipleader_pressure_scale or 1.0)
         return _clamp(bucket_weight * cover * cover_quality * depth_gate * max(chip_share_weight, 0.30) * scale)
+
+    def _tight_table_weight(self, view: PlayerView) -> tuple[float, DecisionTrace]:
+        """Tight-table weight in [0, 1] from the pooled VPIP of the villains
+        seen this tournament (_TIGHT_TABLE_READ); 0 when off, unsampled or
+        on any error (fail closed).  Deterministic: observed history only."""
+        trace: DecisionTrace = {"tight_table_w": 0.0, "tight_table_vpip": None, "tight_table_n": 0}
+        if not bool(getattr(self, "tight_table_enabled", True)):
+            return 0.0, trace
+        try:
+            vpip, n = self._profiles.table_vpip()
+            trace["tight_table_n"] = int(n)
+            if vpip is None or not math.isfinite(vpip) or n < _TIGHT_TABLE_READ["min_samples"]:
+                return 0.0, trace
+            zero = _TIGHT_TABLE_READ["vpip_zero"]
+            full = _TIGHT_TABLE_READ["vpip_full"]
+            w = _clamp((zero - float(vpip)) / max(1e-9, zero - full))
+            trace["tight_table_vpip"] = round(float(vpip), 4)
+            trace["tight_table_w"] = round(w, 4)
+            return w, trace
+        except Exception as exc:
+            self._p5_record_error("tight_table", exc)
+            return 0.0, trace
+
+    def _tight_table_nudge(
+        self,
+        view: PlayerView,
+        context: dict[str, Any],
+        kind: str,
+        spot: str | None = None,
+    ) -> dict[str, float] | None:
+        """Preflop range nudge for a tight table (_TIGHT_TABLE_NUDGES), or
+        None.  Steals only from the button, the small blind and the cutoff;
+        weight = tight_table_w x players-left factor.  Traces the weight."""
+        try:
+            w, trace = self._tight_table_weight(view)
+            self._trace_preflop(**trace)
+            if w <= 0.0 or kind not in _TIGHT_TABLE_NUDGES:
+                return None
+            if kind == "steal":
+                tag = str(getattr(view, "position", "") or "").strip().upper()
+                if spot not in ("btn_steal", "sb_steal") and not (spot == "late_open" and tag == "CO"):
+                    return None
+            rank_ctx = context.get("rank_ctx") or {}
+            players_left = self._safe_int(rank_ctx.get("players_left")) or self._table_size(view, context)
+            depth = 1.0 if players_left >= 5 else (0.5 if players_left == 4 else 0.0)
+            if depth <= 0.0:
+                return None
+            rel, abs_pp, family = _TIGHT_TABLE_NUDGES[kind]
+            weight = round(_clamp(w * depth), 4)
+            self._trace_preflop(tight_nudge_kind=kind, tight_nudge_weight=weight)
+            return {"rel": rel, "abs": abs_pp, "weight": weight, "family": family}
+        except Exception as exc:
+            self._p5_record_error("tight_table_nudge", exc)
+            return None
 
     @staticmethod
     def _short_weight(hero_bb: float) -> float:
