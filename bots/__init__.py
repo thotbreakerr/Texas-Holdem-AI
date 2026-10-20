@@ -25,6 +25,8 @@ def create_bot(btype: str) -> BotAdapter:
       final_aggro         TournamentHybridBot aggro profile
       final_<profile>:p4|telemetry|station|r2|p5
                           TournamentHybridBot Phase 5 ablation arms
+      final_<profile>:notight|nohu
+                          tight-table read off / heads-up module off
       maniac, maniac_trigger, maniac_mixed, overbet_merchant,
       calling_station, nit, folder, loose_passive, minraise, minraiser,
       baseline_sane, pressure_filler, tag_punisher, wide_defender
@@ -166,6 +168,9 @@ def _configure_final_arm(bot, raw_btype: str) -> None:
     # Tight-table read (2026-10-19): on by default; ``:notight`` is the
     # ablation arm.  The P5 arms keep it on.
     bot.tight_table_enabled = arm != "notight"
+    # Heads-up module (2026-10-20): on by default; ``:nohu`` is the ablation
+    # arm.  Independent of the tight-table arm and the P5 arms.
+    bot.heads_up_module_enabled = arm != "nohu"
 
 
 # ── Player-spec parsing ────────────────────────────────────────────────────────

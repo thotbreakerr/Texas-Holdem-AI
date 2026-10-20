@@ -560,6 +560,25 @@ _TIGHT_RAISE_BUMP = {"survival": (0.12, 0.10, 0.10), "aggro": (0.10, 0.08, 0.08)
 # (-46 / -16 bb a hand).
 _SEMI_RAISE_MULT = {"survival": 0.35, "aggro": 0.45}
 
+# Heads-up module (2026-10-20).  Heads-up the hybrid folded 72% of its
+# buttons (the button posts the small blind, so each fold is -0.5 bb) while
+# rule-based villains folded 63-73% of big blinds to an open and 86-88% to a
+# jam.  The button open and the short-stack open jam widen in heads-up
+# equity order (bots/punisher.py's 169-class percentile against one hand):
+# a hand opens when its percentile is within base + w x widen x (1 - base)
+# of the deal mass, w the villain's fold-to-steal read: the module's own
+# counts, shrunk to the 0.45 prior by confidence_w samples, mapped
+# 0.25 -> 0 and 0.65 -> 1.  Unsampled the read sits at the prior (w = 0.5:
+# about 63% of buttons open deep, 66% jam short); a villain that defends its
+# blind ramps the widening off, one that folds ramps it to any two cards.
+# Button only, unopened pots only; the big blind's defence and the postflop
+# tables are unchanged.
+_HU_STEAL_READ = {"fts_zero": 0.25, "fts_full": 0.65, "prior": 0.45, "confidence_w": 10.0}
+_HU_STEAL_WIDEN = {
+    "survival": {"open": 1.00, "jam": 1.00},
+    "aggro": {"open": 1.00, "jam": 1.00},
+}
+
 # Equity needed to raise a bet (or build a large value line).  "4plus" adds +3pp.
 _VALUE_RAISE = {
     "aggro": {"hu": (0.65, 0.67, 0.70), "mw": (0.72, 0.75, 0.78)},
@@ -1168,6 +1187,10 @@ class ProfileConfig:
     # (_BET_RESPECT_EXTRA, the flop/turn/river frequency tables) are not
     # behind this flag; the arm ``final_<profile>:notight`` turns it off.
     tight_table_enabled: bool = True
+    # Heads-up module (2026-10-20): the button open and the short jam widen
+    # by heads-up equity, scaled by the villain's fold-to-steal read; the arm
+    # ``final_<profile>:nohu`` turns it off.
+    heads_up_module_enabled: bool = True
 
 
 SURVIVAL_CONFIG = ProfileConfig(
@@ -1247,6 +1270,11 @@ class TournamentHybridBot:
         self.spewy_tax_relief = float(self.config.spewy_tax_relief)
         self.p5_confidence_w = float(self.config.p5_confidence_w)
         self.tight_table_enabled = bool(self.config.tight_table_enabled)
+        self.heads_up_module_enabled = bool(self.config.heads_up_module_enabled)
+        # Heads-up steal observations: villain pid -> [responses, folds], and
+        # the hero's last unopened button open awaiting its response.
+        self._hu_steal_obs: dict[Any, list[int]] = {}
+        self._hu_steal_pending: DecisionTrace | None = None
         self.p5_error_count = 0
         self.p5_decision_count = 0
         self.p5_station_read_fire_count = 0
@@ -1284,6 +1312,8 @@ class TournamentHybridBot:
         self._rank_cache.clear()
         self._pending_preflop_trace = {}
         self._profiles.reset()
+        self._hu_steal_obs = {}
+        self._hu_steal_pending = None
         self.p5_error_count = 0
         self.p5_decision_count = 0
         self.p5_station_read_fire_count = 0
@@ -1312,6 +1342,10 @@ class TournamentHybridBot:
             self._p5_ingest(view)
         except Exception as exc:
             self._p5_record_error("ingest", exc)
+        try:
+            self._hu_steal_resolve(view)
+        except Exception as exc:
+            self._p5_record_error("hu_steal_resolve", exc)
 
         context: dict[str, Any]
         context_failed = False
@@ -1393,7 +1427,12 @@ class TournamentHybridBot:
         trace.update(self._p5_trace_updates)
         self._p5_update_telemetry(trace)
         self.last_decision = trace
+        try:
+            self._hu_steal_note(view, trace, action)
+        except Exception as exc:
+            self._p5_record_error("hu_steal_note", exc)
         return action
+
 
     @staticmethod
     def _empty_preflop_trace() -> DecisionTrace:
@@ -2036,6 +2075,15 @@ class TournamentHybridBot:
             ceiling,
         )
         branch = "short_shove" if raises or limpers else "short_open_shove"
+        if self._hu_button_unopened(strategy_category, self._classify_position(
+                getattr(view, "position", None), n_players), raises, limpers):
+            self._trace_preflop(hu_button_spot="jam")
+            if not hit:
+                hu_hit, hu_trace = self._hu_steal_hit(view, key, shove_range, "jam")
+                self._trace_preflop(**hu_trace)
+                if hu_hit:
+                    hit = True
+                    range_trace = dict(range_trace, range_hit=True, range_expansion_hit=True)
         self._trace_preflop(
             branch=branch,
             **range_trace,
@@ -2247,6 +2295,14 @@ class TournamentHybridBot:
             rfi_nudges,
             {"family": "default", "max_pct": 1.0},
         )
+        if self._hu_button_unopened(strategy_category, category, raises, limpers):
+            self._trace_preflop(hu_button_spot="open")
+            if not hit:
+                hu_hit, hu_trace = self._hu_steal_hit(view, key, rfi_range, "open")
+                self._trace_preflop(**hu_trace)
+                if hu_hit:
+                    hit = True
+                    range_trace = dict(range_trace, range_hit=True, range_expansion_hit=True)
         self._trace_preflop(
             branch="medium_rfi",
             **range_trace,
@@ -2418,6 +2474,14 @@ class TournamentHybridBot:
             nudges,
             {"family": "default", "max_pct": 1.0},
         )
+        if self._hu_button_unopened(strategy_category, category, raises, limpers):
+            self._trace_preflop(hu_button_spot="open")
+            if not hit:
+                hu_hit, hu_trace = self._hu_steal_hit(view, key, rfi_range, "open")
+                self._trace_preflop(**hu_trace)
+                if hu_hit:
+                    hit = True
+                    range_trace = dict(range_trace, range_hit=True, range_expansion_hit=True)
         self._trace_preflop(
             branch="deep_rfi",
             **range_trace,
@@ -3130,6 +3194,163 @@ class TournamentHybridBot:
         except Exception as exc:
             self._p5_record_error("tight_table_nudge", exc)
             return None
+
+    # --- Heads-up module (2026-10-20) ----------------------------------------
+
+    def _hu_steal_weight(self, view: PlayerView) -> tuple[float, DecisionTrace]:
+        """Heads-up widening weight in [0, 1] from the lone villain's
+        fold-to-steal counters (_HU_STEAL_READ); the prior's weight when
+        unsampled, 0 when off or on any error (fail closed).  Deterministic:
+        observed history only."""
+        trace: DecisionTrace = {"hu_steal_w": 0.0, "hu_steal_fts": None, "hu_steal_n": 0}
+        if not bool(getattr(self, "heads_up_module_enabled", True)):
+            return 0.0, trace
+        try:
+            villains = [pid for pid in (getattr(view, "opponents", None) or []) if pid is not None]
+            obs = [0, 0]
+            if len(villains) == 1:
+                obs = list(self._hu_steal_obs.get(villains[0]) or [0, 0])
+            n = max(0, self._safe_int(obs[0]))
+            k = max(0, min(n, self._safe_int(obs[1])))
+            prior = float(_HU_STEAL_READ["prior"])
+            cw = float(_HU_STEAL_READ["confidence_w"])
+            fts = (k + prior * cw) / max(1e-9, n + cw)
+            zero = float(_HU_STEAL_READ["fts_zero"])
+            full = float(_HU_STEAL_READ["fts_full"])
+            w = _clamp((fts - zero) / max(1e-9, full - zero))
+            trace.update({"hu_steal_w": round(w, 4), "hu_steal_fts": round(fts, 4), "hu_steal_n": n})
+            return w, trace
+        except Exception as exc:
+            self._p5_record_error("hu_steal", exc)
+            return 0.0, trace
+
+    @staticmethod
+    def _hu_class_percentile(key: str) -> float | None:
+        """The hand's heads-up percentile (share of the deal mass in strictly
+        better classes against one random hand), from the committed table in
+        bots/punisher.py; None when unavailable."""
+        try:
+            from bots.punisher import class_percentile
+            if not key or len(key) < 2 or key[0] not in _RANK_INDEX or key[1] not in _RANK_INDEX:
+                return None
+            hi, lo = _RANK_INDEX[key[0]], _RANK_INDEX[key[1]]
+            suited = len(key) == 3 and key[2] == "s" and hi != lo
+            return float(class_percentile((max(hi, lo), min(hi, lo), suited), 1))
+        except Exception:
+            return None
+
+    @classmethod
+    def _combo_mass(cls, hands: frozenset[str] | set[str]) -> float:
+        total = 0
+        for key in hands or ():
+            if len(key) == 2:
+                total += 6
+            elif key.endswith("s"):
+                total += 4
+            else:
+                total += 12
+        return _clamp(total / 1326.0)
+
+    def _hu_steal_hit(
+        self,
+        view: PlayerView,
+        key: str,
+        base_range: frozenset[str],
+        kind: str,
+    ) -> tuple[bool, DecisionTrace]:
+        """Whether the heads-up module admits this hand to an unopened button
+        open (kind "open") or short-stack open jam (kind "jam") that the base
+        range and its nudges did not: percentile within the widened target.
+        Traces the read and the target either way."""
+        w, trace = self._hu_steal_weight(view)
+        trace.update({"hu_steal_kind": kind, "hu_steal_hit": False,
+                      "hu_steal_target_pct": None, "hu_steal_pct": None})
+        if w <= 0.0:
+            return False, trace
+        try:
+            widen = float(_HU_STEAL_WIDEN.get(self.config.name, _HU_STEAL_WIDEN["survival"]).get(kind, 0.0))
+            base = self._combo_mass(base_range)
+            target = _clamp(base + w * widen * (1.0 - base))
+            pct = self._hu_class_percentile(key)
+            trace.update({"hu_steal_target_pct": round(target, 4),
+                          "hu_steal_pct": None if pct is None else round(pct, 4)})
+            if pct is None:
+                return False, trace
+            hit = pct <= target
+            trace["hu_steal_hit"] = bool(hit)
+            return bool(hit), trace
+        except Exception as exc:
+            self._p5_record_error("hu_steal_hit", exc)
+            return False, trace
+
+    def _hu_button_unopened(self, strategy_category: str, category: str, raises: int, limpers: int) -> bool:
+        return (strategy_category == "heads_up" and category == "late"
+                and raises <= 0 and limpers <= 0
+                and bool(getattr(self, "heads_up_module_enabled", True)))
+
+    def _hu_steal_note(self, view: PlayerView, trace: DecisionTrace, action: Action) -> None:
+        """After an unopened heads-up button open or jam, remember it: the
+        villain's response is read at the hero's next view (the hero never
+        sees a fold to its own open, the hand ends first)."""
+        if not bool(getattr(self, "heads_up_module_enabled", True)):
+            return
+        kind = trace.get("hu_button_spot")
+        if not kind or action.type not in ("raise", "bet"):
+            return
+        villains = [pid for pid in (getattr(view, "opponents", None) or []) if pid is not None]
+        if len(villains) != 1:
+            return
+        stacks = getattr(view, "stacks", None) or {}
+        self._hu_steal_pending = {
+            "hand": self._p5_hand_id_int(getattr(view, "hand_id", None)),
+            "pid": villains[0],
+            "kind": kind,
+            "stack": self._safe_int(stacks.get(getattr(view, "me", None), 0)),
+            "bb": max(1, self._infer_big_blind(view)),
+        }
+
+    def _hu_steal_resolve(self, view: PlayerView) -> None:
+        """Settle the pending heads-up open against this view.  Another view in
+        the same hand means the villain continued.  A view in a later hand
+        with no view in between means it folded: for an open, nothing else
+        ends the hand without the hero acting again (a call reaches the
+        flop, a re-raise returns the action), the one exception being an
+        all-in call for less, which the stack change at the very next hand
+        catches; a jam is settled by that stack change alone (the villain
+        folded exactly when the hero's stack grew by the small blind, the
+        blind clock allowed for) and is dropped when the next view is later."""
+        pending = self._hu_steal_pending
+        if pending is None:
+            return
+        hand = self._p5_hand_id_int(getattr(view, "hand_id", None))
+        if hand is None:
+            return
+        if hand < self._safe_int(pending.get("hand")):
+            self._hu_steal_pending = None      # a new tournament's ids
+            self._hu_steal_obs = {}
+            return
+        if hand == pending.get("hand"):
+            self._hu_steal_record(pending["pid"], folded=False)
+            self._hu_steal_pending = None
+            return
+        self._hu_steal_pending = None
+        if hand == self._safe_int(pending.get("hand")) + 1:
+            stacks = getattr(view, "stacks", None) or {}
+            now = self._safe_int(stacks.get(getattr(view, "me", None), 0))
+            bb_then = max(1, self._safe_int(pending.get("bb")))
+            bb_now = max(1, self._infer_big_blind(view))
+            # the hero posted the small blind then and the big blind now
+            fold_delta = (bb_then // 2) + bb_then - bb_now
+            folded = abs((now - self._safe_int(pending.get("stack"))) - fold_delta) <= 1
+            self._hu_steal_record(pending["pid"], folded=folded)
+        elif pending.get("kind") == "open":
+            self._hu_steal_record(pending["pid"], folded=True)
+
+    def _hu_steal_record(self, pid: Any, *, folded: bool) -> None:
+        obs = self._hu_steal_obs.setdefault(pid, [0, 0])
+        obs[0] += 1
+        if folded:
+            obs[1] += 1
 
     @staticmethod
     def _short_weight(hero_bb: float) -> float:
@@ -4023,7 +4244,10 @@ class TournamentHybridBot:
         open_to = self._last_preflop_raise_to(view)
         if open_to <= 0:
             open_to = self._safe_int(getattr(view, "to_call", 0)) + self._current_contribution(view)
-        return open_to <= int(round(2.5 * max(1, bb)))
+        # 2.5 x bb with half a chip of tolerance: at bb = 33 a 2.5x open is 83
+        # and round(82.5) is 82, which folded 15% of the big blind's small-open
+        # defends (2026-10-20).
+        return open_to <= 2.5 * max(1, bb) + 0.5
 
     @classmethod
     def _fold_or_check(cls, view: PlayerView) -> Action:

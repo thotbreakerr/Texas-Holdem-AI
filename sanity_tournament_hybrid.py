@@ -2699,6 +2699,187 @@ def _check_tight_table_module():
     return ok
 
 
+# --- Heads-up module (CHECK 38, 2026-10-20) ----------------------------------
+#
+# The unopened heads-up button: the open and the short jam widen in heads-up
+# equity order, scaled by the villain's fold-to-steal read, which the module
+# observes itself (a fold to the hero's open is never seen: the hand ends
+# before the hero acts again); the ``:nohu`` arm; the small-open rounding
+# fix for the big blind's defence.
+
+
+def _hu_btn_view(hole, chips, hand_id, bb=10):
+    return _rfi_view("BTN", hole, chips=chips, n=2, bb=bb, hand_id=hand_id)
+
+
+def _hu_bb_view(hole, chips, hand_id, bb=10, open_to=25):
+    return _facing_open_view(hole, opener="BTN", hero_pos="BB", n=2, bb=bb,
+                             open_to=open_to, chips=chips, hand_id=hand_id)
+
+
+_HU_AA = [("A", "s"), ("A", "d")]
+_HU_72 = [("7", "s"), ("2", "d")]
+
+
+def _hu_feed(bot, *, folds, continues, start):
+    """``folds`` button opens answered by a fold (the next view is the next
+    hand with the stack grown by the small blind), then ``continues`` opens
+    answered in the same hand."""
+    hand = start
+    for _ in range(folds):
+        view = _hu_btn_view(_HU_AA, 1000, hand)
+        bot.act(view)
+        nxt = _hu_bb_view(_HU_72, 1000, hand + 1)
+        nxt.stacks["Hero"] = view.stacks["Hero"] + 5
+        bot.act(nxt)
+        hand += 2
+    for _ in range(continues):
+        bot.act(_hu_btn_view(_HU_AA, 1000, hand))
+        bot.act(_hu_bb_view(_HU_AA, 1000, hand))
+        hand += 2
+    return hand
+
+
+def _check_heads_up_module():
+    ok = True
+    from bots.tournament_hybrid_bot import _HU_STEAL_READ, _SURVIVAL_RFI_SB
+
+    # 1. Fresh bot at the prior: K5o and Q9o (outside the base range) open
+    #    the heads-up button through the module, J3o does not; the trace
+    #    carries the read, the target and the hand's percentile.
+    prior_w = (_HU_STEAL_READ["prior"] - _HU_STEAL_READ["fts_zero"]) / (
+        _HU_STEAL_READ["fts_full"] - _HU_STEAL_READ["fts_zero"])
+    for hole, opens in (([("K", "s"), ("5", "d")], True), ([("Q", "s"), ("9", "d")], True),
+                        ([("J", "s"), ("3", "d")], False)):
+        fresh = TournamentHybridBot("survival")      # one bot per hand: an open leaves a pending read
+        act = fresh.act(_hu_btn_view(hole, 1000, 38001))
+        t = fresh.last_decision
+        ok &= (act.type == "raise") == opens
+        ok &= t.get("hu_button_spot") == "open" and t.get("hu_steal_kind") == "open"
+        ok &= t.get("base_range_hit") is False and t.get("hu_steal_hit") == opens
+        ok &= abs(t.get("hu_steal_w", -1) - prior_w) < 1e-3 and t.get("hu_steal_n") == 0
+        ok &= 0.0 < t.get("hu_steal_target_pct", 0.0) < 1.0 and t.get("hu_steal_pct") is not None
+        ok &= (t.get("hu_steal_pct") <= t.get("hu_steal_target_pct")) == opens
+    ok &= "K5o" not in _SURVIVAL_RFI_SB and "Q9o" not in _SURVIVAL_RFI_SB
+    # a base-range hand opens as before and is only noted, not widened
+    fresh = TournamentHybridBot("survival")
+    fresh.act(_hu_btn_view(_HU_AA, 1000, 38002))
+    t = fresh.last_decision
+    ok &= t.get("base_range_hit") is True and t.get("hu_button_spot") == "open" and t.get("hu_steal_kind") is None
+    # six-handed button and the heads-up big blind are untouched
+    fresh.act(_rfi_view("BTN", [("K", "s"), ("5", "d")], chips=1000, n=6, hand_id=38003))
+    ok &= fresh.last_decision.get("hu_button_spot") is None and fresh.last_decision.get("branch") == "deep_rfi"
+    fresh.act(_hu_bb_view([("K", "s"), ("5", "d")], 1000, 38004))
+    ok &= fresh.last_decision.get("hu_button_spot") is None
+
+    # 2. The observer: a fold (next hand, stack up by the small blind), a
+    #    continue (a view in the same hand), a fold read from a later view,
+    #    a jam dropped when the next view is later; the pending open clears.
+    obs = TournamentHybridBot("survival")
+    view = _hu_btn_view(_HU_AA, 1000, 38101)
+    obs.act(view)
+    ok &= obs._hu_steal_pending is not None and obs._hu_steal_pending.get("kind") == "open"
+    nxt = _hu_bb_view(_HU_72, 1000, 38102)
+    nxt.stacks["Hero"] = view.stacks["Hero"] + 5
+    obs.act(nxt)
+    ok &= obs._hu_steal_obs.get("BB") == [1, 1] and obs._hu_steal_pending is None
+    obs.act(_hu_btn_view(_HU_AA, 1000, 38103))
+    obs.act(_hu_bb_view(_HU_AA, 1000, 38103))
+    ok &= obs._hu_steal_obs.get("BB") == [2, 1]
+    obs.act(_hu_btn_view(_HU_AA, 1000, 38104))
+    obs.act(_hu_bb_view(_HU_AA, 1000, 38106))
+    ok &= obs._hu_steal_obs.get("BB") == [3, 2]
+    jam = _hu_btn_view(_HU_AA, 120, 38107)
+    obs.act(jam)
+    ok &= obs.last_decision.get("branch") == "short_open_shove" and obs._hu_steal_pending.get("kind") == "jam"
+    obs.act(_hu_bb_view(_HU_AA, 120, 38109))
+    ok &= obs._hu_steal_obs.get("BB") == [3, 2] and obs._hu_steal_pending is None
+    # a jam answered by a fold at the next hand, across a blind level
+    jam = _hu_btn_view(_HU_AA, 120, 38110)
+    obs.act(jam)
+    nxt = _hu_bb_view(_HU_AA, 120, 38111, bb=15)
+    nxt.stacks["Hero"] = jam.stacks["Hero"] + 5 + 10 - 15
+    obs.act(nxt)
+    ok &= obs._hu_steal_obs.get("BB") == [4, 3]
+    # a new tournament (hand ids restart) clears the observations
+    obs.act(_hu_btn_view(_HU_AA, 1000, 38112))
+    obs.act(_hu_bb_view(_HU_AA, 1000, 5))
+    ok &= obs._hu_steal_obs == {} and obs._hu_steal_pending is None
+    obs.reset_memory()
+    ok &= obs._hu_steal_obs == {} and obs._hu_steal_pending is None
+
+    # 3. A villain that folds every steal: any two cards open deep and jam
+    #    short; one that defends every steal: the base range only.
+    folder = TournamentHybridBot("survival")
+    _hu_feed(folder, folds=12, continues=0, start=38200)
+    act = folder.act(_hu_btn_view(_HU_72, 1000, 38300))
+    t = folder.last_decision
+    ok &= act.type == "raise" and t.get("hu_steal_w") == 1.0 and t.get("hu_steal_target_pct") == 1.0
+    ok &= t.get("hu_steal_n") == 12 and t.get("hu_steal_fts", 0.0) > _HU_STEAL_READ["fts_full"]
+    act = folder.act(_hu_btn_view(_HU_72, 120, 38301))
+    t = folder.last_decision
+    ok &= act.type == "raise" and t.get("branch") == "short_open_shove" and t.get("hu_steal_kind") == "jam"
+    ok &= t.get("hu_steal_target_pct") == 1.0
+    act = folder.act(_hu_btn_view(_HU_72, 200, 38302))
+    ok &= act.type == "raise" and folder.last_decision.get("branch") == "medium_rfi"
+    defender = TournamentHybridBot("survival")
+    _hu_feed(defender, folds=0, continues=15, start=38400)
+    act = defender.act(_hu_btn_view([("K", "s"), ("5", "d")], 1000, 38500))
+    t = defender.last_decision
+    ok &= act.type != "raise" and t.get("hu_steal_w") == 0.0 and t.get("hu_steal_hit") is False
+    ok &= t.get("hu_steal_fts", 1.0) < _HU_STEAL_READ["fts_zero"]
+    act = defender.act(_hu_btn_view(_HU_AA, 1000, 38501))
+    ok &= act.type == "raise" and defender.last_decision.get("base_range_hit") is True
+
+    # 4. The arm turns the module off: no spot, no widening, no observation;
+    #    the tight-table read is independent of it.
+    off = create_bot("final_survival:nohu").bot
+    ok &= off.heads_up_module_enabled is False and off.tight_table_enabled is True and off.p5_enabled is False
+    on = create_bot("final_survival").bot
+    ok &= on.heads_up_module_enabled is True
+    ok &= create_bot("final_survival:notight").bot.heads_up_module_enabled is True
+    act = off.act(_hu_btn_view([("K", "s"), ("5", "d")], 1000, 38601))
+    t = off.last_decision
+    ok &= act.type != "raise" and t.get("hu_button_spot") is None and t.get("hu_steal_w") is None
+    off.act(_hu_btn_view(_HU_AA, 1000, 38602))
+    ok &= off._hu_steal_pending is None
+
+    # 5. Small-open rounding: at bb = 33 a 2.5x open is 83 chips and the big
+    #    blind's small-open defence applies, heads-up and six-handed.
+    for n in (2, 6):
+        bb_bot = TournamentHybridBot("survival")
+        view = _facing_open_view([("K", "s"), ("6", "s")], opener="BTN", hero_pos="BB", n=n, bb=33,
+                                 open_to=83, chips=3000, hand_id=38700 + n)
+        ok &= bb_bot._is_small_open(view, 33) is True
+        ok &= bb_bot.act(view).type == "call"
+        wide = _facing_open_view([("K", "s"), ("6", "s")], opener="BTN", hero_pos="BB", n=n, bb=33,
+                                 open_to=100, chips=3000, hand_id=38710 + n)
+        ok &= bb_bot._is_small_open(wide, 33) is False
+
+    # 6. Fail closed: broken observations give w = 0 and an error count; the
+    #    base-range open still happens.
+    broken = TournamentHybridBot("survival")
+    broken._hu_steal_obs = None
+    act = broken.act(_hu_btn_view(_HU_AA, 1000, 38801))
+    ok &= act.type == "raise" and broken.last_decision.get("hu_steal_w") in (None, 0.0)
+    act = broken.act(_hu_btn_view([("K", "s"), ("5", "d")], 1000, 38802))
+    ok &= act.type != "raise" and broken.last_decision.get("hu_steal_w") == 0.0 and broken.p5_error_count >= 1
+
+    # 7. Determinism: two bots fed the same observations act the same.
+    a = TournamentHybridBot("survival")
+    b = TournamentHybridBot("survival")
+    _hu_feed(a, folds=6, continues=4, start=38900)
+    _hu_feed(b, folds=6, continues=4, start=38900)
+    for hid, hole in ((39001, [("J", "s"), ("3", "d")]), (39002, [("T", "s"), ("6", "d")]),
+                      (39003, [("8", "s"), ("4", "d")])):
+        ok &= a.act(_hu_btn_view(hole, 1000, hid)) == b.act(_hu_btn_view(hole, 1000, hid))
+        ok &= a.last_decision.get("hu_steal_target_pct") == b.last_decision.get("hu_steal_target_pct")
+
+    print(f"[CHECK 38] {'PASS' if ok else 'FAIL'} - heads-up module: button open and short jam widen "
+          "by heads-up equity under the observed fold-to-steal read, nohu arm, small-open rounding")
+    return ok
+
+
 def run():
     PASS = True
     PASS &= _check_registry()
@@ -2738,6 +2919,7 @@ def run():
     PASS &= _check_cross_process_determinism()
     PASS &= _check_p5_r2_value_no_harm_instrumentation()
     PASS &= _check_tight_table_module()
+    PASS &= _check_heads_up_module()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS
