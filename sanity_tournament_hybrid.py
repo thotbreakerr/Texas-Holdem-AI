@@ -2880,6 +2880,152 @@ def _check_heads_up_module():
     return ok
 
 
+# --- Heads-up big blind (CHECK 39, 2026-10-20) --------------------------------
+#
+# Heads-up the small blind acts first, so the first history entry's
+# to_call_before is bb - sb: the big blind read half the true blind in every
+# heads-up hand facing an open (a 2.5x open read as 5x, the small-open
+# defence never applied, stacks read twice their depth).  The big blind now
+# reads its own posted blind; six-handed inference is untouched.
+
+
+def _hu_engine_bb_view(hole, *, bb, sb, open_to, chips, hand_id, jam=False):
+    """The engine's heads-up big-blind view facing the button's open: the
+    button posted the small blind and raised first, so its entry carries
+    to_call_before = bb - sb and pot_before = sb + bb."""
+    view = _facing_open_view(hole, opener="BTN", hero_pos="BB", n=2, bb=bb,
+                             open_to=open_to, chips=chips, hand_id=hand_id)
+    view.history[0]["to_call_before"] = bb - sb
+    view.history[0]["pot_before"] = sb + bb
+    if jam:
+        # the villain is all in for open_to: no raise is legal for the hero
+        view.legal_actions = [{"type": "fold"}, {"type": "call"}]
+        view.history[0]["amount"] = open_to
+    return view
+
+
+def _check_heads_up_big_blind():
+    ok = True
+    # 1. The tournament blind levels: the inferred blind is the true one, a 2.5x
+    #    open is small, and the big blind defends A2o / K9o (the small-open
+    #    range, outside the heads-up flat range) by calling.
+    for bb, sb in ((10, 5), (15, 7), (22, 11), (33, 16), (50, 25), (75, 37), (113, 56)):
+        open_to = int(round(2.5 * bb))
+        bot = TournamentHybridBot("survival")
+        view = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=bb, sb=sb, open_to=open_to,
+                                  chips=90 * bb, hand_id=39000 + bb)
+        ok &= view.history[0]["to_call_before"] == bb - sb < bb
+        ok &= bot._hu_big_blind_posted(view) == bb
+        ok &= bot._infer_big_blind(view) == bb
+        ok &= bot._is_small_open(view, bb) is True
+        act = bot.act(view)
+        t = bot.last_decision
+        ok &= act.type == "call" and t.get("branch") == "deep_flat_vs_heads_up" and t.get("band") == "deep"
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("K", "s"), ("9", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39101)
+    ok &= bot.act(view).type == "call" and bot.last_decision.get("branch") == "deep_flat_vs_heads_up"
+    # a hand outside both ranges still folds; a 4x open is not small
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("7", "s"), ("2", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39102)
+    ok &= bot.act(view).type == "fold" and bot.last_decision.get("branch") == "deep_fold_vs_heads_up"
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("K", "s"), ("9", "d")], bb=33, sb=16, open_to=132, chips=3000, hand_id=39103)
+    ok &= bot._infer_big_blind(view) == 33 and bot._is_small_open(view, 33) is False
+    ok &= bot.act(view).type == "fold"
+
+    # 2. The stack band follows the true blind: 8 big blinds facing an open
+    #    is the short band (before: 16, the medium band).
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=50, sb=25, open_to=125, chips=400, hand_id=39201)
+    ok &= bot._infer_big_blind(view) == 50
+    act = bot.act(view)
+    t = bot.last_decision
+    ok &= t.get("band") == "short" and str(t.get("branch", "")).startswith("short_")
+    # the context's hero stack in blinds reads 7 (350 behind the posted 50), not 14
+    ok &= 6.0 <= float((t.get("context") or {}).get("hero_bb") or 0.0) <= 8.0
+
+    # 3. With no raise legal (the villain is all in), the blind is read from
+    #    the jam total less the call.
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=50, sb=25, open_to=900, chips=400, hand_id=39301, jam=True)
+    ok &= bot._hu_big_blind_posted(view) == 50 and bot._infer_big_blind(view) == 50
+
+    # 4. Everywhere else the helper is silent and the inference unchanged:
+    #    six-handed big blind facing an open, the heads-up button, the big
+    #    blind after its own action, and a limped heads-up pot.
+    bot = TournamentHybridBot("survival")
+    six = _facing_open_view([("A", "s"), ("2", "d")], opener="UTG", hero_pos="BB", n=6, bb=33,
+                            open_to=83, chips=3000, hand_id=39401)
+    ok &= bot._hu_big_blind_posted(six) == 0 and bot._infer_big_blind(six) == 33
+    btn = _rfi_view("BTN", [("A", "s"), ("2", "d")], chips=3000, n=2, bb=33, hand_id=39402)
+    ok &= bot._hu_big_blind_posted(btn) == 0 and bot._infer_big_blind(btn) == 33
+    acted = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39403)
+    acted.history.append({"street": "preflop", "pid": "Hero", "type": "raise", "amount": 300,
+                          "to_call_before": 50, "pot_before": 116})
+    ok &= bot._hu_big_blind_posted(acted) == 0
+    # a view with no history and no legal raise falls through to the old paths
+    bare = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39404)
+    bare.history = []
+    ok &= bot._hu_big_blind_posted(bare) == 0
+
+    # 5. The jam fold-to-steal read settles at the big blind's next view: the
+    #    stack delta is read against the true blind.
+    obs = TournamentHybridBot("survival")
+    jam = _hu_btn_view(_HU_AA, 120, 39501, bb=10)
+    obs.act(jam)
+    ok &= obs._hu_steal_pending is not None and obs._hu_steal_pending.get("kind") == "jam"
+    nxt = _hu_engine_bb_view(_HU_72, bb=10, sb=5, open_to=25, chips=120, hand_id=39502)
+    nxt.stacks["Hero"] = jam.stacks["Hero"] + 5
+    obs.act(nxt)
+    ok &= obs._hu_steal_obs.get("BB") == [1, 1]
+
+    # 6. Medium depth (15-25 big blinds effective) heads-up facing a small
+    #    open: outside the re-steal range the big blind flats the deep
+    #    branch's heads-up defence instead of folding; the re-steal jam
+    #    stays first; a hand outside both ranges folds; a 4x open folds;
+    #    six-handed medium play and the ``:nohu`` arm are untouched.
+    for hole, expect, branch in (([("A", "s"), ("2", "d")], "call", "medium_flat_vs_heads_up"),
+                                 ([("K", "s"), ("9", "d")], "call", "medium_flat_vs_heads_up"),
+                                 ([("7", "s"), ("2", "d")], "fold", "medium_resteal_vs_heads_up"),
+                                 ([("A", "s"), ("K", "d")], "raise", "medium_resteal_vs_heads_up")):
+        bot = TournamentHybridBot("survival")
+        view = _hu_engine_bb_view(hole, bb=50, sb=25, open_to=125, chips=1000, hand_id=39801)
+        act = bot.act(view)
+        t = bot.last_decision
+        ok &= act.type == expect and t.get("branch") == branch and t.get("band") == "medium"
+        if expect == "call":
+            ok &= t.get("spot_type") == "flat_vs_open" and t.get("phase4_action") == "call"
+    bot = TournamentHybridBot("survival")
+    view = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=50, sb=25, open_to=200, chips=1000, hand_id=39802)
+    ok &= bot.act(view).type == "fold" and bot.last_decision.get("branch") == "medium_resteal_vs_heads_up"
+    bot = TournamentHybridBot("survival")
+    six = _facing_open_view([("A", "s"), ("2", "d")], opener="BTN", hero_pos="BB", n=6, bb=50,
+                            open_to=125, chips=1000, hand_id=39803)
+    ok &= bot.act(six).type == "fold" and bot.last_decision.get("branch") == "medium_resteal_vs_late"
+    off = create_bot("final_survival:nohu").bot
+    view = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=50, sb=25, open_to=125, chips=1000, hand_id=39804)
+    ok &= off._infer_big_blind(view) == 50          # the inference fix is not armed
+    ok &= off.act(view).type == "fold" and off.last_decision.get("branch") == "medium_resteal_vs_heads_up"
+
+    # 7. Fail closed and deterministic: a broken view gives 0 from the helper
+    #    and the old inference; two bots agree at the tournament levels.
+    bot = TournamentHybridBot("survival")
+    broken = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39601)
+    broken.legal_actions = None
+    broken.to_call = None
+    ok &= bot._hu_big_blind_posted(broken) == 0
+    a = TournamentHybridBot("survival")
+    b = TournamentHybridBot("survival")
+    for hid, hole in ((39701, [("Q", "s"), ("8", "d")]), (39702, [("6", "s"), ("5", "s")]), (39703, [("J", "s"), ("4", "d")])):
+        va = _hu_engine_bb_view(hole, bb=33, sb=16, open_to=83, chips=3000, hand_id=hid)
+        vb = _hu_engine_bb_view(hole, bb=33, sb=16, open_to=83, chips=3000, hand_id=hid)
+        ok &= a.act(va) == b.act(vb)
+
+    print(f"[CHECK 39] {'PASS' if ok else 'FAIL'} - heads-up big blind: the posted blind is read, not bb - sb; "
+          "small-open defence, stack band, medium-depth flat and jam fold read follow the true blind; six-handed untouched")
+    return ok
+
+
 def run():
     PASS = True
     PASS &= _check_registry()
@@ -2920,6 +3066,7 @@ def run():
     PASS &= _check_p5_r2_value_no_harm_instrumentation()
     PASS &= _check_tight_table_module()
     PASS &= _check_heads_up_module()
+    PASS &= _check_heads_up_big_blind()
     print("=" * 60)
     print(f"OVERALL: {'ALL CHECKS PASSED [PASS]' if PASS else 'SOME CHECKS FAILED [FAIL]'}")
     return PASS

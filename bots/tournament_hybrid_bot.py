@@ -2178,19 +2178,22 @@ class TournamentHybridBot:
                 nudges,
                 {"family": "threebet", "max_pct": 1.0},
             )
+            hu_flat = (not hit) and self._hu_medium_flat_hit(view, key, opener_cat, category, bb)
             self._trace_preflop(
-                branch=f"medium_resteal_vs_{opener_cat}",
+                branch=f"medium_flat_vs_{opener_cat}" if hu_flat else f"medium_resteal_vs_{opener_cat}",
                 **range_trace,
                 target_total=self._jam_total(view) if hit else None,
-                spot_type="resteal",
+                spot_type="flat_vs_open" if hu_flat else "resteal",
                 pressure_weight=round(pressure, 4),
-                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else "fold",
-                phase4_action="raise" if hit else "fold",
+                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else ("call" if hu_flat else "fold"),
+                phase4_action="raise" if hit else ("call" if hu_flat else "fold"),
                 future_edge_tax=0.0,
                 **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
-                reason="medium stack resteal jam or fold",
+                reason="medium stack heads-up flat versus small open" if hu_flat else "medium stack resteal jam or fold",
             )
-            return self._safe_aggressive(view, self._jam_total(view)) if hit else self._fold_or_check(view)
+            if hit:
+                return self._safe_aggressive(view, self._jam_total(view))
+            return self._call_or_fold(view) if hu_flat else self._fold_or_check(view)
 
         if limpers:
             iso_range = _ISO_VALUE_SHORT if eff_bb <= 15 else _ISO_VALUE
@@ -3283,6 +3286,27 @@ class TournamentHybridBot:
             self._p5_record_error("hu_steal_hit", exc)
             return False, trace
 
+    def _hu_medium_flat_hit(self, view: PlayerView, key: str, opener_cat: str, category: str, bb: int) -> bool:
+        """Heads-up big blind at medium depth facing one small open (2.5x or
+        less) outside the re-steal range: flat with the deep branch's
+        heads-up defence (the flat range and the small-open range) instead
+        of folding (2026-10-20).  Until the
+        big-blind inference fix these hands read as deep and flatted
+        through the deep branch; the medium branch had no flat.  Off with
+        the heads-up module."""
+        if not bool(getattr(self, "heads_up_module_enabled", True)):
+            return False
+        try:
+            if opener_cat != "heads_up" or category != "bb" or not key:
+                return False
+            if not self._is_small_open(view, bb):
+                return False
+            flat_range = _FLAT_VS_OPEN_RANGES[self.config.name].get("heads_up", frozenset())
+            return key in flat_range or key in _BB_DEFEND_LATE_SMALL
+        except Exception as exc:
+            self._p5_record_error("hu_medium_flat", exc)
+            return False
+
     def _hu_button_unopened(self, strategy_category: str, category: str, raises: int, limpers: int) -> bool:
         return (strategy_category == "heads_up" and category == "late"
                 and raises <= 0 and limpers <= 0
@@ -3985,7 +4009,11 @@ class TournamentHybridBot:
                 continue
             to_call_before = self._safe_int(entry.get("to_call_before"))
             if to_call_before > 0:
-                return to_call_before
+                # Heads-up the small blind acts first, so the first entry's
+                # to_call_before is bb - sb, not the big blind (2026-10-20):
+                # the big blind reads its own posted blind instead.
+                posted = self._hu_big_blind_posted(view)
+                return posted if posted > 0 else to_call_before
             pot_before = self._safe_int(entry.get("pot_before"))
             if pot_before > 0:
                 return max(1, int(round(pot_before / 1.5)))
@@ -3995,6 +4023,43 @@ class TournamentHybridBot:
         if pot > 0:
             return max(1, int(round(pot / 1.5)))
         return 10
+
+    def _hu_big_blind_posted(self, view: PlayerView) -> int:
+        """The big blind the hero posted, when the hero is the big blind
+        heads-up and the villain (the small blind, first to act) has acted
+        before it: its live contribution from the raise maximum (stack +
+        contribution), or, with no raise legal, the villain's raise total
+        less the call.  0 anywhere else.  Before this the first history
+        entry's to_call_before (bb - sb) was read as the big blind in every
+        heads-up big-blind hand facing an open, so a 2.5x open read as 5x
+        and the small-open defence never applied, stacks read twice their
+        depth and the jam fold-to-steal read missed its stack delta."""
+        try:
+            opponents = [pid for pid in (getattr(view, "opponents", None) or []) if pid is not None]
+            if len(opponents) != 1:
+                return 0
+            if str(getattr(view, "position", "") or "").strip().upper() != "BB":
+                return 0
+            hero = getattr(view, "me", None)
+            preflop = [
+                entry for entry in (getattr(view, "history", None) or [])
+                if isinstance(entry, dict) and entry.get("street") == "preflop"
+            ]
+            if not preflop or any(entry.get("pid") == hero for entry in preflop):
+                return 0
+            posted = self._current_contribution(view)
+            if posted > 0:
+                return posted
+            to_call = self._safe_int(getattr(view, "to_call", 0))
+            if to_call <= 0:
+                return 0
+            for entry in reversed(preflop):
+                if entry.get("type") in ("raise", "bet", "all_in"):
+                    amount = self._safe_int(entry.get("amount")) - to_call
+                    return amount if amount > 0 else 0
+            return 0
+        except Exception:
+            return 0
 
     @classmethod
     def _classify_position(cls, pos: Any, n: int) -> str:
