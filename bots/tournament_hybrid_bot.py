@@ -712,7 +712,7 @@ class OpponentProfiles:
         self.once_flags: set[tuple[Any, Any, str]] = set()
         self.last_hand_id: int | None = None
 
-    def ingest(self, view: PlayerView) -> None:
+    def ingest(self, view: PlayerView, bb: int | None = None) -> None:
         hand_id = getattr(view, "hand_id", None)
         hand_int = self._maybe_int(hand_id)
         if hand_int is not None:
@@ -723,7 +723,12 @@ class OpponentProfiles:
         hero = getattr(view, "me", None)
         state = self._new_hand_state(view)
         all_in_pids = set(getattr(view, "all_in_opponents", None) or [])
-        bb = self._infer_big_blind(view)
+        # The owner's blind when given (the hybrid passes its cached read,
+        # which heads-up is the posted blind, 2026-10-21); the reader's own
+        # first-entry read otherwise, which heads-up is bb - sb for either
+        # seat (the small blind acts first, so the first entry's
+        # to_call_before is bb - sb).
+        bb = self._safe_int(bb) if bb is not None and self._safe_int(bb) > 0 else self._infer_big_blind(view)
         history = list(getattr(view, "history", None) or [])
         for idx, entry in enumerate(history):
             if not isinstance(entry, dict):
@@ -1097,6 +1102,9 @@ class OpponentProfiles:
 
     @classmethod
     def _infer_big_blind(cls, view: PlayerView) -> int:
+        """The reader's own blind read: the first preflop entry's call
+        amount.  Heads-up that is bb - sb (the small blind acts first), so
+        the owning bot passes its own read to ``ingest`` (2026-10-21)."""
         for entry in getattr(view, "history", None) or []:
             if not isinstance(entry, dict) or entry.get("street") != "preflop":
                 continue
@@ -1477,7 +1485,7 @@ class TournamentHybridBot:
         }
 
     def _p5_ingest(self, view: PlayerView) -> None:
-        self._profiles.ingest(view)
+        self._profiles.ingest(view, bb=self._infer_big_blind(view))
 
     @staticmethod
     def _p5_hand_id_int(value: Any) -> int | None:
@@ -2179,13 +2187,17 @@ class TournamentHybridBot:
                 {"family": "threebet", "max_pct": 1.0},
             )
             hu_flat = (not hit) and self._hu_medium_flat_hit(view, key, opener_cat, category, bb)
+            if hu_flat:
+                # a hit of the heads-up defence, traced as the deep flat
+                # traces it (range_hit and base_range_hit true)
+                range_trace = dict(range_trace, range_hit=True, base_range_hit=True)
             self._trace_preflop(
                 branch=f"medium_flat_vs_{opener_cat}" if hu_flat else f"medium_resteal_vs_{opener_cat}",
                 **range_trace,
                 target_total=self._jam_total(view) if hit else None,
                 spot_type="flat_vs_open" if hu_flat else "resteal",
                 pressure_weight=round(pressure, 4),
-                pure_chipEV_action="raise" if range_trace.get("base_range_hit") else ("call" if hu_flat else "fold"),
+                pure_chipEV_action="call" if hu_flat else ("raise" if range_trace.get("base_range_hit") else "fold"),
                 phase4_action="raise" if hit else ("call" if hu_flat else "fold"),
                 future_edge_tax=0.0,
                 **self._stack_state_trace(view, context, hero_bb, eff_bb, pressure),
@@ -2431,10 +2443,7 @@ class TournamentHybridBot:
                 )
                 return self._safe_aggressive(view, target)
 
-            flat_range = _FLAT_VS_OPEN_RANGES[self.config.name].get(opener_cat, frozenset())
-            flat_hit = key in flat_range and category != "sb"
-            if category == "bb" and opener_cat in ("late", "sb", "heads_up") and self._is_small_open(view, bb):
-                flat_hit = flat_hit or key in _BB_DEFEND_LATE_SMALL
+            flat_hit = self._flat_vs_open_hit(view, key, opener_cat, category, bb)
             if key in _hands("22-66") and eff_bb < 12:
                 flat_hit = False
             self._trace_preflop(
@@ -3286,14 +3295,28 @@ class TournamentHybridBot:
             self._p5_record_error("hu_steal_hit", exc)
             return False, trace
 
+    def _flat_vs_open_hit(self, view: PlayerView, key: str, opener_cat: str, category: str, bb: int) -> bool:
+        """Membership of the flat-call defence versus one open: the flat
+        range for the opener's category (never from the small blind), plus
+        the big blind's small-open defence (_BB_DEFEND_LATE_SMALL) against a
+        late, small-blind or heads-up open of 2.5x or less.  One definition
+        for the deep branch and the medium heads-up flat (2026-10-21)."""
+        flat_range = _FLAT_VS_OPEN_RANGES[self.config.name].get(opener_cat, frozenset())
+        flat_hit = key in flat_range and category != "sb"
+        if category == "bb" and opener_cat in ("late", "sb", "heads_up") and self._is_small_open(view, bb):
+            flat_hit = flat_hit or key in _BB_DEFEND_LATE_SMALL
+        return flat_hit
+
     def _hu_medium_flat_hit(self, view: PlayerView, key: str, opener_cat: str, category: str, bb: int) -> bool:
         """Heads-up big blind at medium depth facing one small open (2.5x or
         less) outside the re-steal range: flat with the deep branch's
-        heads-up defence (the flat range and the small-open range) instead
-        of folding (2026-10-20).  Until the
-        big-blind inference fix these hands read as deep and flatted
-        through the deep branch; the medium branch had no flat.  Off with
-        the heads-up module."""
+        heads-up defence (_flat_vs_open_hit: the flat range and the
+        small-open range) instead of folding (2026-10-20).  Unlike the
+        deep branch, which flats its flat range at any open size, this
+        flat is only against a small open: a larger open at this depth
+        stays jam-or-fold.  Until the big-blind inference fix these hands
+        read as deep and flatted through the deep branch; the medium
+        branch had no flat.  Off with the heads-up module."""
         if not bool(getattr(self, "heads_up_module_enabled", True)):
             return False
         try:
@@ -3301,8 +3324,7 @@ class TournamentHybridBot:
                 return False
             if not self._is_small_open(view, bb):
                 return False
-            flat_range = _FLAT_VS_OPEN_RANGES[self.config.name].get("heads_up", frozenset())
-            return key in flat_range or key in _BB_DEFEND_LATE_SMALL
+            return self._flat_vs_open_hit(view, key, opener_cat, category, bb)
         except Exception as exc:
             self._p5_record_error("hu_medium_flat", exc)
             return False
@@ -4035,8 +4057,10 @@ class TournamentHybridBot:
         and the small-open defence never applied, stacks read twice their
         depth and the jam fold-to-steal read missed its stack delta."""
         try:
-            opponents = [pid for pid in (getattr(view, "opponents", None) or []) if pid is not None]
-            if len(opponents) != 1:
+            # heads-up by the table's size, as the rest of the bot reads it:
+            # the view's opponents list holds only the unfolded players, so
+            # a multiway hand folded to the big blind would also show one
+            if self._table_size(view) != 2:
                 return 0
             if str(getattr(view, "position", "") or "").strip().upper() != "BB":
                 return 0

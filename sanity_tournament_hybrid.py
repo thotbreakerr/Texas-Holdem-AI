@@ -2951,12 +2951,19 @@ def _check_heads_up_big_blind():
     ok &= bot._hu_big_blind_posted(view) == 50 and bot._infer_big_blind(view) == 50
 
     # 4. Everywhere else the helper is silent and the inference unchanged:
-    #    six-handed big blind facing an open, the heads-up button, the big
-    #    blind after its own action, and a limped heads-up pot.
+    #    six-handed big blind facing an open (both with every seat in the
+    #    opponents list and in the engine's shape, where the list holds only
+    #    the unfolded raiser), the heads-up button, the big blind after its
+    #    own action, and a limped heads-up pot.
     bot = TournamentHybridBot("survival")
     six = _facing_open_view([("A", "s"), ("2", "d")], opener="UTG", hero_pos="BB", n=6, bb=33,
                             open_to=83, chips=3000, hand_id=39401)
     ok &= bot._hu_big_blind_posted(six) == 0 and bot._infer_big_blind(six) == 33
+    six_engine = _facing_open_view([("A", "s"), ("2", "d")], opener="UTG", hero_pos="BB", n=6, bb=33,
+                                   open_to=83, chips=3000, hand_id=39405)
+    six_engine.opponents = ["UTG"]
+    six_engine.acting_opponents = ["UTG"]
+    ok &= bot._hu_big_blind_posted(six_engine) == 0 and bot._infer_big_blind(six_engine) == 33
     btn = _rfi_view("BTN", [("A", "s"), ("2", "d")], chips=3000, n=2, bb=33, hand_id=39402)
     ok &= bot._hu_big_blind_posted(btn) == 0 and bot._infer_big_blind(btn) == 33
     acted = _hu_engine_bb_view([("A", "s"), ("2", "d")], bb=33, sb=16, open_to=83, chips=3000, hand_id=39403)
